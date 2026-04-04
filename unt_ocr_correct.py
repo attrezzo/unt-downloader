@@ -687,9 +687,9 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
     Returns WordToken list in same format as tesseract_tokens.
     Requires: pip install kraken && kraken get 10.5281/zenodo.10592716
     """
+    global _KRAKEN_MODEL, HAS_KRAKEN
     if not HAS_KRAKEN:
         return []
-    global _KRAKEN_MODEL, HAS_KRAKEN
     try:
         if _KRAKEN_MODEL is None:
             model_path = _find_kraken_model()
