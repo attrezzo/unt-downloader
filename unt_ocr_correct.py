@@ -681,24 +681,44 @@ def _download_kraken_model() -> str:
     return str(dest)
 
 
+_kraken_load_lock = threading.Lock()
+
+
 def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
     """
     Run Kraken on a column strip if installed.
     Returns WordToken list in same format as tesseract_tokens.
-    Requires: pip install kraken && kraken get 10.5281/zenodo.10592716
+    Requires: pip install kraken
     """
     global _KRAKEN_MODEL, HAS_KRAKEN
     if not HAS_KRAKEN:
         return []
     try:
         if _KRAKEN_MODEL is None:
-            model_path = _find_kraken_model()
-            if not model_path:
-                model_path = _download_kraken_model()
-            _KRAKEN_MODEL = kraken_models.load_any(model_path)
-            tprint(f"  Kraken model: {model_path}")
+            with _kraken_load_lock:
+                # Re-check after acquiring lock (another thread may have loaded)
+                if _KRAKEN_MODEL is None:
+                    model_path = _find_kraken_model()
+                    if not model_path:
+                        model_path = _download_kraken_model()
+                    _KRAKEN_MODEL = kraken_models.load_any(model_path)
+                    tprint(f"  Kraken model: {model_path}")
         pil = PILImage.fromarray(col_img)
-        seg = blla.segment(pil)
+        # Suppress Kraken's noisy polygonizer warnings on degraded scans.
+        # These come from both the logging system and direct stderr writes.
+        import warnings, logging, io
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _kraken_logger = logging.getLogger("kraken")
+            old_level = _kraken_logger.level
+            _kraken_logger.setLevel(logging.CRITICAL)
+            old_stderr = sys.stderr
+            try:
+                sys.stderr = io.StringIO()  # swallow polygonizer spam
+                seg = blla.segment(pil)
+            finally:
+                sys.stderr = old_stderr
+                _kraken_logger.setLevel(old_level)
         tokens = []
         for record in rpred.rpred(_KRAKEN_MODEL, pil, seg):
             text = record.prediction.strip()
