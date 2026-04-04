@@ -15,5 +15,6 @@ __pycache__/
 */confidence/
 */artifacts/
 */pdf/
-# Keep collection.json configs trackable
-!*/collection.json
+# Ignore real collection configs (contain API keys) — use collection.example.json as template
+collection.json
+*/collection.json
