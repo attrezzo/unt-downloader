@@ -75,6 +75,11 @@ unt_cost_estimate.py        Interactive model selector + cost confirmation.
                             Called by ocr_correct and translate before API use.
 claude_rate_limiter.py      Thread-safe dual token-bucket rate limiter.
 pricing.json                Hand-maintained pricing table. Edit when prices change.
+ocr_pipeline/               Batch-aware OCR preprocessing. Extracts style
+                            signatures, confidence data, and low-confidence
+                            region maps across issues. Feeds calibrated
+                            parameters into unt_ocr_correct.py preprocessing.
+                            Run: python -m ocr_pipeline --config-path collection.json
 CLAUDE.md                   This file.
 README.md                   End-user quickstart (shorter, less technical).
 ```
@@ -113,7 +118,15 @@ articles/
 translated/
     translation_log.json
     {ark}_vol{v}_no{n}_{date}.txt    English translations
-confidence/                     (planned) Per-word confidence sidecar data
+confidence/
+    {ark_id}_page{NN}.json      Per-word confidence records (0–100 integers)
+artifacts/
+    pipeline_log.jsonl          Batch pipeline structured log
+    batch_summary.json          Aggregate statistics from latest sweep
+    style_signatures.json       Per-issue typography/degradation profiles
+    low_confidence/
+        {ark_id}_page{NN}.json  Regions flagged for Pass B refinement
+    debug/                      Debug images (when --save-debug-images)
 pdf/
     {ark}_vol{v}_no{n}_{date}.pdf
 ```

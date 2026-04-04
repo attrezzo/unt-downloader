@@ -112,7 +112,8 @@ class TestArtifactStore:
         with tempfile.TemporaryDirectory() as td:
             store = ArtifactStore(Path(td))
             store.init()
-            assert (Path(td) / "artifacts" / "confidence").is_dir()
+            # confidence/ at collection root per CLAUDE.md
+            assert (Path(td) / "confidence").is_dir()
             assert (Path(td) / "artifacts" / "low_confidence").is_dir()
 
     def test_confidence_save_load(self):

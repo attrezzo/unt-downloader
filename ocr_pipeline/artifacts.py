@@ -1,23 +1,19 @@
 """
 ocr_pipeline.artifacts — Artifact storage for pipeline stages.
 
-All pipeline artifacts live under {collection}/artifacts/.
-Each run creates a timestamped subdirectory for debug images.
-Persistent data (style signatures, confidence records, batch summary)
-is stored at the top level of artifacts/.
+Confidence data lives at the COLLECTION root per CLAUDE.md:
+  {collection}/confidence/          per-word confidence sidecar data
 
-Directory layout:
+Pipeline-specific artifacts live under {collection}/artifacts/:
   artifacts/
-    pipeline_log.jsonl           structured stage log (append-only)
-    batch_summary.json           aggregate stats from latest sweep
-    style_signatures.json        per-issue style data
-    confidence/
-      {ark_id}_page{NN}.json     per-page confidence records
+    pipeline_log.jsonl              structured stage log (append-only)
+    batch_summary.json              aggregate stats from latest sweep
+    style_signatures.json           per-issue style data
     low_confidence/
-      {ark_id}_page{NN}.json     flagged regions for Pass B
+      {ark_id}_page{NN}.json        flagged regions for Pass B
     debug/
       {timestamp}/
-        {ark_id}_p{NN}_*.png     debug images (when enabled)
+        {ark_id}_p{NN}_*.png        debug images (when enabled)
 """
 
 import json
@@ -33,8 +29,10 @@ class ArtifactStore:
     """
 
     def __init__(self, collection_dir: Path):
+        self.collection_dir = collection_dir
         self.root = collection_dir / "artifacts"
-        self.confidence_dir = self.root / "confidence"
+        # confidence/ lives at collection root per CLAUDE.md collection layout
+        self.confidence_dir = collection_dir / "confidence"
         self.low_conf_dir = self.root / "low_confidence"
         self.debug_dir = self.root / "debug"
         self._debug_session: Optional[Path] = None
