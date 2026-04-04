@@ -696,7 +696,6 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
     try:
         if _KRAKEN_MODEL is None:
             with _kraken_load_lock:
-                # Re-check after acquiring lock (another thread may have loaded)
                 if _KRAKEN_MODEL is None:
                     model_path = _find_kraken_model()
                     if not model_path:
@@ -704,38 +703,50 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
                     _KRAKEN_MODEL = kraken_models.load_any(model_path)
                     tprint(f"  Kraken model: {model_path}")
         pil = PILImage.fromarray(col_img)
-        # Suppress Kraken's noisy polygonizer warnings on degraded scans.
-        # These come from both the logging system and direct stderr writes.
-        import warnings, logging, io
+        # Suppress ALL Kraken output during segmentation + recognition.
+        # Polygonizer warnings go to stdout/stderr/logging unpredictably.
+        import warnings, logging, io, contextlib
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _kraken_logger = logging.getLogger("kraken")
-            old_level = _kraken_logger.level
-            _kraken_logger.setLevel(logging.CRITICAL)
-            old_stderr = sys.stderr
-            try:
-                sys.stderr = io.StringIO()  # swallow polygonizer spam
+            logging.getLogger("kraken").setLevel(logging.CRITICAL)
+            devnull = io.StringIO()
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
                 seg = blla.segment(pil)
-            finally:
-                sys.stderr = old_stderr
-                _kraken_logger.setLevel(old_level)
+                records = list(rpred.rpred(_KRAKEN_MODEL, pil, seg))
         tokens = []
-        for record in rpred.rpred(_KRAKEN_MODEL, pil, seg):
+        for record in records:
             text = record.prediction.strip()
-            conf = int(record.confidences[0] * 100) if record.confidences else 50
             if not text:
                 continue
-            bbox = record.bbox
+            conf = int(record.confidences[0] * 100) if record.confidences else 50
+            # Kraken API varies: .bbox (legacy) vs .cuts (newer)
+            if hasattr(record, 'bbox') and record.bbox:
+                x0, y0, x1, y1 = record.bbox
+            elif hasattr(record, 'cuts') and record.cuts:
+                # cuts is a list of coordinate pairs; take bounding box
+                xs = [c[0] for c in record.cuts]
+                ys = [c[1] for c in record.cuts]
+                x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+            elif hasattr(record, 'line'):
+                # Baseline record: use line bounding box
+                line = record.line
+                if hasattr(line, 'bbox'):
+                    x0, y0, x1, y1 = line.bbox
+                elif hasattr(line, 'bounds'):
+                    x0, y0, x1, y1 = line.bounds
+                else:
+                    continue
+            else:
+                continue
             tokens.append({
                 "text":   ILLEGIBLE if conf < 10 else text,
                 "conf":   conf,
                 "source": source_tag,
-                "left": bbox[0], "top": bbox[1],
-                "right": bbox[2], "bottom": bbox[3],
+                "left": int(x0), "top": int(y0),
+                "right": int(x1), "bottom": int(y1),
             })
         return tokens
     except Exception as e:
-        # Disable Kraken for the rest of the run to avoid per-column spam
         err = str(e).lower()
         if "model" in err or "not loadable" in err or ".mlmodel" in err:
             HAS_KRAKEN = False
