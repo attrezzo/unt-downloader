@@ -1041,7 +1041,7 @@ def show_status(config: dict):
             # Count ark_id subdirectories that have at least one article file
             if folder.exists():
                 count = sum(1 for d in folder.iterdir()
-                            if d.is_dir() and any(d.glob("pg*_art*.txt")))
+                            if d.is_dir() and any(d.glob("*_art*.txt")))
             else:
                 count = 0
             bar = "█" * count + "░" * max(0, len(issues) - count)
@@ -1073,7 +1073,7 @@ def show_status(config: dict):
         steps.append(f"  python {script} --correct --resume")
     articles_dir = OUTPUT_DIR / "articles"
     articles_done = sum(1 for d in articles_dir.iterdir()
-                        if d.is_dir() and any(d.glob("pg*_art*.txt"))) \
+                        if d.is_dir() and any(d.glob("*_art*.txt"))) \
                     if articles_dir.exists() else 0
     if articles_done < len(issues):
         steps.append(f"  python {script} --correct --resume  # also generates articles/")

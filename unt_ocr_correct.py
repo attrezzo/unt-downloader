@@ -1212,7 +1212,61 @@ def process_page(ark_id: str, page_num: int, total_pages: int,
 
 
 # ============================================================================
-# ARTICLE SEGMENTATION (Stage 9a)
+# POST-CORRECTION PROOFREADING (Stage 9)
+# ============================================================================
+
+PROOFREAD_PROMPT = """You are an expert proofreader for 19th-century German newspaper text \
+recovered via OCR from Fraktur typeface on 35mm microfilm.
+
+You receive one page of OCR-corrected text from an 1891 German-language Texas newspaper.
+
+TASK: Fix spelling errors, obvious OCR artifacts, and broken words. Do NOT alter meaning.
+
+RULES:
+  • Fix common Fraktur OCR errors: ſ/s confusion, ff/ff, ä↔a, ü↔u, ö↔o transpositions
+  • Rejoin broken compound words ("Bürger meister" → "Bürgermeister")
+  • Rejoin hyphenated line breaks ("Zeitungs-\\nredakteur" → "Zeitungsredakteur")
+  • Correct obvious misspellings while respecting period-appropriate German spelling
+  • Preserve [unleserlich] and [unleserlich bbox=x,y,w,h] markers EXACTLY — never modify
+  • Preserve [Column N] markers EXACTLY
+  • Preserve paragraph breaks and overall text structure
+  • Do NOT add, remove, or rearrange content
+  • Do NOT translate — text stays in the original language
+  • If a word looks unusual but could be valid 1890s German, a Texas place name,
+    or a proper noun, keep it unchanged
+
+OUTPUT: Return the corrected text only. No commentary, no markdown, no JSON wrapping."""
+
+
+def proofread_page(page_num: int, corrected_text: str,
+                   api_key: str, rate_limiter=None) -> str:
+    """Stage 9: Claude proofreads corrected page text for spelling/OCR errors."""
+    if not corrected_text.strip() or corrected_text.startswith("[CORRECTION FAILED"):
+        return corrected_text
+
+    result = claude_api_call(
+        {"model": CLAUDE_MODEL, "max_tokens": 8000,
+         "system": PROOFREAD_PROMPT,
+         "messages": [{"role": "user", "content":
+             f"PAGE {page_num}\n\n{corrected_text}"}]},
+        api_key, rate_limiter, est_tokens=6000)
+
+    if not result.strip():
+        return corrected_text  # fallback to unproofread
+
+    # Verify [unleserlich] markers were preserved — reject if any were lost
+    orig_illegible = len(re.findall(r'\[unleserlich(?:\s+bbox=[^\]]+)?\]', corrected_text))
+    new_illegible = len(re.findall(r'\[unleserlich(?:\s+bbox=[^\]]+)?\]', result))
+    if orig_illegible > 0 and new_illegible < orig_illegible:
+        tprint(f"    ⚠ p{page_num:02d} proofread dropped {orig_illegible - new_illegible} "
+               f"[unleserlich] marker(s) — keeping original")
+        return corrected_text
+
+    return result
+
+
+# ============================================================================
+# ARTICLE SEGMENTATION (Stage 10a)
 # ============================================================================
 
 SEGMENTATION_PROMPT = f"""You are an expert in historical German newspaper structure.
@@ -1347,7 +1401,7 @@ def segment_page(page_num: int, corrected_text: str,
 
 
 # ============================================================================
-# PAGE-BOUNDARY STITCHING (Stage 9b)
+# PAGE-BOUNDARY STITCHING (Stage 10b)
 # ============================================================================
 
 STITCH_PROMPT = """You are an expert in historical German newspaper layout.
@@ -1439,6 +1493,9 @@ def write_article_files(issue: dict, all_items: list, ark_dir: Path) -> int:
     """
     Write one .txt file per article/ad. Also writes manifest.json.
 
+    Filename: {ark_id}_{date}_art{NNN}.txt
+    Example:  metapth1478562_1891-09-17_art003.txt
+
     File format:
       ARK:     {ark_id}
       ISSUE:   {full_title}
@@ -1451,12 +1508,17 @@ def write_article_files(issue: dict, all_items: list, ark_dir: Path) -> int:
       {body with [unleserlich] preserved exactly}
     """
     ark_dir.mkdir(parents=True, exist_ok=True)
+    # Clean old article files (both legacy pg*_art* and new naming patterns)
     for old in ark_dir.glob("pg*_art*.txt"):
         old.unlink()
+    for old in ark_dir.glob("*_art*.txt"):
+        if old.name != "manifest.json":
+            old.unlink()
 
     ark_id     = issue["ark_id"]
     full_title = issue.get("full_title", "")
     total_pgs  = issue.get("pages", 8)
+    issue_date = re.sub(r"[^\w\-]", "-", issue.get("date", "unknown"))
     manifest   = []
     art_num    = 1
 
@@ -1464,7 +1526,7 @@ def write_article_files(issue: dict, all_items: list, ark_dir: Path) -> int:
         pg_first = item["page_span"][0]
         pg_last  = item["page_span"][-1]
         spans    = f"{pg_first}-{pg_last}" if pg_first != pg_last else str(pg_first)
-        fname    = f"pg{pg_first:02d}_art{art_num:03d}.txt"
+        fname    = f"{ark_id}_{issue_date}_art{art_num:03d}.txt"
 
         lines = [
             f"ARK:     {ark_id}",
@@ -1613,7 +1675,7 @@ def process_issue(issue, api_key, correction_prompt, delay,
         return "missing_ocr"
 
     if resume and not retry_failed and corr_path.exists() and corr_path.stat().st_size > 500:
-        if ark_dir.exists() and any(ark_dir.glob("pg*_art*.txt")):
+        if ark_dir.exists() and any(ark_dir.glob("*_art*.txt")):
             tprint(f"  SKIP {fname}", worker=worker_id)
             return "skipped"
 
@@ -1685,6 +1747,23 @@ def process_issue(issue, api_key, correction_prompt, delay,
 
         time.sleep(delay)
 
+    # ── Stage 9: Proofreading pass ─────────────────────────────────────────
+    # Claude reviews each corrected page for residual spelling/OCR errors.
+    proofread_count = 0
+    for pg in sorted(corrected_pages.keys()):
+        text = corrected_pages[pg]
+        if text.startswith("[CORRECTION FAILED"):
+            continue
+        tprint(f"    p{pg:02d} proofreading...", worker=worker_id)
+        proofread = proofread_page(pg, text, api_key, rate_limiter)
+        if proofread != text:
+            corrected_pages[pg] = proofread
+            proofread_count += 1
+        time.sleep(delay)
+    if proofread_count:
+        tprint(f"  Proofread: {proofread_count}/{len(corrected_pages)} page(s) revised",
+               worker=worker_id)
+
     # Write corrected/ file (used by translate step)
     out_lines = [header, ""]
     for pg in sorted(corrected_pages.keys()):
@@ -1695,7 +1774,7 @@ def process_issue(issue, api_key, correction_prompt, delay,
     tprint(f"  → corrected/{fname}  ({corr_path.stat().st_size//1024}KB)",
            worker=worker_id)
 
-    # Article segmentation
+    # ── Stage 10a: Article segmentation ─────────────────────────────────────
     tprint(f"  Segmenting...", worker=worker_id)
     all_items = []
     for pg in sorted(corrected_pages.keys()):
@@ -1707,11 +1786,12 @@ def process_issue(issue, api_key, correction_prompt, delay,
         tprint(f"    p{pg:02d} → {len(items)} item(s)", worker=worker_id)
         time.sleep(delay)
 
-    # Cross-page stitching
+    # ── Stage 10b: Cross-page stitching ─────────────────────────────────────
     if len(corrected_pages) > 1 and all_items:
         tprint(f"  Stitching boundaries...", worker=worker_id)
         all_items = stitch_all_pages(all_items, api_key, rate_limiter, worker_id)
 
+    # ── Stage 11: Write article files ───────────────────────────────────────
     n = write_article_files(issue, all_items, ark_dir)
     tprint(f"  → articles/{ark_id}/  ({n} files)", worker=worker_id)
     return "ok"

@@ -70,7 +70,7 @@ ocr/{ark}_vol{v}_no{n}_{date}.txt           Raw portal HTML (preserved as-is)
 images/{ark_id}/page_01.jpg ... page_NN.jpg
 abbyy/{ark}_vol{v}_no{n}_{date}.xml         Optional ABBYY FineReader XML
 corrected/{ark}_vol{v}_no{n}_{date}.txt      Best OCR in source language
-articles/{ark_id}/pg{NN}_art{NNN}.txt        Segmented articles
+articles/{ark_id}/{ark_id}_{date}_art{NNN}.txt  Segmented articles
 articles/{ark_id}/manifest.json
 translated/{ark}_vol{v}_no{n}_{date}.txt     English translations
 confidence/{ark_id}_page{NN}.json            Per-word confidence (0–100 integers)
@@ -110,7 +110,8 @@ Title:  Bellville Wochenblatt. (Bellville, Tex.), Vol. 1, No. 1 ...
 
 ## Article file format
 
-Written ONLY by `write_article_files()`. File: `pg{NN}_art{NNN}.txt`.
+Written ONLY by `write_article_files()`. File: `{ark_id}_{date}_art{NNN}.txt`.
+Example: `metapth1478562_1891-09-17_art003.txt`
 
 ```
 ARK:     metapth1478562
@@ -165,7 +166,7 @@ Orchestrator passes flags via `run_worker()` → `subprocess.run()`.
 - `typeface`: "Fraktur" (case-insensitive) includes Fraktur error table in prompts.
 - `language`: drives Tesseract language selection + translation prompts.
 - `title_keyword`: filters IIIF manifests in --discover.
-- `layout_type`: planned dispatch for Stage 3/9. Values: `newspaper`, `letter`,
+- `layout_type`: planned dispatch for Stage 3/10. Values: `newspaper`, `letter`,
   `ledger`, `photograph`, `handwritten_document`.
 - `claude_model`: overrides `CLAUDE_MODEL` constant.
 - `anthropic_api_key`: fallback if `ANTHROPIC_API_KEY` env var unset.
@@ -227,10 +228,17 @@ Every engine returns `list[dict]`. Alignment accepts any mix automatically.
 | 7 Alignment | `align_sources(sources)` → `split_agree_dispute(aligned)` | Anchor priority: abbyy>tess_a>tess_b>kraken. 45px tolerance. Agreed/disputed split. |
 | 8 Claude | `arbitrate_with_claude(...)` | Image + agreed text + dispute table (≤300). Resolves `{?...?}`. Safety net strips leftovers. |
 
-**Stages 9–10 (in `process_issue()`):**
-- `segment_page()` — Claude segments corrected text into articles/ads.
-- `stitch_all_pages()` — sequential cross-page stitching. Do not parallelize.
-- `write_article_files()` — ONLY writer to `articles/`.
+**Stages 9–11 (in `process_issue()`):**
+- `proofread_page()` — Stage 9. Claude reviews each corrected page for residual
+  spelling errors and OCR artifacts (Fraktur-specific: ſ/s, broken compounds,
+  hyphenated line breaks). Validates [unleserlich] markers preserved. Runs before
+  corrected/ file is written, so the file contains proofread text.
+- `segment_page()` — Stage 10a. Claude segments corrected text into articles/ads.
+- `stitch_all_pages()` — Stage 10b. Sequential cross-page stitching. Do not parallelize.
+  Multi-page articles merged into single items with `page_span` updated.
+- `write_article_files()` — Stage 11. ONLY writer to `articles/`.
+  Files named `{ark_id}_{date}_art{NNN}.txt`. Each stitched multi-page article
+  is a single file.
 
 ### Key data structures
 
