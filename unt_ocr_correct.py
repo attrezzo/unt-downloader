@@ -103,7 +103,22 @@ except ImportError:
 try:
     import pytesseract
     from PIL import Image as PILImage
-    HAS_TESSERACT = bool(shutil.which("tesseract"))
+    # On Windows, Tesseract is often installed outside PATH
+    if sys.platform == "win32" and not shutil.which("tesseract"):
+        _win_tess_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Tesseract-OCR\tesseract.exe"),
+        ]
+        for _p in _win_tess_paths:
+            if os.path.isfile(_p):
+                pytesseract.pytesseract.tesseract_cmd = _p
+                break
+    HAS_TESSERACT = bool(
+        shutil.which("tesseract")
+        or (sys.platform == "win32"
+            and os.path.isfile(getattr(pytesseract.pytesseract, 'tesseract_cmd', '')))
+    )
 except ImportError:
     HAS_TESSERACT = False
 
@@ -1956,14 +1971,21 @@ def check_deps() -> str:
     lines = []
     lines.append(f"  OpenCV    : {'✓' if HAS_CV2 else '✗  pip install opencv-python-headless scipy'}")
     if HAS_TESSERACT:
+        tess_cmd = getattr(pytesseract.pytesseract, 'tesseract_cmd', 'tesseract')
         lang = detect_tesseract_lang()
         if lang:
-            lines.append(f"  Tesseract : ✓  lang={lang}")
+            lines.append(f"  Tesseract : ✓  lang={lang}  ({tess_cmd})")
         else:
             lines.append("  Tesseract : ✓ installed but NO Fraktur model")
-            lines.append("              apt-get install tesseract-ocr-deu")
+            if sys.platform == "win32":
+                lines.append("              Download deu.traineddata → Tesseract-OCR/tessdata/")
+            else:
+                lines.append("              apt-get install tesseract-ocr-deu")
     else:
-        lines.append("  Tesseract : ✗  apt-get install tesseract-ocr")
+        if sys.platform == "win32":
+            lines.append("  Tesseract : ✗  Install from https://github.com/UB-Mannheim/tesseract/wiki")
+        else:
+            lines.append("  Tesseract : ✗  apt-get install tesseract-ocr")
     lines.append(f"  Kraken    : {'✓' if HAS_KRAKEN else '✗  pip install kraken  (optional)'}")
     n_abbyy = len(list(ABBYY_DIR.glob("*.xml"))) if ABBYY_DIR and ABBYY_DIR.exists() else 0
     lines.append(f"  ABBYY XML : {n_abbyy} file(s) in abbyy/  "
