@@ -1141,7 +1141,14 @@ def run_worker(script_name: str, extra_args: list):
         print(f"Make sure {script_name} is in the same folder as this script.")
         sys.exit(1)
     cmd = [sys.executable, str(script)] + extra_args
-    print(f"Launching: {' '.join(cmd)}\n")
+    # Mask API key in display output
+    display_cmd = []
+    for i, arg in enumerate(cmd):
+        if arg.startswith("sk-ant-") or (i > 0 and cmd[i-1] == "--api-key"):
+            display_cmd.append("sk-ant-...***")
+        else:
+            display_cmd.append(arg)
+    print(f"Launching: {' '.join(display_cmd)}\n")
     result = subprocess.run(cmd)
     sys.exit(result.returncode)
 

@@ -615,28 +615,61 @@ def tesseract_tokens(col_img, lang: str, config: str, source_tag: str) -> list:
 # STAGE 6 — KRAKEN (optional third engine)
 # ============================================================================
 
+def _find_kraken_model() -> str | None:
+    """
+    Find a downloaded Kraken .mlmodel file in the platform data directories.
+    Kraken stores models in $XDG_DATA_HOME/htrmopo/<uuid>/*.mlmodel
+    (Linux: ~/.local/share/htrmopo/, Windows: %LOCALAPPDATA%/htrmopo/).
+    Also checks legacy paths under ~/.kraken/.
+    """
+    search_dirs = []
+
+    # Primary: htrmopo data directory (kraken ≥4.x)
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            search_dirs.append(Path(local) / "htrmopo")
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            search_dirs.append(Path(appdata) / "htrmopo")
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME", "")
+        if xdg:
+            search_dirs.append(Path(xdg) / "htrmopo")
+        search_dirs.append(Path.home() / ".local" / "share" / "htrmopo")
+
+    # Legacy: ~/.kraken/
+    search_dirs.append(Path.home() / ".kraken")
+
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        # Search recursively for .mlmodel files
+        models = list(d.rglob("*.mlmodel"))
+        if models:
+            # Prefer the most recently modified model
+            models.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return str(models[0])
+    return None
+
+
 def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
     """
     Run Kraken on a column strip if installed.
     Returns WordToken list in same format as tesseract_tokens.
-    Requires: pip install kraken && kraken models download 10.0.0
+    Requires: pip install kraken && kraken get 10.5281/zenodo.10592716
     """
     if not HAS_KRAKEN:
         return []
     global _KRAKEN_MODEL
     try:
         if _KRAKEN_MODEL is None:
-            # Try standard model paths; kraken ≥4.x uses vgsl model names,
-            # older versions accept "10.0.0" as a model ID.
-            for model_id in ["10.0.0.mlmodel", "10.0.0"]:
-                try:
-                    _KRAKEN_MODEL = kraken_models.load_any(model_id)
-                    break
-                except Exception:
-                    continue
-            if _KRAKEN_MODEL is None:
+            model_path = _find_kraken_model()
+            if model_path:
+                _KRAKEN_MODEL = kraken_models.load_any(model_path)
+            else:
                 raise RuntimeError(
-                    "Kraken model not found. Run: kraken get 10.0.0")
+                    "No .mlmodel found. Run: kraken get 10.5281/zenodo.10592716")
         pil = PILImage.fromarray(col_img)
         seg = blla.segment(pil)
         tokens = []
@@ -655,7 +688,14 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
             })
         return tokens
     except Exception as e:
-        tprint(f"    ⚠ Kraken error: {e}")
+        global HAS_KRAKEN
+        # Disable Kraken for the rest of the run to avoid per-column spam
+        err = str(e).lower()
+        if "model" in err or "not loadable" in err or ".mlmodel" in err:
+            HAS_KRAKEN = False
+            tprint(f"  ⚠ Kraken disabled for this run: {e}")
+        else:
+            tprint(f"    ⚠ Kraken error: {e}")
         return []
 
 
