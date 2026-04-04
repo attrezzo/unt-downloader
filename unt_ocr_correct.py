@@ -689,7 +689,7 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
     """
     if not HAS_KRAKEN:
         return []
-    global _KRAKEN_MODEL
+    global _KRAKEN_MODEL, HAS_KRAKEN
     try:
         if _KRAKEN_MODEL is None:
             model_path = _find_kraken_model()
@@ -715,7 +715,6 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
             })
         return tokens
     except Exception as e:
-        global HAS_KRAKEN
         # Disable Kraken for the rest of the run to avoid per-column spam
         err = str(e).lower()
         if "model" in err or "not loadable" in err or ".mlmodel" in err:
