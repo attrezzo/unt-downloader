@@ -140,6 +140,10 @@ ILLEGIBLE = "[unleserlich]"
 
 sys.stdout.reconfigure(line_buffering=True)
 _print_lock = threading.Lock()
+def _sanitize_date(date_str: str) -> str:
+    """Replace non-word/non-hyphen chars in a date string for use in filenames."""
+    return re.sub(r'[^\w-]', '-', date_str)
+
 def tprint(*args, worker: str = "", **kwargs):
     with _print_lock:
         prefix = f"[{worker}] " if worker else ""
@@ -1735,7 +1739,7 @@ def main():
             op = CORRECTED_DIR / (
                 f"{issue['ark_id']}_vol{str(issue.get('volume','?')).zfill(2)}"
                 f"_no{str(issue.get('number','?')).zfill(2)}"
-                f"_{re.sub(r'[^\w-]','-',issue.get('date','unknown'))}.txt")
+                f"_{_sanitize_date(issue.get('date','unknown'))}.txt")
             if args.resume and not args.retry_failed and op.exists() and op.stat().st_size > 500:
                 if (ARTICLES_DIR / issue["ark_id"]).exists():
                     continue
