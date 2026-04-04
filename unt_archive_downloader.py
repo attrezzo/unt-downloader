@@ -1361,8 +1361,13 @@ def main():
     p.add_argument("--tier",           default="default",
                    choices=["default", "build", "custom"],
                    help="Anthropic rate limit tier: default=50rpm, build=1000rpm")
+    p.add_argument("--logging",        type=int, default=1, choices=[1,2,3,4,5],
+                   help="Log verbosity: 1=progress 2=pages 3=engines 4=alignment 5=verbose")
+    p.add_argument("--verbose",        action="store_true",
+                   help="Shorthand for --logging 5")
 
     args = p.parse_args()
+    args.logging = 5 if args.verbose else args.logging
 
     if args.all:
         args.discover    = True
@@ -1436,6 +1441,8 @@ def main():
     if args.tier:                worker_args += ["--tier",               args.tier]
     if hasattr(args, 'max_output_tokens') and args.max_output_tokens != 32000:
         worker_args += ["--max-output-tokens", str(args.max_output_tokens)]
+    if args.logging > 1:
+        worker_args += ["--logging", str(args.logging)]
 
     # -----------------------------------------------------------------------
     # Execute steps

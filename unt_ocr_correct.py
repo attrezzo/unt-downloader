@@ -159,7 +159,18 @@ def _sanitize_date(date_str: str) -> str:
     """Replace non-word/non-hyphen chars in a date string for use in filenames."""
     return re.sub(r'[^\w-]', '-', date_str)
 
-def tprint(*args, worker: str = "", **kwargs):
+# ── Logging levels ──────────────────────────────────────────────────────────
+# 1 = issue progress + final results (default)
+# 2 = page-level progress (local OCR done, Claude done, proofread)
+# 3 = engine handoffs (Tesseract cmd, Kraken model, Claude API, segmentation)
+# 4 = alignment detail (per-column disputes, word counts, boundary reports)
+# 5 = verbose (dispute table samples, prompt snippets, token usage, timing)
+LOG_LEVEL = 1
+
+def tprint(*args, worker: str = "", level: int = 1, **kwargs):
+    """Print with optional log level gating. level=0 always prints."""
+    if level > LOG_LEVEL:
+        return
     with _print_lock:
         prefix = f"[{worker}] " if worker else ""
         print(prefix, *args, flush=True, **kwargs)
@@ -309,7 +320,7 @@ def parse_abbyy_page(xml_path: Path, page_index: int = 0) -> tuple:
         return word_tokens, block_bounds
 
     except Exception as e:
-        tprint(f"  ⚠ ABBYY parse error ({xml_path.name} page {page_index}): {e}")
+        tprint(f"  ⚠ ABBYY parse error ({xml_path.name} page {page_index}): {e}", level=2)
         return [], []
 
 
@@ -586,6 +597,8 @@ def tesseract_tokens(col_img, lang: str, config: str, source_tag: str) -> list:
     if not HAS_TESSERACT or not lang:
         return []
     try:
+        tprint(f"      {source_tag}: lang={lang} config='{config}' "
+               f"img={col_img.shape[1]}x{col_img.shape[0]}px", level=3)
         pil  = PILImage.fromarray(col_img)
         data = pytesseract.image_to_data(pil, lang=lang, config=config,
                                          output_type=pytesseract.Output.DICT)
@@ -605,9 +618,13 @@ def tesseract_tokens(col_img, lang: str, config: str, source_tag: str) -> list:
                 "right":  data["left"][i] + data["width"][i],
                 "bottom": data["top"][i]  + data["height"][i],
             })
+        tprint(f"      {source_tag}: → {len(tokens)} tokens", level=4)
+        if tokens and LOG_LEVEL >= 5:
+            sample = [t["text"] for t in tokens[:10]]
+            tprint(f"      {source_tag} sample: {' '.join(sample)}...", level=5)
         return tokens
     except Exception as e:
-        tprint(f"    ⚠ Tesseract ({source_tag}) error: {e}")
+        tprint(f"    ⚠ Tesseract ({source_tag}) error: {e}", level=2)
         return []
 
 
@@ -670,14 +687,14 @@ def _download_kraken_model() -> str:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / _KRAKEN_MODEL_NAME
 
-    tprint(f"  Downloading Kraken model → {dest}")
-    tprint(f"    URL: {_KRAKEN_MODEL_URL.split('?')[0]}")
+    tprint(f"  Downloading Kraken model → {dest}", level=1)
+    tprint(f"    URL: {_KRAKEN_MODEL_URL.split('?')[0]}", level=1)
     req = urllib.request.Request(_KRAKEN_MODEL_URL,
                                 headers={"User-Agent": "UNT-Archive/1.0"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         data = resp.read()
     dest.write_bytes(data)
-    tprint(f"    ✓ {len(data) // 1024:,} KB downloaded")
+    tprint(f"    ✓ {len(data) // 1024:,} KB downloaded", level=1)
     return str(dest)
 
 
@@ -701,7 +718,7 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
                     if not model_path:
                         model_path = _download_kraken_model()
                     _KRAKEN_MODEL = kraken_models.load_any(model_path)
-                    tprint(f"  Kraken model: {model_path}")
+                    tprint(f"  Kraken model: {model_path}", level=3)
         pil = PILImage.fromarray(col_img)
         # Suppress ALL Kraken output during segmentation + recognition.
         # Polygonizer warnings go to stdout/stderr/logging unpredictably.
@@ -719,24 +736,27 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
             if not text:
                 continue
             conf = int(record.confidences[0] * 100) if record.confidences else 50
-            # Kraken API varies: .bbox (legacy) vs .cuts (newer)
-            if hasattr(record, 'bbox') and record.bbox:
-                x0, y0, x1, y1 = record.bbox
-            elif hasattr(record, 'cuts') and record.cuts:
-                # cuts is a list of coordinate pairs; take bounding box
-                xs = [c[0] for c in record.cuts]
-                ys = [c[1] for c in record.cuts]
-                x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-            elif hasattr(record, 'line'):
-                # Baseline record: use line bounding box
-                line = record.line
-                if hasattr(line, 'bbox'):
-                    x0, y0, x1, y1 = line.bbox
-                elif hasattr(line, 'bounds'):
-                    x0, y0, x1, y1 = line.bounds
+            # Extract bounding box from record — API varies by Kraken version:
+            # BBoxOCRRecord has .bbox; BaselineOCRRecord has .boundary (polygon)
+            x0 = y0 = x1 = y1 = 0
+            try:
+                if hasattr(record, 'bbox') and record.bbox:
+                    # Legacy BBoxOCRRecord
+                    x0, y0, x1, y1 = record.bbox
+                elif hasattr(record, 'boundary') and record.boundary:
+                    # BaselineOCRRecord: boundary is a polygon [(x,y), ...]
+                    xs = [p[0] for p in record.boundary]
+                    ys = [p[1] for p in record.boundary]
+                    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+                elif hasattr(record, 'baseline') and record.baseline:
+                    # Fallback: derive from baseline endpoints
+                    xs = [p[0] for p in record.baseline]
+                    ys = [p[1] for p in record.baseline]
+                    x0, y0 = min(xs), min(ys) - 10
+                    x1, y1 = max(xs), max(ys) + 10
                 else:
                     continue
-            else:
+            except Exception:
                 continue
             tokens.append({
                 "text":   ILLEGIBLE if conf < 10 else text,
@@ -745,14 +765,18 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
                 "left": int(x0), "top": int(y0),
                 "right": int(x1), "bottom": int(y1),
             })
+        tprint(f"      kraken: → {len(tokens)} tokens from {len(records)} lines", level=4)
+        if tokens and LOG_LEVEL >= 5:
+            sample = [t["text"] for t in tokens[:10]]
+            tprint(f"      kraken sample: {' '.join(sample)}...", level=5)
         return tokens
     except Exception as e:
         err = str(e).lower()
         if "model" in err or "not loadable" in err or ".mlmodel" in err:
             HAS_KRAKEN = False
-            tprint(f"  ⚠ Kraken disabled for this run: {e}")
+            tprint(f"  ⚠ Kraken disabled for this run: {e}", level=1)
         else:
-            tprint(f"    ⚠ Kraken error: {e}")
+            tprint(f"    ⚠ Kraken error: {e}", level=2)
         return []
 
 
@@ -1012,6 +1036,12 @@ The resolutions dict is for audit logging — include every dispute you resolved
 def claude_api_call(payload: dict, api_key: str,
                     rate_limiter=None, est_tokens: int = 8000) -> str:
     """Shared Claude API call with retry/rate-limit handling."""
+    tprint(f"    → Claude API: model={payload.get('model')} "
+           f"max_tokens={payload.get('max_tokens')} est={est_tokens}", level=3)
+    if LOG_LEVEL >= 5:
+        sys_prompt = payload.get("system", "")
+        tprint(f"      system prompt: {len(sys_prompt)} chars, "
+               f"first 100: {sys_prompt[:100]}...", level=5)
     req_data = json.dumps(payload).encode("utf-8")
     if rate_limiter:
         rate_limiter.acquire(estimated_tokens=est_tokens)
@@ -1026,11 +1056,12 @@ def claude_api_call(payload: dict, api_key: str,
                 method="POST")
             with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read())
+            usage = result.get("usage", {})
+            in_tok  = usage.get("input_tokens", 0)
+            out_tok = usage.get("output_tokens", 0)
             if rate_limiter:
-                usage = result.get("usage", {})
-                rate_limiter.record_usage(
-                    input_tokens=usage.get("input_tokens", 0),
-                    output_tokens=usage.get("output_tokens", 0))
+                rate_limiter.record_usage(input_tokens=in_tok, output_tokens=out_tok)
+            tprint(f"    ← Claude API: {in_tok} in + {out_tok} out tokens", level=3)
             for block in result.get("content", []):
                 if block.get("type") == "text":
                     return block["text"].strip()
@@ -1210,7 +1241,7 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     # ── Load image ────────────────────────────────────────────────────────
     img_bytes, _ = fetch_page_image(ark_id, page_num)
     if not img_bytes:
-        tprint(f"    p{page_num:02d} ⚠ image unavailable", worker=worker_id)
+        tprint(f"    p{page_num:02d} ⚠ image unavailable", worker=worker_id, level=1)
         result["no_image"] = True
         result["agreed_text"] = unt_ocr_text[:3000]
         result["all_disputes"] = []
@@ -1237,7 +1268,7 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
             opencv_cols, abbyy_gutters, expected_cols=expected_cols)
         if boundary_report and boundary_report != "Boundaries agree":
             tprint(f"    p{page_num:02d} boundary comparison:\n{boundary_report}",
-                   worker=worker_id)
+                   worker=worker_id, level=4)
 
     # ── Assign ABBYY tokens to columns ────────────────────────────────────
     abbyy_by_col: dict[int, list] = {}
@@ -1422,7 +1453,7 @@ def proofread_page(page_num: int, corrected_text: str,
     new_illegible = len(re.findall(r'\[unleserlich(?:\s+bbox=[^\]]+)?\]', result))
     if orig_illegible > 0 and new_illegible < orig_illegible:
         tprint(f"    ⚠ p{page_num:02d} proofread dropped {orig_illegible - new_illegible} "
-               f"[unleserlich] marker(s) — keeping original")
+               f"[unleserlich] marker(s) — keeping original", level=2)
         return corrected_text
 
     return result
@@ -1557,7 +1588,7 @@ def segment_page(page_num: int, corrected_text: str,
             item["page_span"] = [page_num, page_num]
         return items
     except Exception as e:
-        tprint(f"    ⚠ Segmentation parse error p{page_num}: {e}")
+        tprint(f"    ⚠ Segmentation parse error p{page_num}: {e}", level=2)
         return [{"type": "article", "headline": "", "body": corrected_text,
                  "page": page_num, "page_span": [page_num, page_num],
                  "continues_from_prev": False, "continues_to_next": False}]
@@ -1628,7 +1659,7 @@ def stitch_all_pages(all_items: list, api_key: str,
         first_item = pages[pb][0]
         if last_item.get("type") in ("masthead", "advertisement"):
             continue
-        tprint(f"    stitch p{pa}→p{pb} ...", worker=worker_id)
+        tprint(f"    stitch p{pa}→p{pb} ...", worker=worker_id, level=3)
         decision = stitch_boundary(last_item, first_item, api_key, rate_limiter)
         if decision == "merge":
             merged_body = last_item["body"].rstrip() + "\n\n" + first_item["body"].lstrip()
@@ -1639,9 +1670,9 @@ def stitch_all_pages(all_items: list, api_key: str,
             last_item["continues_to_next"] = first_item.get("continues_to_next", False)
             pages[pb].pop(0)
             merges += 1
-            tprint(f"    ✓ merged p{pa}→p{pb}", worker=worker_id)
+            tprint(f"    ✓ merged p{pa}→p{pb}", worker=worker_id, level=3)
     if merges:
-        tprint(f"  Stitched {merges} cross-page article(s)", worker=worker_id)
+        tprint(f"  Stitched {merges} cross-page article(s)", worker=worker_id, level=1)
     result = []
     for pg in sorted_pgs:
         result.extend(pages.get(pg, []))
@@ -1834,18 +1865,18 @@ def process_issue(issue, api_key, correction_prompt, delay,
     ark_dir   = ARTICLES_DIR  / ark_id
 
     if not ocr_path.exists():
-        tprint(f"  ⚠ OCR not found: {fname}", worker=worker_id)
+        tprint(f"  ⚠ OCR not found: {fname}", worker=worker_id, level=1)
         return "missing_ocr"
 
     if resume and not retry_failed and corr_path.exists() and corr_path.stat().st_size > 500:
         if ark_dir.exists() and any(ark_dir.glob("*_art*.txt")):
-            tprint(f"  SKIP {fname}", worker=worker_id)
+            tprint(f"  SKIP {fname}", worker=worker_id, level=1)
             return "skipped"
 
     ocr_raw = ocr_path.read_text(encoding="utf-8", errors="replace")
     header, ocr_pages = parse_ocr_pages(ocr_raw)
     if not ocr_pages:
-        tprint(f"  ⚠ Could not parse pages in {fname}", worker=worker_id)
+        tprint(f"  ⚠ Could not parse pages in {fname}", worker=worker_id, level=1)
         return "parse_error"
 
     actual_pages = max(ocr_pages.keys())
@@ -1871,10 +1902,10 @@ def process_issue(issue, api_key, correction_prompt, delay,
                "Kraken" if HAS_KRAKEN else None,
                "ABBYY" if has_abbyy else None]
     engine_str = "+".join(e for e in engines if e) or "Claude-only"
-    tprint(f"  {actual_pages}pp  redo={redo}  engines={engine_str}", worker=worker_id)
+    tprint(f"  {actual_pages}pp  redo={redo}  engines={engine_str}", worker=worker_id, level=1)
     if has_abbyy:
         tprint(f"  ABBYY XML: {axml.name} — treating as one source among several",
-               worker=worker_id)
+               worker=worker_id, level=1)
 
     corrected_pages = dict(existing_corrected)
 
@@ -1883,11 +1914,11 @@ def process_issue(issue, api_key, correction_prompt, delay,
     local_results = {}
     for pg, needs_redo in pages_to_process:
         if not needs_redo:
-            tprint(f"    p{pg:02d} KEEP", worker=worker_id)
+            tprint(f"    p{pg:02d} KEEP", worker=worker_id, level=2)
             continue
 
         unt_ocr = strip_ocr_html(ocr_pages.get(pg, ""))
-        tprint(f"    p{pg:02d}/{actual_pages} local OCR ...", worker=worker_id)
+        tprint(f"    p{pg:02d}/{actual_pages} local OCR ...", worker=worker_id, level=2)
 
         abbyy_tokens, abbyy_blocks = [], []
         if has_abbyy:
@@ -1902,9 +1933,9 @@ def process_issue(issue, api_key, correction_prompt, delay,
                 worker_id=worker_id,
             )
             local_results[pg] = local
-            tprint(f"    p{pg:02d} ✓ [{local['summary']}]", worker=worker_id)
+            tprint(f"    p{pg:02d} ✓ [{local['summary']}]", worker=worker_id, level=2)
         except Exception as e:
-            tprint(f"    p{pg:02d} ✗ local: {e}", worker=worker_id)
+            tprint(f"    p{pg:02d} ✗ local: {e}", worker=worker_id, level=1)
             corrected_pages[pg] = f"[CORRECTION FAILED: {e}]\n\n{unt_ocr}"
 
     # Summary of disputes across all pages
@@ -1916,7 +1947,7 @@ def process_issue(issue, api_key, correction_prompt, delay,
     tprint(f"  Local OCR done: {len(local_results)} pages, "
            f"{total_disputes} disputes, "
            f"{pages_needing_claude} page(s) need Claude",
-           worker=worker_id)
+           worker=worker_id, level=1)
 
     # ── Phase B: CLAUDE stages (8-9) ─────────────────────────────────────
     for pg in sorted(local_results.keys()):
@@ -1927,9 +1958,9 @@ def process_issue(issue, api_key, correction_prompt, delay,
                 api_key, correction_prompt, rate_limiter)
             corrected_pages[pg] = corrected
             snippet = corrected[:60].replace("\n", " ")
-            tprint(f"    p{pg:02d} ✓ [{summary}]  \"{snippet}...\"", worker=worker_id)
+            tprint(f"    p{pg:02d} ✓ [{summary}]  \"{snippet}...\"", worker=worker_id, level=2)
         except Exception as e:
-            tprint(f"    p{pg:02d} ✗ claude: {e}", worker=worker_id)
+            tprint(f"    p{pg:02d} ✗ claude: {e}", worker=worker_id, level=1)
             # Fall back to agreed text from local stage
             corrected_pages[pg] = (f"[CORRECTION FAILED: {e}]\n\n"
                                    + local.get("agreed_text", ""))
@@ -1941,7 +1972,7 @@ def process_issue(issue, api_key, correction_prompt, delay,
         text = corrected_pages[pg]
         if text.startswith("[CORRECTION FAILED"):
             continue
-        tprint(f"    p{pg:02d} proofreading...", worker=worker_id)
+        tprint(f"    p{pg:02d} proofreading...", worker=worker_id, level=2)
         proofread = proofread_page(pg, text, api_key, rate_limiter)
         if proofread != text:
             corrected_pages[pg] = proofread
@@ -1949,7 +1980,7 @@ def process_issue(issue, api_key, correction_prompt, delay,
         time.sleep(delay)
     if proofread_count:
         tprint(f"  Proofread: {proofread_count}/{len(corrected_pages)} page(s) revised",
-               worker=worker_id)
+               worker=worker_id, level=1)
 
     # Write corrected/ file (used by translate step)
     out_lines = [header, ""]
@@ -1959,10 +1990,10 @@ def process_issue(issue, api_key, correction_prompt, delay,
         out_lines.append("")
     corr_path.write_text('\n'.join(out_lines), encoding="utf-8")
     tprint(f"  → corrected/{fname}  ({corr_path.stat().st_size//1024}KB)",
-           worker=worker_id)
+           worker=worker_id, level=1)
 
     # ── Stage 10a: Article segmentation ─────────────────────────────────────
-    tprint(f"  Segmenting...", worker=worker_id)
+    tprint(f"  Segmenting...", worker=worker_id, level=1)
     all_items = []
     for pg in sorted(corrected_pages.keys()):
         text = corrected_pages[pg]
@@ -1970,17 +2001,17 @@ def process_issue(issue, api_key, correction_prompt, delay,
             continue
         items = segment_page(pg, text, api_key, rate_limiter)
         all_items.extend(items)
-        tprint(f"    p{pg:02d} → {len(items)} item(s)", worker=worker_id)
+        tprint(f"    p{pg:02d} → {len(items)} item(s)", worker=worker_id, level=2)
         time.sleep(delay)
 
     # ── Stage 10b: Cross-page stitching ─────────────────────────────────────
     if len(corrected_pages) > 1 and all_items:
-        tprint(f"  Stitching boundaries...", worker=worker_id)
+        tprint(f"  Stitching boundaries...", worker=worker_id, level=1)
         all_items = stitch_all_pages(all_items, api_key, rate_limiter, worker_id)
 
     # ── Stage 11: Write article files ───────────────────────────────────────
     n = write_article_files(issue, all_items, ark_dir)
-    tprint(f"  → articles/{ark_id}/  ({n} files)", worker=worker_id)
+    tprint(f"  → articles/{ark_id}/  ({n} files)", worker=worker_id, level=1)
     return "ok"
 
 
@@ -2111,7 +2142,14 @@ def main():
     p.add_argument("--serial",         action="store_true")
     p.add_argument("--tier",           default="default",
                    choices=["default","build","custom"])
+    p.add_argument("--logging",        type=int, default=1, choices=[1,2,3,4,5],
+                   help="Log verbosity: 1=progress 2=pages 3=engines 4=alignment 5=verbose")
+    p.add_argument("--verbose",        action="store_true",
+                   help="Shorthand for --logging 5")
     args = p.parse_args()
+
+    global LOG_LEVEL
+    LOG_LEVEL = 5 if args.verbose else args.logging
 
     config_path = Path(args.config_path)
     if not config_path.exists():
@@ -2188,10 +2226,10 @@ def main():
         idx, issue = idx_issue
         ark_id = issue["ark_id"]
         wid    = ""
-        tprint(f"\n{'─'*60}")
+        tprint(f"\n{'─'*60}", level=1)
         tprint(f"[{idx+1}/{len(issues)}] {ark_id}  "
                f"Vol.{issue.get('volume','?')} No.{issue.get('number','?')}  "
-               f"{issue.get('date','')}")
+               f"{issue.get('date','')}", level=1)
         status = process_issue(
             issue, api_key, correction_prompt,
             args.delay, args.resume, args.retry_failed,
@@ -2215,11 +2253,11 @@ def main():
     for item in all_items:
         run_issue(item)
 
-    if rate_limiter: tprint(f"\nRate limiter: {rate_limiter.status_line()}")
-    tprint(f"\n{'='*50}")
-    tprint(f"Complete: {ctr['ok']}  Skipped: {ctr['skipped']}  Errors: {ctr['err']}")
-    tprint(f"Corrected: {CORRECTED_DIR}")
-    tprint(f"Articles:  {ARTICLES_DIR}")
+    if rate_limiter: tprint(f"\nRate limiter: {rate_limiter.status_line()}", level=1)
+    tprint(f"\n{'='*50}", level=1)
+    tprint(f"Complete: {ctr['ok']}  Skipped: {ctr['skipped']}  Errors: {ctr['err']}", level=1)
+    tprint(f"Corrected: {CORRECTED_DIR}", level=1)
+    tprint(f"Articles:  {ARTICLES_DIR}", level=1)
 
 if __name__ == "__main__":
     main()
