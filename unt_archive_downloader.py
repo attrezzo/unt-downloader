@@ -235,184 +235,253 @@ def configure_global(existing: dict = None) -> dict:
 # UNT metadata lookup — called before the wizard to pre-populate defaults
 # ---------------------------------------------------------------------------
 
+_UNT_HEADERS = {"User-Agent": "UNT-Archive-Researcher/1.0 (Texas history research)"}
+
+
+def _title_code_from_url(raw: str) -> str | None:
+    """Extract a UNT title code (t#####) from any URL or bare value."""
+    m = re.search(r"/titles/(t\d+)", raw)
+    return m.group(1) if m else None
+
+
+def _ark_id_from_url(raw: str) -> str | None:
+    """Extract a metapth ARK ID from any URL or bare value."""
+    m = re.search(r"(metapth\d+)", raw)
+    return m.group(1) if m else None
+
+
+def _fetch_kbart(title_code: str) -> dict:
+    """
+    Fetch KBART.txt for a title code and return a flat dict of useful fields.
+    KBART is the single most complete metadata source UNT exposes.
+    """
+    url = f"https://texashistory.unt.edu/explore/titles/{title_code}/KBART.txt"
+    try:
+        r = requests.get(url, headers=_UNT_HEADERS, timeout=20)
+        if r.status_code != 200:
+            return {}
+        lines = r.text.splitlines()
+        if len(lines) < 2:
+            return {}
+        hdrs = lines[0].split("\t")
+        vals = lines[1].split("\t")
+        row  = dict(zip(hdrs, vals))
+
+        out = {}
+        if row.get("publication_title"):
+            # Strip trailing year range in parentheses: "Bellville Wochenblatt (Bellville, Tex.) 1891-1909"
+            name = row["publication_title"].strip()
+            name = re.sub(r"\s+\d{4}[-–]\d{4}\s*$", "", name).strip()
+            out["title_name"] = name
+        if row.get("title_id"):     out["title_code"]    = row["title_id"].strip()
+        if row.get("lccn_number"):  out["lccn"]          = row["lccn_number"].strip()
+        if row.get("oclc_number"):  out["oclc"]          = row["oclc_number"].strip()
+        if row.get("place_of_publication"):
+            out["pub_location"] = row["place_of_publication"].strip()
+        if row.get("publisher_name") and row["publisher_name"].strip():
+            out["publisher"] = row["publisher_name"].strip()
+        if row.get("language"):
+            lang = row["language"].strip().lower()
+            # ISO 639-2 → human readable
+            lang_map = {"ger": "German", "eng": "English", "spa": "Spanish",
+                        "fre": "French",  "por": "Portuguese"}
+            out["language"] = lang_map.get(lang, lang.capitalize())
+        if row.get("date_first_issue_online"):
+            out["date_first"] = row["date_first_issue_online"].strip()
+        if row.get("date_last_issue_online"):
+            out["date_last"] = row["date_last_issue_online"].strip()
+        if out.get("date_first") and out.get("date_last"):
+            y1 = out["date_first"][:4]
+            y2 = out["date_last"][:4]
+            out["date_range"] = f"{y1}–{y2}" if y1 != y2 else y1
+        if row.get("title_url"):
+            out["permalink"] = row["title_url"].strip()
+        return out
+    except Exception:
+        return {}
+
+
+def _fetch_ark_range(title_code: str) -> dict:
+    """
+    Fetch identifiers.json which lists every issue ARK.
+    Returns ark_scan_start, ark_scan_end, and first_ark derived from the actual issue list.
+    """
+    url = f"https://texashistory.unt.edu/explore/titles/{title_code}/identifiers.json"
+    try:
+        r = requests.get(url, headers=_UNT_HEADERS, timeout=30)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        # Keys are "ark:/67531/metapthNNNNNN"
+        nums = []
+        for key in data:
+            m = re.search(r"metapth(\d+)", key)
+            if m:
+                nums.append(int(m.group(1)))
+        if not nums:
+            return {}
+        lo, hi = min(nums), max(nums)
+        first_ark = f"metapth{lo}"
+        return {
+            "first_ark":      first_ark,
+            "ark_scan_start": lo - 3,     # small buffer before first issue
+            "ark_scan_end":   hi + 10,    # buffer after last known issue
+        }
+    except Exception:
+        return {}
+
+
+def _fetch_publisher_from_manifest(ark_id: str) -> dict:
+    """Fetch the IIIF manifest of one issue and return parsed metadata."""
+    url = f"https://texashistory.unt.edu/ark:/67531/{ark_id}/manifest/"
+    try:
+        r = requests.get(url, headers=_UNT_HEADERS, timeout=20)
+        if r.status_code != 200:
+            return {}
+        return _parse_manifest_metadata(r.json())
+    except Exception:
+        return {}
+
+
 def _fetch_title_metadata(title_code: str) -> dict:
     """
-    Fetch metadata from UNT's title-level endpoints using the title code.
-
-    Sources tried in order:
-      1. identifiers.json  → LCCN, OCLC, partner ARKs, collection code
-      2. KBART.txt         → title name, date range, first/last issue dates
-      3. First issue IIIF manifest → publisher, language, ARK range start,
-                                     page count, first canvas image service URL
-
-    Returns a dict of discovered values (any field may be absent if the
-    endpoint failed or didn't contain it). All values are strings.
+    Fetch all available metadata for a title code from UNT endpoints.
+    Sources (in order of reliability):
+      1. KBART.txt       — title, LCCN, OCLC, language, location, dates
+      2. identifiers.json — all issue ARKs → computed scan range
+      3. First issue IIIF manifest — publisher (if not in KBART)
     """
-    discovered = {"title_code": title_code}
-    base = "https://texashistory.unt.edu"
+    print(f"  Fetching metadata from texashistory.unt.edu ...", end="", flush=True)
 
-    headers = {"User-Agent": "UNT-Archive-Researcher/1.0 (Texas history research)"}
+    discovered = {"title_code": title_code,
+                  "permalink": f"https://texashistory.unt.edu/explore/titles/{title_code}/"}
 
-    # ── 1. identifiers.json ───────────────────────────────────────────────
-    try:
-        url = f"{base}/explore/titles/{title_code}/identifiers.json"
-        req = requests.get(url, headers=headers, timeout=20)
-        if req.status_code == 200:
-            ids = req.json()
-            # Structure: list of {type, value} dicts  OR  dict of type→value
-            if isinstance(ids, list):
-                for entry in ids:
-                    t = entry.get("type", "").lower()
-                    v = str(entry.get("value", "")).strip()
-                    if t == "lccn"  and v: discovered["lccn"]          = v
-                    if t == "oclc"  and v: discovered["oclc"]          = v
-                    if t == "ark"   and v: discovered["first_ark"]     = v
-                    if t in ("collection", "code") and v:
-                        discovered["collection_id"] = v
-            elif isinstance(ids, dict):
-                for k, v in ids.items():
-                    kl = k.lower()
-                    if "lccn"  in kl and v: discovered["lccn"]          = str(v)
-                    if "oclc"  in kl and v: discovered["oclc"]          = str(v)
-                    if "ark"   in kl and v: discovered["first_ark"]     = str(v)
-    except Exception:
-        pass
+    kbart = _fetch_kbart(title_code)
+    discovered.update(kbart)
+    print(".", end="", flush=True)
 
-    # ── 2. KBART.txt ──────────────────────────────────────────────────────
-    try:
-        url = f"{base}/explore/titles/{title_code}/KBART.txt"
-        req = requests.get(url, headers=headers, timeout=20)
-        if req.status_code == 200:
-            lines = req.text.splitlines()
-            if len(lines) >= 2:
-                hdrs = lines[0].split("\t")
-                vals = lines[1].split("\t")
-                row  = dict(zip(hdrs, vals))
-                if row.get("publication_title"):
-                    discovered["title_name"] = row["publication_title"].strip()
-                if row.get("date_first_issue_online"):
-                    discovered["date_first"] = row["date_first_issue_online"].strip()
-                if row.get("date_last_issue_online"):
-                    discovered["date_last"]  = row["date_last_issue_online"].strip()
-                if row.get("publisher_name"):
-                    discovered["publisher"]  = row["publisher_name"].strip()
-                if row.get("coverage_notes"):
-                    discovered["coverage"]   = row["coverage_notes"].strip()
-    except Exception:
-        pass
+    ark_range = _fetch_ark_range(title_code)
+    discovered.update(ark_range)
+    print(".", end="", flush=True)
 
-    # Build date_range string if we got both ends
-    if discovered.get("date_first") and discovered.get("date_last"):
-        y1 = discovered["date_first"][:4]
-        y2 = discovered["date_last"][:4]
-        discovered["date_range"] = f"{y1}–{y2}" if y1 != y2 else y1
-
-    # ── 3. IIIF manifest of first known issue ─────────────────────────────
-    # Try to find a first ARK from identifiers, or scan a small range
-    first_ark = discovered.get("first_ark", "")
-
-    # If identifiers.json gave us an ARK list, it may be the title-level ARK
-    # not an issue ARK — strip any path and try it as an issue manifest
-    if first_ark and "/" in first_ark:
-        first_ark = first_ark.rstrip("/").split("/")[-1]
-
-    if first_ark and first_ark.startswith("metapth"):
-        try:
-            url = f"{base}/ark:/67531/{first_ark}/manifest/"
-            req = requests.get(url, headers=headers, timeout=20)
-            if req.status_code == 200:
-                mf = req.json()
-                _parse_manifest_into(mf, first_ark, discovered)
-        except Exception:
-            pass
+    if discovered.get("first_ark") and not discovered.get("publisher"):
+        pub = _fetch_publisher_from_manifest(discovered["first_ark"])
+        for k, v in pub.items():
+            if k not in discovered or not discovered[k]:
+                discovered[k] = v
+    print(" done\n")
 
     return discovered
 
 
-def _parse_manifest_into(mf: dict, ark_id: str, discovered: dict):
-    """Extract useful fields from a IIIF manifest into discovered dict."""
-    label = mf.get("label", "")
-    if label and "title_name" not in discovered:
-        # Strip the volume/issue suffix to get just the title name
-        # e.g. "Bellville Wochenblatt. (Bellville, Tex.), Vol. 1, No. 1 ..."
-        # → "Bellville Wochenblatt"
-        clean = re.sub(r"\s*[\.,]\s*\(.*", "", label).strip()
-        if clean:
-            discovered["title_name"] = clean
+def _parse_manifest_metadata(mf: dict) -> dict:
+    """
+    Extract every useful field from a IIIF manifest metadata array.
+    The array uses dot-qualified keys like 'title.serialtitle', 'identifier.LCCN', etc.
+    """
+    lang_map = {"ger": "German", "eng": "English", "spa": "Spanish",
+                "fre": "French", "por": "Portuguese"}
+    out = {}
+    languages = []
 
-    # Metadata array: look for publisher, language, location, date
     for entry in mf.get("metadata", []):
-        lbl = entry.get("label", "").lower()
+        lbl = entry.get("label", "")
         val = entry.get("value", "")
         if isinstance(val, list): val = val[0] if val else ""
         val = str(val).strip()
         if not val:
             continue
-        if "publisher" in lbl and "publisher" not in discovered:
-            discovered["publisher"] = val
-        if "language" in lbl and "language" not in discovered:
-            discovered["language"] = val
-        if "location" in lbl and "pub_location" not in discovered:
-            discovered["pub_location"] = val
-        if "date" in lbl and "date_first" not in discovered:
-            discovered["date_first"] = val
+        lbl_lower = lbl.lower()
 
-    # ARK range: record the numeric part so we can suggest a scan start
-    m = re.search(r"metapth(\d+)", ark_id)
-    if m:
-        n = int(m.group(1))
-        discovered["ark_scan_start_hint"] = n - 5   # start a little before
+        if lbl_lower == "title.serialtitle":
+            out["title_name"] = val
+        elif lbl_lower == "publisher" and "publisher" not in out:
+            out["publisher"] = val
+        elif lbl_lower == "language":
+            lang = lang_map.get(val.lower(), val.capitalize())
+            if lang not in languages:
+                languages.append(lang)
+        elif lbl_lower == "identifier.lccn":
+            out["lccn"] = val
+        elif lbl_lower == "identifier.oclc":
+            out["oclc"] = val
+        elif lbl_lower == "coverage.placename" and "pub_location" not in out:
+            # "United States - Texas - Austin County - Bellville" → "Bellville, Texas"
+            parts = [p.strip() for p in val.split("-")]
+            if len(parts) >= 2:
+                out["pub_location"] = f"{parts[-1]}, {parts[-2]}"
+            else:
+                out["pub_location"] = val
+        elif lbl_lower.startswith("description.physical") and "source_medium" not in out:
+            if "microfilm" in val.lower():
+                m = re.search(r"(\d+\s*mm\.?\s*microfilm)", val, re.I)
+                out["source_medium"] = m.group(1).strip() if m else "microfilm"
 
-    # Page count from first canvas
-    seqs = mf.get("sequences", [])
-    if seqs:
-        canvases = seqs[0].get("canvases", [])
-        if canvases and "pages_typical" not in discovered:
-            discovered["pages_typical"] = len(canvases)
+    # Primary language: prefer non-English for multilingual items
+    if languages:
+        non_en = [l for l in languages if l.lower() != "english"]
+        out["language"] = non_en[0] if non_en else languages[0]
+
+    return out
+
+
+def _find_title_code_from_issue_html(ark_id: str) -> str | None:
+    """
+    Fetch the issue's HTML page and extract the title code from its navigation links.
+    The page reliably contains hrefs like /explore/titles/t02903/ in breadcrumbs.
+    """
+    try:
+        url = f"https://texashistory.unt.edu/ark:/67531/{ark_id}/"
+        r = requests.get(url, headers=_UNT_HEADERS, timeout=20)
+        if r.status_code == 200:
+            m = re.search(r"/titles/(t\d+)/", r.text)
+            return m.group(1) if m else None
+    except Exception:
+        pass
+    return None
 
 
 def _lookup_by_ark(ark_id: str) -> dict:
     """
-    Alternative entry point: look up via a known issue ARK rather than title code.
-    Fetches the IIIF manifest and extracts what it can.
-    Returns discovered dict.
+    Look up via a known issue ARK.
+    1. Parse the IIIF manifest for all available metadata fields.
+    2. Find the title code from the issue's HTML page.
+    3. Use KBART + identifiers.json to fill in anything the manifest lacks.
     """
+    print(f"  Fetching metadata for {ark_id} ...", end="", flush=True)
     discovered = {"first_ark": ark_id}
-    base    = "https://texashistory.unt.edu"
-    headers = {"User-Agent": "UNT-Archive-Researcher/1.0 (Texas history research)"}
 
+    # ── Step 1: manifest (rich metadata) ─────────────────────────────────
     try:
-        url = f"{base}/ark:/67531/{ark_id}/manifest/"
-        req = requests.get(url, headers=headers, timeout=20)
-        if req.status_code == 200:
-            mf = req.json()
-            _parse_manifest_into(mf, ark_id, discovered)
+        url = f"https://texashistory.unt.edu/ark:/67531/{ark_id}/manifest/"
+        r = requests.get(url, headers=_UNT_HEADERS, timeout=20)
+        if r.status_code == 200:
+            mf = r.json()
+            discovered.update(_parse_manifest_metadata(mf))
     except Exception:
         pass
+    print(".", end="", flush=True)
+
+    # ── Step 2: title code from issue HTML ────────────────────────────────
+    title_code = _find_title_code_from_issue_html(ark_id)
+    if title_code:
+        discovered["title_code"] = title_code
+    print(".", end="", flush=True)
+
+    # ── Step 3: KBART + identifiers.json — KBART wins for its own fields ────
+    # KBART is the authoritative collection-level record; manifest metadata
+    # is issue-level and can be less precise (e.g. coverage.placeName gives
+    # county name instead of the canonical "Bellville, Tex." publisher city).
+    if title_code:
+        kbart = _fetch_kbart(title_code)
+        discovered.update(kbart)   # KBART overwrites manifest for shared fields
+        ark_range = _fetch_ark_range(title_code)
+        for k, v in ark_range.items():
+            if k not in discovered or not discovered[k]:
+                discovered[k] = v
+    print(" done\n")
 
     return discovered
-
-
-def _print_discovered(d: dict):
-    """Pretty-print what was auto-discovered from UNT."""
-    fields = [
-        ("Title",        d.get("title_name")),
-        ("LCCN",         d.get("lccn")),
-        ("OCLC",         d.get("oclc")),
-        ("Publisher",    d.get("publisher")),
-        ("Location",     d.get("pub_location")),
-        ("Date range",   d.get("date_range")),
-        ("Language",     d.get("language")),
-        ("First ARK",    d.get("first_ark")),
-        ("ARK start ≈",  str(d["ark_scan_start_hint"]) if "ark_scan_start_hint" in d else None),
-    ]
-    any_found = any(v for _, v in fields)
-    if not any_found:
-        print("  (No metadata retrieved — check your identifier and network connection)")
-        return
-    for label, val in fields:
-        if val:
-            print(f"  {label:<14}: {val}")
 
 
 # ---------------------------------------------------------------------------
@@ -445,134 +514,142 @@ LOOKUP_PROMPT = """
 ─────────────────────────────────────────────────────────────────────────
 STEP 1 — IDENTIFY YOUR COLLECTION
 ─────────────────────────────────────────────────────────────────────────
-Provide one identifier and the script will look up the rest automatically.
+Paste the URL of the collection's title page on the Portal to Texas History.
 
-You can use any of these:
+  Title page URL  →  e.g. https://texashistory.unt.edu/explore/titles/t02903/
 
-  Portal title code  →  found in the URL of the title's page
-                         e.g. https://texashistory.unt.edu/explore/titles/t02903/
-                         → title code is  t02903
-
-  LCCN               →  Library of Congress Control Number
-                         e.g. sn86088292
-
-  A known issue ARK  →  the ARK of any single issue you've already found
-                         e.g. metapth1478562
-
-Enter just the value — no URL, no label prefix.
+You can also paste an individual issue URL, or enter a bare LCCN or ARK ID
+as a fallback — but the title page URL gives the most complete results.
 """
 
 
 def run_configure(existing: dict = None) -> dict:
     """
-    Configuration wizard — two phases:
+    Configuration wizard.
 
-    Phase 1  Ask for one identifier, fetch everything UNT knows, display it
-             all at once. User accepts with Enter or types 'edit' to correct
-             any field individually.
+    Phase 1  User pastes the UNT title page URL. Script fetches everything
+             automatically (KBART + identifiers.json + IIIF manifest).
+             User reviews and optionally edits any field.
 
-    Phase 2  Ask only for things UNT cannot provide:
-               • ARK scan range (start / end numbers)
-               • Claude context (community, history, subjects, place names)
-               • Output folder name
+    Phase 2  Researcher-supplied context: community, history, place names.
+             Layout / column settings.  Output folder name.
     """
     e = existing or {}
     print(CONFIGURE_INTRO)
     print(LOOKUP_PROMPT)
 
-    # ─── Phase 1: single identifier → bulk lookup ─────────────────────────
-    identifier = ask(
-        "Title code, LCCN, or issue ARK",
-        e.get("title_code") or e.get("lccn") or e.get("first_ark", ""),
-        required=True
-    ).strip()
+    # ─── Phase 1: URL → lookup ────────────────────────────────────────────
+    default_url = (
+        e.get("permalink") or
+        (f"https://texashistory.unt.edu/explore/titles/{e['title_code']}/"
+         if e.get("title_code") else "") or
+        e.get("first_ark", "")
+    )
+    raw = ask("Collection URL (or LCCN / ARK ID as fallback)", default_url,
+              required=True).strip()
 
-    # Accept pasted URLs — extract the useful fragment
-    if identifier.startswith("http"):
-        m = re.search(r"titles/(t\d+)", identifier)
-        if m: identifier = m.group(1)
-        else:
-            m = re.search(r"(metapth\d+)", identifier)
-            if m: identifier = m.group(1)
+    # Parse URL → title code or ARK ID
+    title_code = _title_code_from_url(raw)
+    ark_id     = None if title_code else _ark_id_from_url(raw)
 
-    identifier = identifier.lower().strip()
-    print(f"\nFetching metadata for '{identifier}' from texashistory.unt.edu ...")
+    # Bare values: t##### → title code, metapth##### → ark, sn##### → LCCN
+    if not title_code and not ark_id:
+        bare = raw.lower()
+        if re.match(r"^t\d+$", bare):
+            title_code = bare
+        elif re.match(r"^metapth\d+$", bare):
+            ark_id = bare
+        # LCCN: can't resolve to title code reliably via API, so warn
+        elif re.match(r"^sn\d+", bare) or re.match(r"^\d{8,}$", bare):
+            print(f"\n  ⚠  LCCN lookup is not supported directly.")
+            print(f"     Find the title page at texashistory.unt.edu and paste its URL instead.")
+            title_code = ask("Title code (e.g. t02903)", "", required=True).strip().lower()
 
-    discovered = {}
-    if re.match(r"^t\d+$", identifier):
-        discovered = _fetch_title_metadata(identifier)
-        discovered["title_code"] = identifier
-    elif re.match(r"^sn\d+", identifier) or re.match(r"^\d{8,}$", identifier):
-        discovered["lccn"] = identifier
-    elif re.match(r"^metapth\d+$", identifier):
-        discovered = _lookup_by_ark(identifier)
-        discovered["first_ark"] = identifier
+    print()
+    if title_code:
+        discovered = _fetch_title_metadata(title_code)
+    elif ark_id:
+        discovered = _lookup_by_ark(ark_id)
+    else:
+        print("  ⚠  Could not parse a title code or ARK from the input.")
+        discovered = {}
 
-    # Merge with any existing config (existing wins only if discovered is empty)
+    # Merge with existing config (existing wins only for fields not discovered)
     for k, v in e.items():
         if k not in discovered or not discovered[k]:
             discovered[k] = v
 
-    # Build default output dir from title
-    title_name = discovered.get("title_name", "")
-    if title_name and not discovered.get("output_dir_name"):
-        discovered["output_dir_name"] = re.sub(
-            r"[^\w\-]", "_", title_name.lower().replace(" ", "_")
-        )[:40]
+    # Auto-suggest typeface: German pre-1940 newspapers are almost always Fraktur
+    if not discovered.get("typeface"):
+        lang = discovered.get("language", "").lower()
+        date_first = discovered.get("date_first", "")
+        if lang == "german" and (not date_first or date_first[:4] < "1941"):
+            discovered["typeface"] = "Fraktur"
 
-    # Derive keyword from first word of title
-    if title_name and not discovered.get("title_keyword"):
-        discovered["title_keyword"] = title_name.split()[0].lower()
+    # Build output dir name and keyword from title
+    title_name = discovered.get("title_name", "")
+    if title_name:
+        # Bare title word only (strip location suffix like "(Bellville, Tex.)")
+        bare_title = re.sub(r"\s*\(.*?\)\s*$", "", title_name).strip()
+        if not discovered.get("output_dir_name"):
+            # Lowercase, spaces → underscores, drop everything non-word
+            discovered["output_dir_name"] = re.sub(
+                r"[^\w]", "_", bare_title.lower()
+            ).strip("_")[:40]
+        if not discovered.get("title_keyword"):
+            discovered["title_keyword"] = bare_title.split()[0].lower()
 
     # ─── Display everything discovered ────────────────────────────────────
-    print()
     print("─" * 72)
     print("DISCOVERED COLLECTION METADATA")
     print("─" * 72)
 
-    # Fields in display order: (label, config_key, width)
     display_fields = [
-        ("Title",           "title_name"),
-        ("Title code",      "title_code"),
-        ("LCCN",            "lccn"),
-        ("OCLC",            "oclc"),
-        ("Collection code", "collection_id"),
-        ("Publisher",       "publisher"),
-        ("Location",        "pub_location"),
-        ("Date range",      "date_range"),
-        ("Language",        "language"),
-        ("Typeface",        "typeface"),
-        ("Source medium",   "source_medium"),
-        ("First ARK",       "first_ark"),
-        ("Match keyword",   "title_keyword"),
-        ("Output folder",   "output_dir_name"),
+        ("Title",         "title_name"),
+        ("Title code",    "title_code"),
+        ("LCCN",          "lccn"),
+        ("OCLC",          "oclc"),
+        ("Publisher",     "publisher"),
+        ("Location",      "pub_location"),
+        ("Date range",    "date_range"),
+        ("Language",      "language"),
+        ("Typeface",      "typeface"),
+        ("Source medium", "source_medium"),
+        ("First ARK",     "first_ark"),
+        ("ARK range",     None),  # synthetic display
+        ("Match keyword", "title_keyword"),
+        ("Output folder", "output_dir_name"),
     ]
 
     for label, key in display_fields:
-        val = discovered.get(key, "")
-        marker = "  ✓" if val else "  —"
-        print(f"{marker}  {label:<18}: {val or '(not found)'}")
+        if key is None:  # ARK range synthetic row
+            lo = discovered.get("ark_scan_start", "")
+            hi = discovered.get("ark_scan_end", "")
+            val = f"metapth{lo} – metapth{hi}" if lo and hi else "(not found)"
+            marker = "  ✓" if lo and hi else "  —"
+        else:
+            val = str(discovered.get(key, "") or "")
+            marker = "  ✓" if val else "  —"
+        print(f"{marker}  {label:<16}: {val or '(not found)'}")
 
     print()
-    accept = ask(
-        "Accept all discovered values? (yes / no to edit field by field)",
-        "yes"
-    )
+    accept = ask("Accept all? (yes / no to edit field by field)", "yes")
 
     if accept.lower() not in ("yes", "y"):
-        # ── Field-by-field edit of discovered data ─────────────────────────
-        print("\nEdit each field — press Enter to keep the current value.\n")
-        for label, key in display_fields:
-            # typeface and source_medium have sensible hardcoded defaults
-            default_fallbacks = {
-                "typeface":      "Fraktur",
-                "source_medium": "35mm microfilm",
-                "language":      "German",
-            }
-            current = discovered.get(key) or default_fallbacks.get(key, "")
+        print("\nEdit each field — press Enter to keep current value.\n")
+        editable = [f for f in display_fields if f[1] is not None]
+        defaults = {"typeface": "Fraktur", "source_medium": "35mm microfilm",
+                    "language": "German"}
+        for label, key in editable:
+            current = discovered.get(key) or defaults.get(key, "")
             discovered[key] = ask(label, current)
+        # ARK range editable separately
+        lo = ask("ARK scan start (digits)", str(discovered.get("ark_scan_start", "")))
+        hi = ask("ARK scan end (digits)",   str(discovered.get("ark_scan_end", "")))
+        if lo: discovered["ark_scan_start"] = int(lo)
+        if hi: discovered["ark_scan_end"]   = int(hi)
 
-    # Ensure defaults for typeface / source_medium if still blank
+    # Ensure required defaults
     if not discovered.get("typeface"):      discovered["typeface"]      = "Fraktur"
     if not discovered.get("source_medium"): discovered["source_medium"] = "35mm microfilm"
     if not discovered.get("language"):      discovered["language"]      = "German"
@@ -581,36 +658,16 @@ def run_configure(existing: dict = None) -> dict:
     title_code    = discovered.get("title_code", "")
     title_keyword = discovered.get("title_keyword", "")
 
-    # ─── Phase 2: things only the researcher knows ────────────────────────
-    print()
-    print("─" * 72)
-    print("ARK SCAN RANGE")
-    print("─" * 72)
-    print("UNT does not expose the full ARK range for a title via its API.")
-    print("Provide the numeric portion of a known ARK near the start of the")
-    print("collection, and a reasonable upper bound. Include a small buffer")
-    print("on each side — the scanner skips non-matching ARKs automatically.\n")
-
-    # Use discovered hint if available
-    ark_hint_start = discovered.get("ark_scan_start_hint") or discovered.get("ark_scan_start", "")
-    ark_hint_end   = discovered.get("ark_scan_end", "")
-    if ark_hint_start and not ark_hint_end:
-        ark_hint_end = int(ark_hint_start) + 150
-
-    if ark_hint_start:
-        print(f"  Hint from manifest: first issue ARK ≈ metapth{ark_hint_start}")
-        print( "  (adjust if needed — add a few before and a generous buffer after)\n")
-
-    ark_start = ask(
-        "First ARK number to scan (digits only)",
-        str(e.get("ark_scan_start") or ark_hint_start or ""),
-        required=True
-    )
-    ark_end = ask(
-        "Last ARK number to scan",
-        str(e.get("ark_scan_end") or ark_hint_end or ""),
-        required=True
-    )
+    # Validate ARK range — required for --discover
+    ark_start = discovered.get("ark_scan_start")
+    ark_end   = discovered.get("ark_scan_end")
+    if not ark_start or not ark_end:
+        print("\n  ⚠  ARK scan range not found automatically.")
+        print("     Enter the numeric portion of a known issue ARK to set bounds.\n")
+        ark_start = int(ask("First ARK number to scan", "", required=True))
+        ark_end   = int(ask("Last ARK number to scan",  "", required=True))
+        discovered["ark_scan_start"] = ark_start
+        discovered["ark_scan_end"]   = ark_end
 
     print()
     print("─" * 72)
@@ -674,15 +731,17 @@ def run_configure(existing: dict = None) -> dict:
     )
 
     # ─── Assemble and confirm ─────────────────────────────────────────────
+    permalink = discovered.get("permalink") or (
+        f"https://texashistory.unt.edu/explore/titles/{title_code}/" if title_code else "")
+
     config = {
-        "title_name":         discovered.get("title_name", ""),
+        "title_name":         title_name,
         "lccn":               discovered.get("lccn", ""),
         "oclc":               discovered.get("oclc", ""),
         "title_code":         title_code,
-        "permalink":          f"https://texashistory.unt.edu/explore/titles/{title_code}/",
-        "collection_id":      discovered.get("collection_id", ""),
-        "ark_scan_start":     int(ark_start),
-        "ark_scan_end":       int(ark_end),
+        "permalink":          permalink,
+        "ark_scan_start":     int(discovered.get("ark_scan_start", 0)),
+        "ark_scan_end":       int(discovered.get("ark_scan_end", 0)),
         "title_keyword":      title_keyword.lower(),
         "publisher":          discovered.get("publisher", ""),
         "pub_location":       discovered.get("pub_location", ""),
@@ -702,18 +761,18 @@ def run_configure(existing: dict = None) -> dict:
 
     print()
     print("─" * 72)
-    print("COLLECTION CONFIGURATION")
+    print("COLLECTION CONFIGURATION SUMMARY")
     print("─" * 72)
     print(f"  Collection : {config['title_name']}")
-    print(f"  Title code : {config['title_code']}  |  LCCN: {config['lccn'] or '—'}  |  OCLC: {config['oclc'] or '—'}")
-    print(f"  ARK range  : metapth{ark_start} – metapth{ark_end}  (keyword: '{title_keyword}')")
+    print(f"  Title code : {config['title_code'] or '—'}  |  LCCN: {config['lccn'] or '—'}  |  OCLC: {config['oclc'] or '—'}")
+    print(f"  ARK range  : metapth{config['ark_scan_start']} – metapth{config['ark_scan_end']}  (keyword: '{title_keyword}')")
     print(f"  Language   : {config['language']}  ({config['typeface']})")
     print(f"  Publisher  : {config['publisher'] or '—'}")
     print(f"  Dates      : {config['date_range'] or '—'}")
     print(f"  Output dir : {output_dir_name}/")
     print()
 
-    confirm = ask("Save and continue? (yes/no)", "yes")
+    confirm = ask("Save and continue?", "yes")
     if confirm.lower() not in ("yes", "y"):
         print("Configuration cancelled.")
         sys.exit(0)
