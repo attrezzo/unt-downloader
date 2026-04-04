@@ -1,0 +1,46 @@
+{
+  "_meta": {
+    "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "last_verified": "2026-03-29",
+    "note": "Anthropic does not expose pricing via API. Update this file when prices change.",
+    "units": "USD per million tokens"
+  },
+  "models": {
+    "claude-haiku-4-5-20251001": {
+      "input":  1.00,
+      "output": 5.00,
+      "tier":   "haiku",
+      "note":   "Fastest, most cost-efficient"
+    },
+    "claude-haiku-4-5": {
+      "input":  1.00,
+      "output": 5.00,
+      "tier":   "haiku",
+      "note":   "Alias for claude-haiku-4-5-20251001"
+    },
+    "claude-sonnet-4-6": {
+      "input":  3.00,
+      "output": 15.00,
+      "tier":   "sonnet",
+      "note":   "Balanced speed and intelligence — recommended"
+    },
+    "claude-opus-4-6": {
+      "input":  5.00,
+      "output": 25.00,
+      "tier":   "opus",
+      "note":   "Most capable, highest cost"
+    },
+    "claude-sonnet-4-5": {
+      "input":  3.00,
+      "output": 15.00,
+      "tier":   "sonnet",
+      "note":   "Previous Sonnet generation"
+    },
+    "claude-opus-4-5": {
+      "input":  5.00,
+      "output": 25.00,
+      "tier":   "opus",
+      "note":   "Previous Opus generation"
+    }
+  }
+}
