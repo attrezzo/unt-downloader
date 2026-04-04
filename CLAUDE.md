@@ -35,6 +35,9 @@ Every OCR result carries confidence 0–100. The alignment step classifies each 
 positions. Never discard per-word scores. Never flatten to boolean.
 
 `[unleserlich]` = zero-confidence, examined by all tools, judged unreadable.
+When page-absolute coordinates are available, tagged as `[unleserlich bbox=x,y,w,h]`
+where x,y,w,h are pixel coordinates in the original scan. This enables future
+selective re-OCR of only the unreadable regions.
 
 ---
 
@@ -318,6 +321,8 @@ and the `re.sub` safety net. Update all three together.
 **=== separator:** exactly 60 `=` when written. Detection: `startswith('=' * 10)`.
 
 **`[unleserlich]`** is THE ONLY illegible marker. Translated equivalent: `[illegible]`.
+May carry bbox tag: `[unleserlich bbox=x,y,w,h]` (page-absolute px).
+Both forms are valid. Parse with: `re.findall(r'\[unleserlich(?:\s+bbox=(\d+,\d+,\d+,\d+))?\]', text)`
 
 **`stitch_all_pages()` is sequential.** Page 3→4 merge feeds into 4→5. Do not parallelize.
 

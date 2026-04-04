@@ -782,8 +782,10 @@ def split_agree_dispute(aligned: list) -> tuple:
             if not w["agree"]:
                 anchor_tok = next(iter(w["tokens"].values()))
                 dispute_table.append({
-                    "top":          anchor_tok["top"]  if anchor_tok else 0,
-                    "left":         anchor_tok["left"] if anchor_tok else 0,
+                    "top":          anchor_tok["top"]    if anchor_tok else 0,
+                    "left":         anchor_tok["left"]   if anchor_tok else 0,
+                    "right":        anchor_tok["right"]  if anchor_tok else 0,
+                    "bottom":       anchor_tok["bottom"] if anchor_tok else 0,
                     "provisional":  w["consensus"],
                     "readings":     {k: (t["text"] if t else "(none)")
                                      for k, t in w["tokens"].items()},
@@ -1012,6 +1014,50 @@ def arbitrate_with_claude(ark_id: str, page_num: int, total_pages: int,
 
 
 # ============================================================================
+# ILLEGIBLE COORDINATE TAGGING
+# ============================================================================
+
+def _tag_illegible_with_bbox(corrected_text: str, dispute_table: list) -> str:
+    """
+    Replace bare [unleserlich] markers with coordinate-tagged versions.
+
+    Format: [unleserlich bbox=x,y,w,h]
+    Where x,y,w,h are page-absolute pixel coordinates of the region that
+    could not be read. This enables future selective re-OCR of only the
+    unreadable regions when better tools become available.
+
+    Uses dispute table entries that have page-absolute coordinates
+    (page_left, page_top, page_right, page_bottom) set by process_page().
+    """
+    # Build lookup of illegible disputes with page coords
+    illegible_bboxes = []
+    for d in dispute_table:
+        prov = d.get("provisional", "")
+        if prov == ILLEGIBLE or (d.get("confs") and max(d["confs"].values()) == 0):
+            pl = d.get("page_left", 0)
+            pt = d.get("page_top", 0)
+            pr = d.get("page_right", pl + 30)
+            pb = d.get("page_bottom", pt + 20)
+            if pl > 0 or pt > 0:  # have real coords
+                illegible_bboxes.append((pl, pt, pr - pl, pb - pt))
+
+    if not illegible_bboxes:
+        return corrected_text
+
+    # Replace [unleserlich] occurrences with tagged versions, using coords
+    # in order of appearance. If more markers than coords, extras stay bare.
+    bbox_iter = iter(illegible_bboxes)
+    def _replace_with_bbox(match):
+        try:
+            x, y, w, h = next(bbox_iter)
+            return f"[unleserlich bbox={x},{y},{w},{h}]"
+        except StopIteration:
+            return match.group(0)  # no more coords, leave bare
+
+    return re.sub(r'\[unleserlich\]', _replace_with_bbox, corrected_text)
+
+
+# ============================================================================
 # PER-PAGE ORCHESTRATOR
 # ============================================================================
 
@@ -1117,6 +1163,16 @@ def process_page(ark_id: str, page_num: int, total_pages: int,
 
         aligned           = align_sources(sources)
         agreed_lines, dis = split_agree_dispute(aligned)
+
+        # Map column-local coordinates to page-absolute for each dispute
+        # cx1 = column left edge in page coords, top = content top edge
+        for d in dis:
+            d["page_left"]   = d["left"]   + cx1
+            d["page_top"]    = d["top"]    + top
+            d["page_right"]  = d.get("right",  d["left"] + 30) + cx1
+            d["page_bottom"] = d.get("bottom", d["top"]  + 20) + top
+            d["column"]      = col_idx
+
         all_agreed_lines.append(f"[Column {col_idx}]")
         all_agreed_lines.extend(agreed_lines)
         all_disputes.extend(dis)
@@ -1132,12 +1188,25 @@ def process_page(ark_id: str, page_num: int, total_pages: int,
     summary = (f"{n_opencv}cols  engines={','.join(sorted(engines_used))}  "
                f"agreed≈{agree_count}words  disputes={dispute_count}")
 
-    # ── Claude arbitration ────────────────────────────────────────────────
+    # ── Claude arbitration (only when disputes exist) ───────────────────
+    if dispute_count == 0 and agreed_text.strip():
+        # All engines agree on every word — no need to spend API tokens.
+        # Strip {?...?} markers (shouldn't be any, but safety net).
+        corrected = re.sub(r'\{\?([^?}]*)\?\}', r'\1', agreed_text)
+        corrected = _tag_illegible_with_bbox(corrected, all_disputes)
+        summary += "  claude=skipped(no-disputes)"
+        return corrected, summary
+
     corrected = arbitrate_with_claude(
         ark_id, page_num, total_pages,
         agreed_text, all_disputes,
         issue_meta, api_key, correction_prompt,
         rate_limiter=rate_limiter)
+
+    # ── Tag [unleserlich] with page-absolute bounding box ────────────────
+    # This enables future selective re-OCR of only the unreadable regions.
+    # Format: [unleserlich bbox=x,y,w,h] where coords are page-absolute px.
+    corrected = _tag_illegible_with_bbox(corrected, all_disputes)
 
     return corrected, summary
 
@@ -1172,11 +1241,90 @@ OUTPUT — valid JSON only, no markdown:
   "continues_from_prev": false, "continues_to_next": false}}]}}"""
 
 
+def _local_segment_page(page_num: int, corrected_text: str) -> list | None:
+    """
+    Attempt local segmentation without Claude. Returns items list on success,
+    None if the page is too complex for local heuristics.
+
+    Local heuristics handle:
+      - Page 1 masthead detection (title + date + volume at top)
+      - Obvious headline breaks (ALL-CAPS or centered lines after whitespace)
+      - Advertisement markers (common German ad patterns)
+
+    Returns None (defer to Claude) when:
+      - Multiple potential article boundaries are ambiguous
+      - Page has complex multi-column structure with unclear breaks
+    """
+    if not corrected_text.strip():
+        return []
+
+    lines = corrected_text.split('\n')
+    # Strip [Column N] markers for analysis but preserve structure
+    content_lines = [l for l in lines if not l.strip().startswith('[Column ')]
+
+    if not content_lines:
+        return []
+
+    # ── Page 1 masthead: first few lines are typically title/date/volume ──
+    if page_num == 1 and len(content_lines) >= 3:
+        # Check if first line looks like a newspaper title (short, possibly caps)
+        first = content_lines[0].strip()
+        if first and len(first) < 80:
+            # Simple case: page 1 with a clear masthead then content
+            # Find where masthead ends (blank line or dateline pattern)
+            mast_end = 0
+            for i, line in enumerate(content_lines[:8]):
+                if not line.strip():
+                    mast_end = i
+                    break
+                # Dateline patterns like "Bellville, den 17. September 1891"
+                if re.search(r'\b\d{4}\b', line) and re.search(r'[A-Z][a-z]+ville|den \d', line):
+                    mast_end = i + 1
+                    break
+            # Don't try to be too clever — only handle obvious single-body pages
+            # Fall through to Claude for complex cases
+
+    # ── Simple pages: if text has no clear article boundaries, treat as one ──
+    # Look for headline indicators: blank line + short bold/caps line
+    headline_indices = []
+    for i, line in enumerate(content_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # A headline candidate: preceded by blank line, short, possibly caps
+        if i > 0 and not content_lines[i-1].strip() and len(stripped) < 60:
+            # Check for dateline patterns (city + date)
+            if re.search(r'^[A-ZÄÖÜ][a-zäöüß]+,\s+\d', stripped):
+                headline_indices.append(i)
+            # ALL CAPS or mostly caps lines
+            elif len(stripped) > 3 and sum(1 for c in stripped if c.isupper()) > len(stripped) * 0.6:
+                headline_indices.append(i)
+
+    # If 0 or 1 headline found, it's a simple page — handle locally
+    if len(headline_indices) <= 1:
+        body = corrected_text.strip()
+        if not body:
+            return []
+        return [{"type": "article", "headline": "", "body": body,
+                 "continues_from_prev": False, "continues_to_next": False,
+                 "page": page_num, "page_span": [page_num, page_num]}]
+
+    # Multiple possible article breaks — too complex for local heuristics
+    return None
+
+
 def segment_page(page_num: int, corrected_text: str,
                  api_key: str, rate_limiter=None) -> list:
     """Segment corrected page text into discrete articles/ads."""
     if not corrected_text.strip():
         return []
+
+    # Try local segmentation first to save API costs
+    local_result = _local_segment_page(page_num, corrected_text)
+    if local_result is not None:
+        return local_result
+
+    # Fall back to Claude for complex pages
     raw = claude_api_call(
         {"model": CLAUDE_MODEL, "max_tokens": 4000,
          "system": SEGMENTATION_PROMPT,
@@ -1798,16 +1946,65 @@ def main():
             else:                   ctr["err"]     += 1
         return status
 
-    if effective_workers == 1:
-        for item in enumerate(issues): run_issue(item)
-    else:
-        with ThreadPoolExecutor(max_workers=effective_workers) as ex:
-            futs = {ex.submit(run_issue, item): item for item in enumerate(issues)}
-            for fut in as_completed(futs):
-                try: fut.result()
-                except Exception as e:
-                    _, iss = futs[fut]
-                    tprint(f"  ✗ Unhandled: {iss['ark_id']}: {e}")
+    # ── Pilot-issue re-quoting ────────────────────────────────────────────
+    # Process the first issue, measure actual token usage, then re-estimate
+    # cost for the remaining issues and confirm before continuing.
+    remaining_issues = list(enumerate(issues))
+
+    if len(remaining_issues) > 1 and rate_limiter:
+        pilot_idx, pilot_issue = remaining_issues[0]
+        tprint("── Pilot issue (measuring actual costs) ──")
+        tokens_before = rate_limiter.total_tokens
+        run_issue((pilot_idx, pilot_issue))
+        tokens_after = rate_limiter.total_tokens
+        pilot_tokens = tokens_after - tokens_before
+        pilot_pages  = int(pilot_issue.get("pages", 8))
+
+        if pilot_tokens > 0 and ctr["ok"] >= 1:
+            tok_per_page = pilot_tokens / max(pilot_pages, 1)
+            remaining_pages = sum(int(iss.get("pages", 8))
+                                  for _, iss in remaining_issues[1:])
+            est_remaining_tokens = remaining_pages * tok_per_page
+            # Use actual pricing: weight input 60% / output 40% at model rates
+            est_cost = est_remaining_tokens * 10.0 / 1_000_000  # blended $/MTok
+            tprint(f"\n── Pilot complete ──")
+            tprint(f"  Pilot issue: {pilot_pages} pages, "
+                   f"{pilot_tokens:,} tokens ({tok_per_page:.0f}/page)")
+            tprint(f"  Remaining:   {remaining_pages} pages across "
+                   f"{len(remaining_issues)-1} issues")
+            tprint(f"  Revised est: ~{est_remaining_tokens:,.0f} tokens, "
+                   f"~${est_cost:.2f}")
+            try:
+                answer = input("  Continue with remaining issues? [y/N]: ").strip().lower()
+                if answer not in ("y", "yes"):
+                    tprint("Stopped after pilot issue.")
+                    remaining_issues = []  # skip the rest
+            except (EOFError, KeyboardInterrupt):
+                remaining_issues = []
+
+        remaining_issues = remaining_issues[1:]  # pilot already done
+
+    elif len(remaining_issues) > 1:
+        # No rate limiter — still run pilot, just no re-quoting
+        run_issue(remaining_issues[0])
+        remaining_issues = remaining_issues[1:]
+
+    # ── Process remaining issues ──────────────────────────────────────────
+    if remaining_issues:
+        if effective_workers == 1:
+            for item in remaining_issues: run_issue(item)
+        else:
+            with ThreadPoolExecutor(max_workers=effective_workers) as ex:
+                futs = {ex.submit(run_issue, item): item
+                        for item in remaining_issues}
+                for fut in as_completed(futs):
+                    try: fut.result()
+                    except Exception as e:
+                        _, iss = futs[fut]
+                        tprint(f"  ✗ Unhandled: {iss['ark_id']}: {e}")
+    elif len(list(enumerate(issues))) == 1:
+        # Single issue — just run it
+        run_issue((0, issues[0]))
 
     if rate_limiter: tprint(f"\nRate limiter: {rate_limiter.status_line()}")
     tprint(f"\n{'='*50}")

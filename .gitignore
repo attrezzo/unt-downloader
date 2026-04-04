@@ -1,3 +1,19 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Collection output directories — these contain downloaded/generated data
+# that should not be committed (images alone can be hundreds of MB).
+# Each collection lives in its own directory (e.g. bellville_wochenblatt/).
+*/metadata/
+*/ocr/
+*/images/
+*/abbyy/
+*/corrected/
+*/articles/
+*/translated/
+*/confidence/
+*/artifacts/
+*/pdf/
+# Keep collection.json configs trackable
+!*/collection.json
