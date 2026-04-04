@@ -615,42 +615,70 @@ def tesseract_tokens(col_img, lang: str, config: str, source_tag: str) -> list:
 # STAGE 6 — KRAKEN (optional third engine)
 # ============================================================================
 
+# Best Kraken model for German Fraktur newspapers (Austrian Newspapers ground truth)
+_KRAKEN_MODEL_URL  = "https://zenodo.org/records/7933402/files/austriannewspapers.mlmodel?download=1"
+_KRAKEN_MODEL_NAME = "austriannewspapers.mlmodel"
+
+
+def _kraken_model_dir() -> Path:
+    """Return the platform-specific directory for storing Kraken models."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA", "")
+        return Path(base) / "kraken" if base else Path.home() / ".kraken"
+    xdg = os.environ.get("XDG_DATA_HOME", "")
+    return Path(xdg) / "kraken" if xdg else Path.home() / ".local" / "share" / "kraken"
+
+
 def _find_kraken_model() -> str | None:
     """
-    Find a downloaded Kraken .mlmodel file in the platform data directories.
-    Kraken stores models in $XDG_DATA_HOME/htrmopo/<uuid>/*.mlmodel
-    (Linux: ~/.local/share/htrmopo/, Windows: %LOCALAPPDATA%/htrmopo/).
-    Also checks legacy paths under ~/.kraken/.
+    Find a Kraken .mlmodel file. Searches:
+      1. Our own model directory (kraken/ under platform data dir)
+      2. htrmopo directories (kraken ≥4.x model store)
+      3. Legacy ~/.kraken/
     """
-    search_dirs = []
+    search_dirs = [_kraken_model_dir()]
 
-    # Primary: htrmopo data directory (kraken ≥4.x)
+    # htrmopo directories (where `kraken get` stores models)
     if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA", "")
-        if local:
-            search_dirs.append(Path(local) / "htrmopo")
-        appdata = os.environ.get("APPDATA", "")
-        if appdata:
-            search_dirs.append(Path(appdata) / "htrmopo")
+        for var in ("LOCALAPPDATA", "APPDATA"):
+            d = os.environ.get(var, "")
+            if d: search_dirs.append(Path(d) / "htrmopo")
     else:
         xdg = os.environ.get("XDG_DATA_HOME", "")
-        if xdg:
-            search_dirs.append(Path(xdg) / "htrmopo")
+        if xdg: search_dirs.append(Path(xdg) / "htrmopo")
         search_dirs.append(Path.home() / ".local" / "share" / "htrmopo")
 
-    # Legacy: ~/.kraken/
     search_dirs.append(Path.home() / ".kraken")
 
     for d in search_dirs:
         if not d.exists():
             continue
-        # Search recursively for .mlmodel files
         models = list(d.rglob("*.mlmodel"))
         if models:
-            # Prefer the most recently modified model
+            # Prefer austriannewspapers model if present, else most recent
+            for m in models:
+                if "austriannewspapers" in m.name.lower():
+                    return str(m)
             models.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             return str(models[0])
     return None
+
+
+def _download_kraken_model() -> str:
+    """Download the Fraktur-optimized Kraken model from Zenodo."""
+    dest_dir = _kraken_model_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / _KRAKEN_MODEL_NAME
+
+    tprint(f"  Downloading Kraken model → {dest}")
+    tprint(f"    URL: {_KRAKEN_MODEL_URL.split('?')[0]}")
+    req = urllib.request.Request(_KRAKEN_MODEL_URL,
+                                headers={"User-Agent": "UNT-Archive/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = resp.read()
+    dest.write_bytes(data)
+    tprint(f"    ✓ {len(data) // 1024:,} KB downloaded")
+    return str(dest)
 
 
 def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
@@ -665,11 +693,10 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
     try:
         if _KRAKEN_MODEL is None:
             model_path = _find_kraken_model()
-            if model_path:
-                _KRAKEN_MODEL = kraken_models.load_any(model_path)
-            else:
-                raise RuntimeError(
-                    "No .mlmodel found. Run: kraken get 10.5281/zenodo.10592716")
+            if not model_path:
+                model_path = _download_kraken_model()
+            _KRAKEN_MODEL = kraken_models.load_any(model_path)
+            tprint(f"  Kraken model: {model_path}")
         pil = PILImage.fromarray(col_img)
         seg = blla.segment(pil)
         tokens = []
