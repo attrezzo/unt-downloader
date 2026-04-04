@@ -2006,7 +2006,7 @@ def main():
     if args.preload_images:
         preload_images(issues, resume=True, retry_failed=args.retry_failed,
                        workers=args.workers)
-        if not api_key: return
+        return  # preload is a standalone step; user runs --correct separately
 
     correction_prompt = build_correction_prompt(config)
     rate_limiter = limiter_from_tier(args.tier) if ClaudeRateLimiter else None
