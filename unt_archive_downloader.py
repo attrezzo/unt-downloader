@@ -332,28 +332,13 @@ def _fetch_ark_range(title_code: str) -> dict:
 
 
 def _fetch_publisher_from_manifest(ark_id: str) -> dict:
-    """Fetch the IIIF manifest of one issue to get publisher and confirm metadata."""
+    """Fetch the IIIF manifest of one issue and return parsed metadata."""
     url = f"https://texashistory.unt.edu/ark:/67531/{ark_id}/manifest/"
     try:
         r = requests.get(url, headers=_UNT_HEADERS, timeout=20)
         if r.status_code != 200:
             return {}
-        mf = r.json()
-        out = {}
-        for entry in mf.get("metadata", []):
-            lbl = entry.get("label", "").lower()
-            val = entry.get("value", "")
-            if isinstance(val, list): val = val[0] if val else ""
-            val = str(val).strip()
-            if not val:
-                continue
-            if "publisher" in lbl and "publisher" not in out:
-                out["publisher"] = val
-            if "language" in lbl and "language" not in out:
-                out["language"] = val
-            if "place" in lbl and "pub_location" not in out:
-                out["pub_location"] = val
-        return out
+        return _parse_manifest_metadata(r.json())
     except Exception:
         return {}
 
@@ -389,51 +374,113 @@ def _fetch_title_metadata(title_code: str) -> dict:
     return discovered
 
 
+def _parse_manifest_metadata(mf: dict) -> dict:
+    """
+    Extract every useful field from a IIIF manifest metadata array.
+    The array uses dot-qualified keys like 'title.serialtitle', 'identifier.LCCN', etc.
+    """
+    lang_map = {"ger": "German", "eng": "English", "spa": "Spanish",
+                "fre": "French", "por": "Portuguese"}
+    out = {}
+    languages = []
+
+    for entry in mf.get("metadata", []):
+        lbl = entry.get("label", "")
+        val = entry.get("value", "")
+        if isinstance(val, list): val = val[0] if val else ""
+        val = str(val).strip()
+        if not val:
+            continue
+        lbl_lower = lbl.lower()
+
+        if lbl_lower == "title.serialtitle":
+            out["title_name"] = val
+        elif lbl_lower == "publisher" and "publisher" not in out:
+            out["publisher"] = val
+        elif lbl_lower == "language":
+            lang = lang_map.get(val.lower(), val.capitalize())
+            if lang not in languages:
+                languages.append(lang)
+        elif lbl_lower == "identifier.lccn":
+            out["lccn"] = val
+        elif lbl_lower == "identifier.oclc":
+            out["oclc"] = val
+        elif lbl_lower == "coverage.placename" and "pub_location" not in out:
+            # "United States - Texas - Austin County - Bellville" → "Bellville, Texas"
+            parts = [p.strip() for p in val.split("-")]
+            if len(parts) >= 2:
+                out["pub_location"] = f"{parts[-1]}, {parts[-2]}"
+            else:
+                out["pub_location"] = val
+        elif lbl_lower.startswith("description.physical") and "source_medium" not in out:
+            if "microfilm" in val.lower():
+                m = re.search(r"(\d+\s*mm\.?\s*microfilm)", val, re.I)
+                out["source_medium"] = m.group(1).strip() if m else "microfilm"
+
+    # Primary language: prefer non-English for multilingual items
+    if languages:
+        non_en = [l for l in languages if l.lower() != "english"]
+        out["language"] = non_en[0] if non_en else languages[0]
+
+    return out
+
+
+def _find_title_code_from_issue_html(ark_id: str) -> str | None:
+    """
+    Fetch the issue's HTML page and extract the title code from its navigation links.
+    The page reliably contains hrefs like /explore/titles/t02903/ in breadcrumbs.
+    """
+    try:
+        url = f"https://texashistory.unt.edu/ark:/67531/{ark_id}/"
+        r = requests.get(url, headers=_UNT_HEADERS, timeout=20)
+        if r.status_code == 200:
+            m = re.search(r"/titles/(t\d+)/", r.text)
+            return m.group(1) if m else None
+    except Exception:
+        pass
+    return None
+
+
 def _lookup_by_ark(ark_id: str) -> dict:
     """
-    Look up via a known issue ARK. Fetches the IIIF manifest, then tries
-    to find the title code so we can pull full KBART metadata.
+    Look up via a known issue ARK.
+    1. Parse the IIIF manifest for all available metadata fields.
+    2. Find the title code from the issue's HTML page.
+    3. Use KBART + identifiers.json to fill in anything the manifest lacks.
     """
     print(f"  Fetching metadata for {ark_id} ...", end="", flush=True)
     discovered = {"first_ark": ark_id}
-    base = "https://texashistory.unt.edu"
 
+    # ── Step 1: manifest (rich metadata) ─────────────────────────────────
     try:
-        url = f"{base}/ark:/67531/{ark_id}/manifest/"
+        url = f"https://texashistory.unt.edu/ark:/67531/{ark_id}/manifest/"
         r = requests.get(url, headers=_UNT_HEADERS, timeout=20)
         if r.status_code == 200:
             mf = r.json()
-            # Title code may appear in seeAlso or related links
-            see_also = mf.get("seeAlso", [])
-            if isinstance(see_also, str): see_also = [see_also]
-            for link in see_also:
-                if isinstance(link, dict): link = link.get("@id", "")
-                tc = _title_code_from_url(str(link))
-                if tc:
-                    discovered["title_code"] = tc
-                    break
-            # Also check the manifest @id and related
-            manifest_id = mf.get("@id", "")
-            # Parse publisher, language etc from metadata array
-            pub = _fetch_publisher_from_manifest(ark_id)
-            discovered.update(pub)
+            discovered.update(_parse_manifest_metadata(mf))
     except Exception:
         pass
-
     print(".", end="", flush=True)
 
-    # If we found a title code, pull the full KBART metadata
-    if discovered.get("title_code"):
-        kbart = _fetch_kbart(discovered["title_code"])
-        for k, v in kbart.items():
-            if k not in discovered or not discovered[k]:
-                discovered[k] = v
-        ark_range = _fetch_ark_range(discovered["title_code"])
+    # ── Step 2: title code from issue HTML ────────────────────────────────
+    title_code = _find_title_code_from_issue_html(ark_id)
+    if title_code:
+        discovered["title_code"] = title_code
+    print(".", end="", flush=True)
+
+    # ── Step 3: KBART + identifiers.json — KBART wins for its own fields ────
+    # KBART is the authoritative collection-level record; manifest metadata
+    # is issue-level and can be less precise (e.g. coverage.placeName gives
+    # county name instead of the canonical "Bellville, Tex." publisher city).
+    if title_code:
+        kbart = _fetch_kbart(title_code)
+        discovered.update(kbart)   # KBART overwrites manifest for shared fields
+        ark_range = _fetch_ark_range(title_code)
         for k, v in ark_range.items():
             if k not in discovered or not discovered[k]:
                 discovered[k] = v
-
     print(" done\n")
+
     return discovered
 
 
@@ -542,12 +589,15 @@ def run_configure(existing: dict = None) -> dict:
     # Build output dir name and keyword from title
     title_name = discovered.get("title_name", "")
     if title_name:
+        # Bare title word only (strip location suffix like "(Bellville, Tex.)")
+        bare_title = re.sub(r"\s*\(.*?\)\s*$", "", title_name).strip()
         if not discovered.get("output_dir_name"):
+            # Lowercase, spaces → underscores, drop everything non-word
             discovered["output_dir_name"] = re.sub(
-                r"[^\w\-]", "_", title_name.lower().replace(" ", "_")
-            )[:40]
+                r"[^\w]", "_", bare_title.lower()
+            ).strip("_")[:40]
         if not discovered.get("title_keyword"):
-            discovered["title_keyword"] = title_name.split()[0].lower()
+            discovered["title_keyword"] = bare_title.split()[0].lower()
 
     # ─── Display everything discovered ────────────────────────────────────
     print("─" * 72)
@@ -572,9 +622,6 @@ def run_configure(existing: dict = None) -> dict:
     ]
 
     for label, key in display_fields:
-        if key == "title_name" and not discovered.get("title_name"):
-            # Strip the "(Bellville, Tex.) 1891-1909" suffix from og:title if present
-            pass
         if key is None:  # ARK range synthetic row
             lo = discovered.get("ark_scan_start", "")
             hi = discovered.get("ark_scan_end", "")
