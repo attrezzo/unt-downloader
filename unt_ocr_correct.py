@@ -2176,10 +2176,11 @@ def main():
     def run_issue(idx_issue):
         idx, issue = idx_issue
         ark_id = issue["ark_id"]
-        wid    = f"w{idx % effective_workers + 1}" if effective_workers > 1 else ""
-        tprint(f"[{idx+1:02d}/{len(issues)}] {ark_id}  "
+        wid    = ""
+        tprint(f"\n{'─'*60}")
+        tprint(f"[{idx+1}/{len(issues)}] {ark_id}  "
                f"Vol.{issue.get('volume','?')} No.{issue.get('number','?')}  "
-               f"{issue.get('date','')}", worker=wid)
+               f"{issue.get('date','')}")
         status = process_issue(
             issue, api_key, correction_prompt,
             args.delay, args.resume, args.retry_failed,
@@ -2195,21 +2196,13 @@ def main():
             else:                   ctr["err"]     += 1
         return status
 
-    # ── Process all issues ────────────────────────────────────────────────
-    # process_issue() runs local OCR (stages 1-7) first for all pages in
-    # an issue, reports dispute counts, then runs Claude (stages 8-9).
-    # Cost estimation happens inside process_issue before Claude calls.
+    # ── Process all issues sequentially ─────────────────────────────────
+    # Local OCR is CPU/GPU-bound — parallelizing just interleaves output
+    # and thrashes the same hardware. Issues run one at a time; the Claude
+    # API phase inside each issue can still use rate_limiter concurrency.
     all_items = list(enumerate(issues))
-    if effective_workers == 1:
-        for item in all_items: run_issue(item)
-    else:
-        with ThreadPoolExecutor(max_workers=effective_workers) as ex:
-            futs = {ex.submit(run_issue, item): item for item in all_items}
-            for fut in as_completed(futs):
-                try: fut.result()
-                except Exception as e:
-                    _, iss = futs[fut]
-                    tprint(f"  ✗ Unhandled: {iss['ark_id']}: {e}")
+    for item in all_items:
+        run_issue(item)
 
     if rate_limiter: tprint(f"\nRate limiter: {rate_limiter.status_line()}")
     tprint(f"\n{'='*50}")
