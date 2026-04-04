@@ -51,6 +51,8 @@ unt_render_pdf.py           Renders translated/ as PDFs. ReportLab only, no API 
 unt_cost_estimate.py        Model selector + cost confirmation before API use.
 claude_rate_limiter.py      Thread-safe dual token-bucket rate limiter.
 pricing.json                Hand-maintained $/MTok rates. Edit when prices change.
+config.json                 Global settings (API key, model, tier). Git-ignored.
+config.example.json         Template for config.json — committed to repo.
 ocr_pipeline/               Batch-aware preprocessing. Style signatures, confidence data,
                             low-confidence maps. Run: python -m ocr_pipeline --config-path ...
 CLAUDE.md                   This file.
@@ -147,7 +149,27 @@ Orchestrator passes flags via `run_worker()` → `subprocess.run()`.
 
 ---
 
-## collection.json schema
+## config.json — global settings
+
+Project-level config, git-ignored. Copy `config.example.json` → `config.json`.
+
+```json
+{
+  "anthropic_api_key": "sk-ant-...",
+  "claude_model": "claude-sonnet-4-6",
+  "tier": "default"
+}
+```
+
+- `anthropic_api_key`: primary API key location. Resolution order:
+  `--api-key` flag → `ANTHROPIC_API_KEY` env → `config.json` → `collection.json` (legacy).
+- `claude_model`: default model for all collections. Per-collection `collection.json`
+  overrides this.
+- `tier`: rate-limit tier (`default`, `build`, `custom`).
+
+---
+
+## collection.json — per-collection settings
 
 ```json
 {
@@ -158,8 +180,7 @@ Orchestrator passes flags via `run_worker()` → `subprocess.run()`.
   "permalink": "https://texashistory.unt.edu/explore/titles/.../",
   "title_keyword": "bellville",
   "community_desc": "...", "place_names": "...", "organizations": "...",
-  "historical_context": "...", "subject_notes": "...",
-  "anthropic_api_key": "sk-ant-...", "claude_model": "claude-sonnet-4-6"
+  "historical_context": "...", "subject_notes": "..."
 }
 ```
 
@@ -168,8 +189,8 @@ Orchestrator passes flags via `run_worker()` → `subprocess.run()`.
 - `title_keyword`: filters IIIF manifests in --discover.
 - `layout_type`: planned dispatch for Stage 3/10. Values: `newspaper`, `letter`,
   `ledger`, `photograph`, `handwritten_document`.
-- `claude_model`: overrides `CLAUDE_MODEL` constant.
-- `anthropic_api_key`: fallback if `ANTHROPIC_API_KEY` env var unset.
+- `claude_model`: per-collection override (optional, falls back to config.json).
+- `anthropic_api_key`: legacy fallback (optional, prefer config.json).
 
 ---
 

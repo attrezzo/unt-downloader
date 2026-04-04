@@ -14,7 +14,5 @@
   "place_names": "Bellville, Cat Spring, Industry, New Ulm, San Felipe",
   "organizations": "",
   "historical_context": "Weekly German-language newspaper serving Austin County settlers",
-  "subject_notes": "",
-  "anthropic_api_key": "YOUR_ANTHROPIC_API_KEY",
-  "claude_model": "claude-sonnet-4-6"
+  "subject_notes": ""
 }
