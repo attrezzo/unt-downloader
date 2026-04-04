@@ -147,3 +147,60 @@ class TestOcrCorrectPureFunctions:
         header, pages = parse_ocr_pages(text)
         assert 1 in pages
         assert 2 in pages
+
+    def test_tag_illegible_with_bbox(self):
+        from unt_ocr_correct import _tag_illegible_with_bbox, ILLEGIBLE
+        text = f"Some text {ILLEGIBLE} and more {ILLEGIBLE} here."
+        disputes = [
+            {"provisional": ILLEGIBLE, "confs": {"tess_a": 0},
+             "page_left": 100, "page_top": 200, "page_right": 150, "page_bottom": 220},
+            {"provisional": ILLEGIBLE, "confs": {"tess_a": 0},
+             "page_left": 300, "page_top": 400, "page_right": 380, "page_bottom": 425},
+        ]
+        result = _tag_illegible_with_bbox(text, disputes)
+        assert "[unleserlich bbox=100,200,50,20]" in result
+        assert "[unleserlich bbox=300,400,80,25]" in result
+        assert "[unleserlich]" not in result
+
+    def test_tag_illegible_no_coords_stays_bare(self):
+        from unt_ocr_correct import _tag_illegible_with_bbox, ILLEGIBLE
+        text = f"Text {ILLEGIBLE} here."
+        # Dispute with no page coords — marker stays bare
+        disputes = [{"provisional": ILLEGIBLE, "confs": {"tess_a": 0},
+                     "page_left": 0, "page_top": 0}]
+        result = _tag_illegible_with_bbox(text, disputes)
+        assert "[unleserlich]" in result
+        assert "bbox=" not in result
+
+    def test_tag_illegible_empty_disputes(self):
+        from unt_ocr_correct import _tag_illegible_with_bbox, ILLEGIBLE
+        text = f"Text {ILLEGIBLE} here."
+        result = _tag_illegible_with_bbox(text, [])
+        assert "[unleserlich]" in result
+
+    def test_local_segment_simple_page(self):
+        from unt_ocr_correct import _local_segment_page
+        # Simple page with no clear article breaks → single article
+        text = "This is a simple page of text.\nIt continues here.\nAnd here."
+        result = _local_segment_page(1, text)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["type"] == "article"
+
+    def test_local_segment_complex_page_defers(self):
+        from unt_ocr_correct import _local_segment_page
+        # Complex page with multiple headline-like breaks → defer to Claude
+        text = (
+            "First article text.\n"
+            "\n"
+            "BREAKING NEWS HEADLINE\n"
+            "Article body here.\n"
+            "\n"
+            "Berlin, 3. Sept.\n"
+            "Another article body.\n"
+            "\n"
+            "ANOTHER HEADLINE\n"
+            "More text.\n"
+        )
+        result = _local_segment_page(3, text)
+        assert result is None  # defers to Claude
