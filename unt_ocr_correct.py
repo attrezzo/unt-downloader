@@ -159,7 +159,18 @@ def _sanitize_date(date_str: str) -> str:
     """Replace non-word/non-hyphen chars in a date string for use in filenames."""
     return re.sub(r'[^\w-]', '-', date_str)
 
-def tprint(*args, worker: str = "", **kwargs):
+# ── Logging levels ──────────────────────────────────────────────────────────
+# 1 = issue progress + final results (default)
+# 2 = page-level progress (local OCR done, Claude done, proofread)
+# 3 = engine handoffs (Tesseract cmd, Kraken model, Claude API, segmentation)
+# 4 = alignment detail (per-column disputes, word counts, boundary reports)
+# 5 = verbose (dispute table samples, prompt snippets, token usage, timing)
+LOG_LEVEL = 1
+
+def tprint(*args, worker: str = "", level: int = 1, **kwargs):
+    """Print with optional log level gating. level=0 always prints."""
+    if level > LOG_LEVEL:
+        return
     with _print_lock:
         prefix = f"[{worker}] " if worker else ""
         print(prefix, *args, flush=True, **kwargs)
@@ -309,7 +320,7 @@ def parse_abbyy_page(xml_path: Path, page_index: int = 0) -> tuple:
         return word_tokens, block_bounds
 
     except Exception as e:
-        tprint(f"  ⚠ ABBYY parse error ({xml_path.name} page {page_index}): {e}")
+        tprint(f"  ⚠ ABBYY parse error ({xml_path.name} page {page_index}): {e}", level=2)
         return [], []
 
 
@@ -586,6 +597,8 @@ def tesseract_tokens(col_img, lang: str, config: str, source_tag: str) -> list:
     if not HAS_TESSERACT or not lang:
         return []
     try:
+        tprint(f"      {source_tag}: lang={lang} config='{config}' "
+               f"img={col_img.shape[1]}x{col_img.shape[0]}px", level=3)
         pil  = PILImage.fromarray(col_img)
         data = pytesseract.image_to_data(pil, lang=lang, config=config,
                                          output_type=pytesseract.Output.DICT)
@@ -605,9 +618,13 @@ def tesseract_tokens(col_img, lang: str, config: str, source_tag: str) -> list:
                 "right":  data["left"][i] + data["width"][i],
                 "bottom": data["top"][i]  + data["height"][i],
             })
+        tprint(f"      {source_tag}: → {len(tokens)} tokens", level=4)
+        if tokens and LOG_LEVEL >= 5:
+            sample = [t["text"] for t in tokens[:10]]
+            tprint(f"      {source_tag} sample: {' '.join(sample)}...", level=5)
         return tokens
     except Exception as e:
-        tprint(f"    ⚠ Tesseract ({source_tag}) error: {e}")
+        tprint(f"    ⚠ Tesseract ({source_tag}) error: {e}", level=2)
         return []
 
 
@@ -670,14 +687,14 @@ def _download_kraken_model() -> str:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / _KRAKEN_MODEL_NAME
 
-    tprint(f"  Downloading Kraken model → {dest}")
-    tprint(f"    URL: {_KRAKEN_MODEL_URL.split('?')[0]}")
+    tprint(f"  Downloading Kraken model → {dest}", level=1)
+    tprint(f"    URL: {_KRAKEN_MODEL_URL.split('?')[0]}", level=1)
     req = urllib.request.Request(_KRAKEN_MODEL_URL,
                                 headers={"User-Agent": "UNT-Archive/1.0"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         data = resp.read()
     dest.write_bytes(data)
-    tprint(f"    ✓ {len(data) // 1024:,} KB downloaded")
+    tprint(f"    ✓ {len(data) // 1024:,} KB downloaded", level=1)
     return str(dest)
 
 
@@ -696,52 +713,70 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
     try:
         if _KRAKEN_MODEL is None:
             with _kraken_load_lock:
-                # Re-check after acquiring lock (another thread may have loaded)
                 if _KRAKEN_MODEL is None:
                     model_path = _find_kraken_model()
                     if not model_path:
                         model_path = _download_kraken_model()
                     _KRAKEN_MODEL = kraken_models.load_any(model_path)
-                    tprint(f"  Kraken model: {model_path}")
+                    tprint(f"  Kraken model: {model_path}", level=3)
         pil = PILImage.fromarray(col_img)
-        # Suppress Kraken's noisy polygonizer warnings on degraded scans.
-        # These come from both the logging system and direct stderr writes.
-        import warnings, logging, io
+        # Suppress ALL Kraken output during segmentation + recognition.
+        # Polygonizer warnings go to stdout/stderr/logging unpredictably.
+        import warnings, logging, io, contextlib
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _kraken_logger = logging.getLogger("kraken")
-            old_level = _kraken_logger.level
-            _kraken_logger.setLevel(logging.CRITICAL)
-            old_stderr = sys.stderr
-            try:
-                sys.stderr = io.StringIO()  # swallow polygonizer spam
+            logging.getLogger("kraken").setLevel(logging.CRITICAL)
+            devnull = io.StringIO()
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
                 seg = blla.segment(pil)
-            finally:
-                sys.stderr = old_stderr
-                _kraken_logger.setLevel(old_level)
+                records = list(rpred.rpred(_KRAKEN_MODEL, pil, seg))
         tokens = []
-        for record in rpred.rpred(_KRAKEN_MODEL, pil, seg):
+        for record in records:
             text = record.prediction.strip()
-            conf = int(record.confidences[0] * 100) if record.confidences else 50
             if not text:
                 continue
-            bbox = record.bbox
+            conf = int(record.confidences[0] * 100) if record.confidences else 50
+            # Extract bounding box from record — API varies by Kraken version:
+            # BBoxOCRRecord has .bbox; BaselineOCRRecord has .boundary (polygon)
+            x0 = y0 = x1 = y1 = 0
+            try:
+                if hasattr(record, 'bbox') and record.bbox:
+                    # Legacy BBoxOCRRecord
+                    x0, y0, x1, y1 = record.bbox
+                elif hasattr(record, 'boundary') and record.boundary:
+                    # BaselineOCRRecord: boundary is a polygon [(x,y), ...]
+                    xs = [p[0] for p in record.boundary]
+                    ys = [p[1] for p in record.boundary]
+                    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+                elif hasattr(record, 'baseline') and record.baseline:
+                    # Fallback: derive from baseline endpoints
+                    xs = [p[0] for p in record.baseline]
+                    ys = [p[1] for p in record.baseline]
+                    x0, y0 = min(xs), min(ys) - 10
+                    x1, y1 = max(xs), max(ys) + 10
+                else:
+                    continue
+            except Exception:
+                continue
             tokens.append({
                 "text":   ILLEGIBLE if conf < 10 else text,
                 "conf":   conf,
                 "source": source_tag,
-                "left": bbox[0], "top": bbox[1],
-                "right": bbox[2], "bottom": bbox[3],
+                "left": int(x0), "top": int(y0),
+                "right": int(x1), "bottom": int(y1),
             })
+        tprint(f"      kraken: → {len(tokens)} tokens from {len(records)} lines", level=4)
+        if tokens and LOG_LEVEL >= 5:
+            sample = [t["text"] for t in tokens[:10]]
+            tprint(f"      kraken sample: {' '.join(sample)}...", level=5)
         return tokens
     except Exception as e:
-        # Disable Kraken for the rest of the run to avoid per-column spam
         err = str(e).lower()
         if "model" in err or "not loadable" in err or ".mlmodel" in err:
             HAS_KRAKEN = False
-            tprint(f"  ⚠ Kraken disabled for this run: {e}")
+            tprint(f"  ⚠ Kraken disabled for this run: {e}", level=1)
         else:
-            tprint(f"    ⚠ Kraken error: {e}")
+            tprint(f"    ⚠ Kraken error: {e}", level=2)
         return []
 
 
@@ -1001,6 +1036,12 @@ The resolutions dict is for audit logging — include every dispute you resolved
 def claude_api_call(payload: dict, api_key: str,
                     rate_limiter=None, est_tokens: int = 8000) -> str:
     """Shared Claude API call with retry/rate-limit handling."""
+    tprint(f"    → Claude API: model={payload.get('model')} "
+           f"max_tokens={payload.get('max_tokens')} est={est_tokens}", level=3)
+    if LOG_LEVEL >= 5:
+        sys_prompt = payload.get("system", "")
+        tprint(f"      system prompt: {len(sys_prompt)} chars, "
+               f"first 100: {sys_prompt[:100]}...", level=5)
     req_data = json.dumps(payload).encode("utf-8")
     if rate_limiter:
         rate_limiter.acquire(estimated_tokens=est_tokens)
@@ -1015,11 +1056,12 @@ def claude_api_call(payload: dict, api_key: str,
                 method="POST")
             with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read())
+            usage = result.get("usage", {})
+            in_tok  = usage.get("input_tokens", 0)
+            out_tok = usage.get("output_tokens", 0)
             if rate_limiter:
-                usage = result.get("usage", {})
-                rate_limiter.record_usage(
-                    input_tokens=usage.get("input_tokens", 0),
-                    output_tokens=usage.get("output_tokens", 0))
+                rate_limiter.record_usage(input_tokens=in_tok, output_tokens=out_tok)
+            tprint(f"    ← Claude API: {in_tok} in + {out_tok} out tokens", level=3)
             for block in result.get("content", []):
                 if block.get("type") == "text":
                     return block["text"].strip()
@@ -1199,7 +1241,7 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     # ── Load image ────────────────────────────────────────────────────────
     img_bytes, _ = fetch_page_image(ark_id, page_num)
     if not img_bytes:
-        tprint(f"    p{page_num:02d} ⚠ image unavailable", worker=worker_id)
+        tprint(f"    p{page_num:02d} ⚠ image unavailable", worker=worker_id, level=1)
         result["no_image"] = True
         result["agreed_text"] = unt_ocr_text[:3000]
         result["all_disputes"] = []
@@ -1210,25 +1252,37 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     result["img_bytes"] = img_bytes
     nparr    = np.frombuffer(img_bytes, np.uint8)
     img_gray = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+    h, w = img_gray.shape
+    tprint(f"      image loaded: {w}x{h}px ({len(img_bytes)//1024}KB)", level=3)
+
+    # Stage 2: Preprocess
+    tprint(f"      preprocessing (CLAHE + median blur) ...", level=3)
     enhanced = preprocess_image(img_gray)
 
-    # ── Detect columns from image (always) ───────────────────────────────
+    # Stage 3: Detect columns
+    tprint(f"      detecting columns ...", level=3)
     bounds       = detect_content_bounds(img_gray)
     left, top, right, bot = bounds
     opencv_cols  = detect_columns_from_image(img_gray, bounds, expected_cols=expected_cols)
     n_opencv     = len(opencv_cols)
+    tprint(f"      → {n_opencv} columns detected  "
+           f"content bounds=({left},{top})→({right},{bot})", level=3)
+    if LOG_LEVEL >= 5:
+        for ci, (cx1, cx2) in enumerate(opencv_cols, 1):
+            tprint(f"        col {ci}: x={cx1}→{cx2} ({cx2-cx1}px wide)", level=5)
 
-    # ── Boundary comparison (if ABBYY data present) ───────────────────────
+    # Stage 4: Boundary comparison (if ABBYY data present)
     final_cols = opencv_cols
     if abbyy_blocks:
+        tprint(f"      comparing ABBYY boundaries ...", level=3)
         abbyy_gutters = abbyy_column_boundaries(abbyy_blocks)
         final_cols, boundary_report = compare_boundaries(
             opencv_cols, abbyy_gutters, expected_cols=expected_cols)
+        tprint(f"      → ABBYY reconciled: {len(final_cols)} columns", level=3)
         if boundary_report and boundary_report != "Boundaries agree":
-            tprint(f"    p{page_num:02d} boundary comparison:\n{boundary_report}",
-                   worker=worker_id)
+            tprint(f"      boundary detail:\n{boundary_report}", level=4)
 
-    # ── Assign ABBYY tokens to columns ────────────────────────────────────
+    # Assign ABBYY tokens to columns
     abbyy_by_col: dict[int, list] = {}
     if abbyy_page_tokens:
         for tok in abbyy_page_tokens:
@@ -1240,8 +1294,10 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
                     local["right"] = max(0, tok["right"] - cx1)
                     abbyy_by_col.setdefault(col_idx, []).append(local)
                     break
+        tprint(f"      ABBYY tokens: {sum(len(v) for v in abbyy_by_col.values())} "
+               f"across {len(abbyy_by_col)} columns", level=3)
 
-    # ── OCR each column (Tesseract + Kraken) ──────────────────────────────
+    # Stages 5-7: OCR each column → align → agree/dispute
     all_agreed_lines = []
     all_disputes     = []
     engines_used     = set()
@@ -1249,13 +1305,16 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     for col_idx, (cx1, cx2) in enumerate(final_cols, 1):
         strip = enhanced[top:bot, cx1:cx2]
         if strip.shape[1] < 50:
+            tprint(f"      col {col_idx}: too narrow ({strip.shape[1]}px), skipping", level=4)
             continue
 
+        tprint(f"      col {col_idx}/{n_opencv}: OCR engines ...", level=3)
         sources: dict[str, list] = {}
 
         if col_idx in abbyy_by_col:
             sources["abbyy"] = abbyy_by_col[col_idx]
             engines_used.add("abbyy")
+            tprint(f"        abbyy: {len(abbyy_by_col[col_idx])} tokens", level=4)
 
         if HAS_TESSERACT and tess_lang:
             ta = tesseract_tokens(strip, tess_lang, TESS_PSM_A, "tess_a")
@@ -1264,14 +1323,29 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
             if tb: sources["tess_b"] = tb; engines_used.add("tess_b")
 
         if HAS_KRAKEN:
+            tprint(f"        kraken: segmenting + recognizing ...", level=3)
             kr = kraken_tokens(strip)
             if kr: sources["kraken"] = kr; engines_used.add("kraken")
 
         if not sources:
+            tprint(f"      col {col_idx}: no engine produced tokens", level=3)
             continue
 
+        # Stage 7: Alignment
+        src_summary = ", ".join(f"{k}={len(v)}" for k, v in sources.items())
+        tprint(f"        aligning sources: {src_summary}", level=3)
         aligned           = align_sources(sources)
         agreed_lines, dis = split_agree_dispute(aligned)
+        tprint(f"        → agreed={len(agreed_lines)} lines, "
+               f"disputes={len(dis)}", level=3)
+
+        if dis and LOG_LEVEL >= 5:
+            for d in dis[:3]:
+                readings = d.get("readings", {})
+                tprint(f"          dispute: {d.get('provisional','?')} — "
+                       f"readings={readings}", level=5)
+            if len(dis) > 3:
+                tprint(f"          ... and {len(dis)-3} more disputes", level=5)
 
         for d in dis:
             d["page_left"]   = d["left"]   + cx1
@@ -1287,6 +1361,7 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     agreed_text = "\n".join(all_agreed_lines)
     if not agreed_text.strip():
         agreed_text = unt_ocr_text[:3000]
+        tprint(f"      ⚠ no engine output — falling back to portal OCR", level=2)
 
     agree_count   = sum(1 for l in all_agreed_lines if l.strip() and not l.startswith("["))
     dispute_count = len(all_disputes)
@@ -1314,27 +1389,35 @@ def process_page_claude(local_result: dict, ark_id: str, total_pages: int,
 
     # No image — Claude corrects text-only
     if local_result.get("no_image"):
+        tprint(f"    p{page_num:02d} sending to Claude (no image, text-only correction)", level=1)
         raw = claude_api_call(
             {"model": CLAUDE_MODEL, "max_tokens": 6000,
              "system": correction_prompt,
              "messages": [{"role": "user", "content":
                  f"PAGE {page_num}: Correct this OCR text (no image available):\n{local_result['unt_ocr_text']}"}]},
             api_key, rate_limiter, est_tokens=3000)
+        tprint(f"    p{page_num:02d} ← Claude returned {len(raw)} chars", level=3)
         return raw, "no-image"
 
     # No disputes — all engines agree, skip Claude
     if len(all_disputes) == 0 and agreed_text.strip():
+        tprint(f"    p{page_num:02d} all engines agree — skipping Claude", level=1)
         corrected = re.sub(r'\{\?([^?}]*)\?\}', r'\1', agreed_text)
         corrected = _tag_illegible_with_bbox(corrected, all_disputes)
         summary += "  claude=skipped(no-disputes)"
         return corrected, summary
 
     # Stage 8: Claude arbitrates disputes
+    tprint(f"    p{page_num:02d} sending {len(all_disputes)} disputes to Claude ...", level=1)
+    if LOG_LEVEL >= 5:
+        tprint(f"      agreed text: {len(agreed_text)} chars, "
+               f"first 120: {agreed_text[:120]}...", level=5)
     corrected = arbitrate_with_claude(
         ark_id, page_num, total_pages,
         agreed_text, all_disputes,
         issue_meta, api_key, correction_prompt,
         rate_limiter=rate_limiter)
+    tprint(f"    p{page_num:02d} ← Claude returned {len(corrected)} chars", level=3)
 
     corrected = _tag_illegible_with_bbox(corrected, all_disputes)
     return corrected, summary
@@ -1411,7 +1494,7 @@ def proofread_page(page_num: int, corrected_text: str,
     new_illegible = len(re.findall(r'\[unleserlich(?:\s+bbox=[^\]]+)?\]', result))
     if orig_illegible > 0 and new_illegible < orig_illegible:
         tprint(f"    ⚠ p{page_num:02d} proofread dropped {orig_illegible - new_illegible} "
-               f"[unleserlich] marker(s) — keeping original")
+               f"[unleserlich] marker(s) — keeping original", level=2)
         return corrected_text
 
     return result
@@ -1528,9 +1611,11 @@ def segment_page(page_num: int, corrected_text: str,
     # Try local segmentation first to save API costs
     local_result = _local_segment_page(page_num, corrected_text)
     if local_result is not None:
+        tprint(f"  │    p{page_num:02d} segmented locally ({len(local_result)} items)", level=3)
         return local_result
 
     # Fall back to Claude for complex pages
+    tprint(f"  │    p{page_num:02d} too complex for local — sending to Claude", level=3)
     raw = claude_api_call(
         {"model": CLAUDE_MODEL, "max_tokens": 4000,
          "system": SEGMENTATION_PROMPT,
@@ -1546,7 +1631,7 @@ def segment_page(page_num: int, corrected_text: str,
             item["page_span"] = [page_num, page_num]
         return items
     except Exception as e:
-        tprint(f"    ⚠ Segmentation parse error p{page_num}: {e}")
+        tprint(f"    ⚠ Segmentation parse error p{page_num}: {e}", level=2)
         return [{"type": "article", "headline": "", "body": corrected_text,
                  "page": page_num, "page_span": [page_num, page_num],
                  "continues_from_prev": False, "continues_to_next": False}]
@@ -1617,7 +1702,7 @@ def stitch_all_pages(all_items: list, api_key: str,
         first_item = pages[pb][0]
         if last_item.get("type") in ("masthead", "advertisement"):
             continue
-        tprint(f"    stitch p{pa}→p{pb} ...", worker=worker_id)
+        tprint(f"    stitch p{pa}→p{pb} ...", worker=worker_id, level=3)
         decision = stitch_boundary(last_item, first_item, api_key, rate_limiter)
         if decision == "merge":
             merged_body = last_item["body"].rstrip() + "\n\n" + first_item["body"].lstrip()
@@ -1628,9 +1713,9 @@ def stitch_all_pages(all_items: list, api_key: str,
             last_item["continues_to_next"] = first_item.get("continues_to_next", False)
             pages[pb].pop(0)
             merges += 1
-            tprint(f"    ✓ merged p{pa}→p{pb}", worker=worker_id)
+            tprint(f"    ✓ merged p{pa}→p{pb}", worker=worker_id, level=3)
     if merges:
-        tprint(f"  Stitched {merges} cross-page article(s)", worker=worker_id)
+        tprint(f"  Stitched {merges} cross-page article(s)", worker=worker_id, level=1)
     result = []
     for pg in sorted_pgs:
         result.extend(pages.get(pg, []))
@@ -1823,18 +1908,18 @@ def process_issue(issue, api_key, correction_prompt, delay,
     ark_dir   = ARTICLES_DIR  / ark_id
 
     if not ocr_path.exists():
-        tprint(f"  ⚠ OCR not found: {fname}", worker=worker_id)
+        tprint(f"  ⚠ OCR not found: {fname}", worker=worker_id, level=1)
         return "missing_ocr"
 
     if resume and not retry_failed and corr_path.exists() and corr_path.stat().st_size > 500:
         if ark_dir.exists() and any(ark_dir.glob("*_art*.txt")):
-            tprint(f"  SKIP {fname}", worker=worker_id)
+            tprint(f"  SKIP {fname}", worker=worker_id, level=1)
             return "skipped"
 
     ocr_raw = ocr_path.read_text(encoding="utf-8", errors="replace")
     header, ocr_pages = parse_ocr_pages(ocr_raw)
     if not ocr_pages:
-        tprint(f"  ⚠ Could not parse pages in {fname}", worker=worker_id)
+        tprint(f"  ⚠ Could not parse pages in {fname}", worker=worker_id, level=1)
         return "parse_error"
 
     actual_pages = max(ocr_pages.keys())
@@ -1860,27 +1945,36 @@ def process_issue(issue, api_key, correction_prompt, delay,
                "Kraken" if HAS_KRAKEN else None,
                "ABBYY" if has_abbyy else None]
     engine_str = "+".join(e for e in engines if e) or "Claude-only"
-    tprint(f"  {actual_pages}pp  redo={redo}  engines={engine_str}", worker=worker_id)
+    tprint(f"  {actual_pages}pp  redo={redo}  engines={engine_str}", worker=worker_id, level=1)
     if has_abbyy:
         tprint(f"  ABBYY XML: {axml.name} — treating as one source among several",
-               worker=worker_id)
+               worker=worker_id, level=1)
 
     corrected_pages = dict(existing_corrected)
 
-    # ── Phase A: LOCAL stages (1-7) for all pages ─────────────────────────
-    # Runs Tesseract, Kraken, ABBYY parsing, alignment — no API calls.
+    # ══════════════════════════════════════════════════════════════════════
+    # PASS 1 — HIGH CONFIDENCE: Local OCR engines (stages 1-7)
+    # Tesseract + Kraken + ABBYY → word alignment → agreed/disputed split
+    # No API calls. Produces high-confidence agreed text and dispute table.
+    # ══════════════════════════════════════════════════════════════════════
+    tprint(f"  ┌─ PASS 1: Local OCR (high-confidence extraction) ─────────",
+           worker=worker_id, level=1)
     local_results = {}
     for pg, needs_redo in pages_to_process:
         if not needs_redo:
-            tprint(f"    p{pg:02d} KEEP", worker=worker_id)
+            tprint(f"  │  p{pg:02d} KEEP (already corrected)", worker=worker_id, level=2)
             continue
 
         unt_ocr = strip_ocr_html(ocr_pages.get(pg, ""))
-        tprint(f"    p{pg:02d}/{actual_pages} local OCR ...", worker=worker_id)
+        tprint(f"  │  p{pg:02d}/{actual_pages} running local OCR engines ...",
+               worker=worker_id, level=1)
 
         abbyy_tokens, abbyy_blocks = [], []
         if has_abbyy:
+            tprint(f"  │    parsing ABBYY XML page {pg} ...", worker=worker_id, level=3)
             abbyy_tokens, abbyy_blocks = parse_abbyy_page(axml, page_index=pg - 1)
+            tprint(f"  │    → {len(abbyy_tokens)} ABBYY tokens, "
+                   f"{len(abbyy_blocks)} blocks", worker=worker_id, level=3)
 
         try:
             local = process_page_local(
@@ -1891,54 +1985,75 @@ def process_issue(issue, api_key, correction_prompt, delay,
                 worker_id=worker_id,
             )
             local_results[pg] = local
-            tprint(f"    p{pg:02d} ✓ [{local['summary']}]", worker=worker_id)
+            disputes = len(local.get("all_disputes", []))
+            tprint(f"  │  p{pg:02d} ✓ [{local['summary']}]",
+                   worker=worker_id, level=1)
         except Exception as e:
-            tprint(f"    p{pg:02d} ✗ local: {e}", worker=worker_id)
+            tprint(f"  │  p{pg:02d} ✗ FAILED: {e}", worker=worker_id, level=1)
             corrected_pages[pg] = f"[CORRECTION FAILED: {e}]\n\n{unt_ocr}"
 
     # Summary of disputes across all pages
     total_disputes = sum(len(r.get("all_disputes", []))
                          for r in local_results.values())
+    total_agreed = sum(
+        sum(1 for l in r.get("agreed_text", "").split("\n")
+            if l.strip() and not l.startswith("["))
+        for r in local_results.values())
     pages_needing_claude = sum(1 for r in local_results.values()
                                if len(r.get("all_disputes", [])) > 0
                                or r.get("no_image"))
-    tprint(f"  Local OCR done: {len(local_results)} pages, "
-           f"{total_disputes} disputes, "
-           f"{pages_needing_claude} page(s) need Claude",
-           worker=worker_id)
+    tprint(f"  └─ PASS 1 complete: {len(local_results)} pages, "
+           f"~{total_agreed} agreed words, {total_disputes} disputes",
+           worker=worker_id, level=1)
 
-    # ── Phase B: CLAUDE stages (8-9) ─────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # PASS 2 — LOW CONFIDENCE: Claude arbitration (stage 8) + proofread (9)
+    # Sends disputed words + page image to Claude for resolution.
+    # Then proofreads each corrected page for residual errors.
+    # ══════════════════════════════════════════════════════════════════════
+    tprint(f"  ┌─ PASS 2: Claude arbitration (low-confidence resolution) ─",
+           worker=worker_id, level=1)
+    tprint(f"  │  {pages_needing_claude} page(s) have disputes to resolve",
+           worker=worker_id, level=1)
+
     for pg in sorted(local_results.keys()):
         local = local_results[pg]
+        n_disputes = len(local.get("all_disputes", []))
         try:
             corrected, summary = process_page_claude(
                 local, ark_id, actual_pages, issue,
                 api_key, correction_prompt, rate_limiter)
             corrected_pages[pg] = corrected
             snippet = corrected[:60].replace("\n", " ")
-            tprint(f"    p{pg:02d} ✓ [{summary}]  \"{snippet}...\"", worker=worker_id)
+            tprint(f"  │  p{pg:02d} ✓ \"{snippet}...\"",
+                   worker=worker_id, level=2)
         except Exception as e:
-            tprint(f"    p{pg:02d} ✗ claude: {e}", worker=worker_id)
-            # Fall back to agreed text from local stage
+            tprint(f"  │  p{pg:02d} ✗ FAILED: {e}", worker=worker_id, level=1)
             corrected_pages[pg] = (f"[CORRECTION FAILED: {e}]\n\n"
                                    + local.get("agreed_text", ""))
         time.sleep(delay)
 
-    # Stage 9: Proofreading pass
+    tprint(f"  └─ PASS 2 arbitration complete", worker=worker_id, level=1)
+
+    # ── Stage 9: Proofreading pass ────────────────────────────────────────
+    tprint(f"  ┌─ Stage 9: Proofreading ──────────────────────────────────",
+           worker=worker_id, level=1)
     proofread_count = 0
     for pg in sorted(corrected_pages.keys()):
         text = corrected_pages[pg]
         if text.startswith("[CORRECTION FAILED"):
             continue
-        tprint(f"    p{pg:02d} proofreading...", worker=worker_id)
+        tprint(f"  │  p{pg:02d} proofreading ...", worker=worker_id, level=2)
         proofread = proofread_page(pg, text, api_key, rate_limiter)
         if proofread != text:
             corrected_pages[pg] = proofread
             proofread_count += 1
+            tprint(f"  │  p{pg:02d} ✓ revised", worker=worker_id, level=2)
+        else:
+            tprint(f"  │  p{pg:02d} ✓ no changes", worker=worker_id, level=2)
         time.sleep(delay)
-    if proofread_count:
-        tprint(f"  Proofread: {proofread_count}/{len(corrected_pages)} page(s) revised",
-               worker=worker_id)
+    tprint(f"  └─ Proofread: {proofread_count}/{len(corrected_pages)} page(s) revised",
+           worker=worker_id, level=1)
 
     # Write corrected/ file (used by translate step)
     out_lines = [header, ""]
@@ -1948,28 +2063,39 @@ def process_issue(issue, api_key, correction_prompt, delay,
         out_lines.append("")
     corr_path.write_text('\n'.join(out_lines), encoding="utf-8")
     tprint(f"  → corrected/{fname}  ({corr_path.stat().st_size//1024}KB)",
-           worker=worker_id)
+           worker=worker_id, level=1)
 
     # ── Stage 10a: Article segmentation ─────────────────────────────────────
-    tprint(f"  Segmenting...", worker=worker_id)
+    tprint(f"  ┌─ Stage 10: Article segmentation + stitching ─────────────",
+           worker=worker_id, level=1)
     all_items = []
     for pg in sorted(corrected_pages.keys()):
         text = corrected_pages[pg]
         if text.startswith("[CORRECTION FAILED"):
             continue
+        tprint(f"  │  p{pg:02d} segmenting ...", worker=worker_id, level=2)
         items = segment_page(pg, text, api_key, rate_limiter)
         all_items.extend(items)
-        tprint(f"    p{pg:02d} → {len(items)} item(s)", worker=worker_id)
+        types = {}
+        for it in items:
+            types[it.get("type", "?")] = types.get(it.get("type", "?"), 0) + 1
+        type_str = ", ".join(f"{v} {k}" for k, v in types.items())
+        tprint(f"  │  p{pg:02d} → {len(items)} item(s): {type_str}",
+               worker=worker_id, level=1)
+        if LOG_LEVEL >= 5:
+            for it in items:
+                hl = it.get("headline", "")[:60] or "(no headline)"
+                tprint(f"  │    {it.get('type','?')}: {hl}", level=5)
         time.sleep(delay)
 
-    # ── Stage 10b: Cross-page stitching ─────────────────────────────────────
+    # Stage 10b: Cross-page stitching
     if len(corrected_pages) > 1 and all_items:
-        tprint(f"  Stitching boundaries...", worker=worker_id)
+        tprint(f"  │  stitching across page boundaries ...", worker=worker_id, level=1)
         all_items = stitch_all_pages(all_items, api_key, rate_limiter, worker_id)
 
-    # ── Stage 11: Write article files ───────────────────────────────────────
+    # Stage 11: Write article files
     n = write_article_files(issue, all_items, ark_dir)
-    tprint(f"  → articles/{ark_id}/  ({n} files)", worker=worker_id)
+    tprint(f"  └─ → articles/{ark_id}/  ({n} files)", worker=worker_id, level=1)
     return "ok"
 
 
@@ -2100,7 +2226,14 @@ def main():
     p.add_argument("--serial",         action="store_true")
     p.add_argument("--tier",           default="default",
                    choices=["default","build","custom"])
+    p.add_argument("--logging",        type=int, default=1, choices=[1,2,3,4,5],
+                   help="Log verbosity: 1=progress 2=pages 3=engines 4=alignment 5=verbose")
+    p.add_argument("--verbose",        action="store_true",
+                   help="Shorthand for --logging 5")
     args = p.parse_args()
+
+    global LOG_LEVEL
+    LOG_LEVEL = 5 if args.verbose else args.logging
 
     config_path = Path(args.config_path)
     if not config_path.exists():
@@ -2176,10 +2309,11 @@ def main():
     def run_issue(idx_issue):
         idx, issue = idx_issue
         ark_id = issue["ark_id"]
-        wid    = f"w{idx % effective_workers + 1}" if effective_workers > 1 else ""
-        tprint(f"[{idx+1:02d}/{len(issues)}] {ark_id}  "
+        wid    = ""
+        tprint(f"\n{'─'*60}", level=1)
+        tprint(f"[{idx+1}/{len(issues)}] {ark_id}  "
                f"Vol.{issue.get('volume','?')} No.{issue.get('number','?')}  "
-               f"{issue.get('date','')}", worker=wid)
+               f"{issue.get('date','')}", level=1)
         status = process_issue(
             issue, api_key, correction_prompt,
             args.delay, args.resume, args.retry_failed,
@@ -2195,27 +2329,19 @@ def main():
             else:                   ctr["err"]     += 1
         return status
 
-    # ── Process all issues ────────────────────────────────────────────────
-    # process_issue() runs local OCR (stages 1-7) first for all pages in
-    # an issue, reports dispute counts, then runs Claude (stages 8-9).
-    # Cost estimation happens inside process_issue before Claude calls.
+    # ── Process all issues sequentially ─────────────────────────────────
+    # Local OCR is CPU/GPU-bound — parallelizing just interleaves output
+    # and thrashes the same hardware. Issues run one at a time; the Claude
+    # API phase inside each issue can still use rate_limiter concurrency.
     all_items = list(enumerate(issues))
-    if effective_workers == 1:
-        for item in all_items: run_issue(item)
-    else:
-        with ThreadPoolExecutor(max_workers=effective_workers) as ex:
-            futs = {ex.submit(run_issue, item): item for item in all_items}
-            for fut in as_completed(futs):
-                try: fut.result()
-                except Exception as e:
-                    _, iss = futs[fut]
-                    tprint(f"  ✗ Unhandled: {iss['ark_id']}: {e}")
+    for item in all_items:
+        run_issue(item)
 
-    if rate_limiter: tprint(f"\nRate limiter: {rate_limiter.status_line()}")
-    tprint(f"\n{'='*50}")
-    tprint(f"Complete: {ctr['ok']}  Skipped: {ctr['skipped']}  Errors: {ctr['err']}")
-    tprint(f"Corrected: {CORRECTED_DIR}")
-    tprint(f"Articles:  {ARTICLES_DIR}")
+    if rate_limiter: tprint(f"\nRate limiter: {rate_limiter.status_line()}", level=1)
+    tprint(f"\n{'='*50}", level=1)
+    tprint(f"Complete: {ctr['ok']}  Skipped: {ctr['skipped']}  Errors: {ctr['err']}", level=1)
+    tprint(f"Corrected: {CORRECTED_DIR}", level=1)
+    tprint(f"Articles:  {ARTICLES_DIR}", level=1)
 
 if __name__ == "__main__":
     main()

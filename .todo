@@ -1,0 +1,64 @@
+# UNT Downloader — Future Work
+# Items below are design notes for Claude Code to implement later.
+# Each item includes enough context to act on without re-research.
+
+## CUDA detection and guided install during --configure
+
+### Problem
+Kraken runs a PyTorch neural network for segmentation (blla.segment) and
+recognition (rpred). On CPU this is the slowest local stage — 5-10x slower
+than GPU. Users with NVIDIA GPUs get no benefit unless they have the CUDA
+version of PyTorch installed, and there's no indication of this anywhere
+in the pipeline.
+
+### What to implement
+
+1. **Add CUDA status to check_deps() output** (unt_ocr_correct.py)
+   - `import torch; torch.cuda.is_available()` → show GPU name or "CPU only"
+   - Example output:
+     ```
+     PyTorch    : ✓  CUDA — NVIDIA GeForce RTX 3080 (10 GB)
+     PyTorch    : ✓  CPU only (install CUDA PyTorch for 5-10x faster Kraken)
+     ```
+   - Guard with try/except since torch may not be installed if Kraken isn't.
+
+2. **Add CUDA check to configure_global() wizard** (unt_archive_downloader.py)
+   - After API key / model / tier prompts, check torch CUDA status.
+   - If torch is installed but CUDA unavailable, print install guidance:
+     ```
+     ─────────────────────────────────────────────
+     GPU ACCELERATION (optional — speeds up Kraken OCR)
+     ─────────────────────────────────────────────
+     PyTorch is installed but using CPU only.
+     If you have an NVIDIA GPU, install CUDA PyTorch for 5-10x faster OCR:
+
+       pip uninstall torch torchvision torchaudio
+       pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+     After installing, re-run --configure to verify.
+     ```
+   - If CUDA is already available, just show confirmation:
+     ```
+     GPU        : ✓  NVIDIA GeForce RTX 3080 via CUDA 11.8
+     ```
+   - If torch is not installed at all (no Kraken), skip silently.
+
+3. **Kraken device selection** (unt_ocr_correct.py, kraken_tokens)
+   - Kraken/PyTorch should auto-detect CUDA, but verify that load_any()
+     and rpred() are using the GPU. May need to pass device='cuda' explicitly
+     to kraken_models.load_any() depending on Kraken version.
+   - Test: time a single page with and without CUDA to confirm speedup.
+
+### Key facts for implementation
+- PyTorch CUDA 11.8 URL: https://download.pytorch.org/whl/cu118
+- PyTorch CUDA 12.1 URL: https://download.pytorch.org/whl/cu121
+- Check: `python -c "import torch; print(torch.cuda.is_available())"`
+- GPU name: `torch.cuda.get_device_name(0)`
+- VRAM: `torch.cuda.get_device_properties(0).total_mem`
+- Tesseract has no CUDA support (--oem 1 LSTM is CPU only).
+- OpenCV CUDA modules exist but our ops (CLAHE, medianBlur) don't need them.
+- Only Kraken benefits meaningfully from GPU acceleration.
+
+### Files to modify
+- unt_ocr_correct.py: check_deps(), kraken_tokens()
+- unt_archive_downloader.py: configure_global()
