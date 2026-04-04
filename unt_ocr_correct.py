@@ -1928,14 +1928,29 @@ def main():
     collection_dir = config_path.parent
     init_paths(collection_dir)
 
+    # Load global config for API key and model defaults
+    global_config_path = Path(__file__).parent / "config.json"
+    global_config = {}
+    if global_config_path.exists():
+        try:
+            global_config = json.loads(global_config_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
     global CLAUDE_MODEL
+    # Model priority: collection.json → config.json → default
     if config.get("claude_model"):
         CLAUDE_MODEL = config["claude_model"]
+    elif global_config.get("claude_model"):
+        CLAUDE_MODEL = global_config["claude_model"]
 
-    api_key = (args.api_key or os.environ.get("ANTHROPIC_API_KEY","")
-               or config.get("anthropic_api_key",""))
+    # API key priority: flag → env → config.json → collection.json (legacy)
+    api_key = (args.api_key
+               or os.environ.get("ANTHROPIC_API_KEY", "")
+               or global_config.get("anthropic_api_key", "")
+               or config.get("anthropic_api_key", ""))
     if not args.preload_images and not api_key:
-        sys.exit("Error: API key required.")
+        sys.exit("Error: API key required. Set in config.json, ANTHROPIC_API_KEY env var, or --api-key flag.")
 
     index_path = METADATA_DIR / "all_issues.json"
     if not index_path.exists():

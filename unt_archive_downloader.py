@@ -96,6 +96,138 @@ def pdf_url(ark):      return f"{BASE_URL}/ark:/67531/{ark}/pdf/"
 def manifest_url(ark): return f"{BASE_URL}/ark:/67531/{ark}/manifest/"
 
 # ---------------------------------------------------------------------------
+# Interactive helpers
+# ---------------------------------------------------------------------------
+
+def ask(prompt: str, default: str = "", required: bool = False) -> str:
+    """Prompt user for input with an optional default value."""
+    suffix = f" [{default}]" if default else ""
+    while True:
+        answer = input(f"  {prompt}{suffix}: ").strip()
+        if not answer and default:
+            return default
+        if answer or not required:
+            return answer
+        print("    (required — please enter a value)")
+
+
+def ask_multiline(prompt: str) -> str:
+    """Prompt for multi-line input. Empty line finishes."""
+    print(f"  {prompt}")
+    print("  (Enter a blank line to finish)")
+    lines = []
+    while True:
+        line = input("  > ")
+        if not line.strip() and lines:
+            break
+        if line.strip():
+            lines.append(line.strip())
+    return " ".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Global configuration (project-level, not per-collection)
+# ---------------------------------------------------------------------------
+
+GLOBAL_CONFIG_PATH = Path(__file__).parent / "config.json"
+
+
+def load_global_config() -> dict:
+    """Load config.json from project root. Returns empty dict if missing."""
+    if GLOBAL_CONFIG_PATH.exists():
+        try:
+            return json.loads(GLOBAL_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_global_config(config: dict):
+    """Write config.json to project root."""
+    GLOBAL_CONFIG_PATH.write_text(
+        json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    print(f"✓ Global config saved → {GLOBAL_CONFIG_PATH}\n")
+
+
+def configure_global(existing: dict = None) -> dict:
+    """Interactive wizard for global (non-collection) settings."""
+    e = existing or load_global_config()
+
+    print()
+    print("─" * 72)
+    print("GLOBAL SETTINGS  (shared across all collections)")
+    print("─" * 72)
+
+    # ── API key ──────────────────────────────────────────────────────────
+    print("\nYour Anthropic API key is needed for the --correct and --translate steps.")
+    print("It will be stored in config.json (git-ignored). Leave blank to set later")
+    print("via the ANTHROPIC_API_KEY environment variable or --api-key flag.\n")
+    existing_key = e.get("anthropic_api_key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+    key_display  = f"...{existing_key[-6:]}" if len(existing_key) > 6 else ""
+    api_key      = ask("Anthropic API key (sk-ant-...)", key_display)
+    if api_key == key_display and existing_key:
+        api_key = existing_key
+
+    # ── Default model ────────────────────────────────────────────────────
+    default_model = e.get("claude_model", "claude-sonnet-4-6")
+    chosen_model  = default_model
+
+    if api_key:
+        print()
+        print("─" * 72)
+        print("DEFAULT MODEL")
+        print("─" * 72)
+        print("Choose the default Claude model for --correct and --translate.")
+        print("You can override per-collection in collection.json.\n")
+        try:
+            from unt_cost_estimate import configure_model
+            chosen_model = configure_model(api_key, current_model=default_model)
+        except ImportError:
+            print("  (unt_cost_estimate.py not found — keeping default model)")
+        except Exception as exc:
+            print(f"  (Model lookup failed: {exc} — keeping default)")
+    else:
+        print("\n  (API key not set — skipping model selection; default: claude-sonnet-4-6)")
+
+    # ── Rate limit tier ──────────────────────────────────────────────────
+    tier = ask(
+        "Default rate-limit tier (default / build / custom)",
+        e.get("tier", "default")
+    )
+    if tier not in ("default", "build", "custom"):
+        tier = "default"
+
+    config = {
+        "anthropic_api_key": api_key,
+        "claude_model":      chosen_model,
+        "tier":              tier,
+    }
+
+    # Preserve any extra keys the user may have added manually
+    for k, v in e.items():
+        if k not in config:
+            config[k] = v
+
+    print()
+    print("─" * 72)
+    print("GLOBAL CONFIG SUMMARY")
+    print("─" * 72)
+    print(f"  API key  : {'...' + api_key[-6:] if len(api_key) > 6 else '(not set)'}")
+    print(f"  Model    : {chosen_model}")
+    print(f"  Tier     : {tier}")
+    print()
+
+    confirm = ask("Save global settings?", "yes")
+    if confirm.lower() not in ("yes", "y"):
+        print("  (Skipped — global settings not saved)")
+        return e  # return previous
+
+    save_global_config(config)
+    return config
+
+
+# ---------------------------------------------------------------------------
 # Interactive collection configuration
 # ---------------------------------------------------------------------------
 
@@ -531,7 +663,7 @@ def run_configure(existing: dict = None) -> dict:
 
     print()
     print("─" * 72)
-    print("OUTPUT FOLDER & API KEY")
+    print("OUTPUT FOLDER")
     print("─" * 72)
     default_dir = discovered.get("output_dir_name") or re.sub(
         r"[^\w\-]", "_", title_name.lower().replace(" ", "_")
@@ -540,39 +672,6 @@ def run_configure(existing: dict = None) -> dict:
         "Output folder name (created in current directory)",
         default_dir
     )
-
-    print()
-    print("Your Anthropic API key is needed for the --correct and --translate steps.")
-    print("It will be stored in collection.json. Leave blank to set later via the")
-    print("ANTHROPIC_API_KEY environment variable or --api-key flag.\n")
-    existing_key = e.get("anthropic_api_key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
-    key_display  = f"...{existing_key[-6:]}" if len(existing_key) > 6 else ""
-    api_key      = ask("Anthropic API key (sk-ant-...)", key_display)
-    if api_key == key_display and existing_key:
-        api_key = existing_key
-
-    # ─── Model selection ──────────────────────────────────────────────────
-    default_claude_model = e.get("claude_model", "claude-sonnet-4-6")
-    chosen_model         = default_claude_model
-
-    if api_key:
-        print()
-        print("─" * 72)
-        print("DEFAULT MODEL SELECTION")
-        print("─" * 72)
-        print("Choose the default Claude model for --correct and --translate.")
-        print("You can override this at runtime. Cost per run is shown when")
-        print("you invoke those steps.\n")
-        try:
-            from unt_cost_estimate import configure_model
-            chosen_model = configure_model(api_key, current_model=default_claude_model)
-        except ImportError:
-            print("  (unt_cost_estimate.py not found — keeping default model)")
-        except Exception as exc:
-            print(f"  (Model lookup failed: {exc} — keeping default)")
-    else:
-        print()
-        print("  (API key not set — skipping model selection; default: claude-sonnet-4-6)")
 
     # ─── Assemble and confirm ─────────────────────────────────────────────
     config = {
@@ -599,13 +698,11 @@ def run_configure(existing: dict = None) -> dict:
         "layout_type":        layout_type,
         "expected_cols":      expected_cols,
         "output_dir_name":    output_dir_name,
-        "anthropic_api_key":  api_key,
-        "claude_model":       chosen_model,
     }
 
     print()
     print("─" * 72)
-    print("FINAL CONFIGURATION")
+    print("COLLECTION CONFIGURATION")
     print("─" * 72)
     print(f"  Collection : {config['title_name']}")
     print(f"  Title code : {config['title_code']}  |  LCCN: {config['lccn'] or '—'}  |  OCLC: {config['oclc'] or '—'}")
@@ -614,8 +711,6 @@ def run_configure(existing: dict = None) -> dict:
     print(f"  Publisher  : {config['publisher'] or '—'}")
     print(f"  Dates      : {config['date_range'] or '—'}")
     print(f"  Output dir : {output_dir_name}/")
-    print(f"  API key    : {'...'+api_key[-6:] if len(api_key) > 6 else '(not set)'}")
-    print(f"  Model      : {chosen_model}")
     print()
 
     confirm = ask("Save and continue? (yes/no)", "yes")
@@ -1212,6 +1307,14 @@ def main():
         return
 
     # -----------------------------------------------------------------------
+    # Global config (API key, model, tier — shared across collections)
+    # -----------------------------------------------------------------------
+    global_config = load_global_config()
+
+    if args.configure:
+        global_config = configure_global(global_config)
+
+    # -----------------------------------------------------------------------
     # Locate / create collection config
     # -----------------------------------------------------------------------
     config_path = find_config_path(args.config_dir)
@@ -1243,13 +1346,12 @@ def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     # -----------------------------------------------------------------------
-    # Build common worker args
-    # -----------------------------------------------------------------------
-    # Resolve API key: --api-key flag → env var → collection.json
+    # Resolve API key: flag → env → config.json → collection.json (legacy)
     # -----------------------------------------------------------------------
     resolved_api_key = (
         args.api_key
         or os.environ.get("ANTHROPIC_API_KEY", "")
+        or global_config.get("anthropic_api_key", "")
         or config.get("anthropic_api_key", "")
     )
 
