@@ -965,9 +965,10 @@ def _download_issue_ocr(task: dict, page_workers: int) -> dict:
     return {"fname": fname, "status": "ok", "kb": kb}
 
 
-def download_all_ocr(config: dict, resume: bool = True, workers: int = 8):
+def download_all_ocr(config: dict, resume: bool = True, workers: int = 8,
+                     ark: str = None, date_from: str = None, date_to: str = None):
     """
-    Download OCR text for all issues.
+    Download OCR text for all issues (or a filtered subset).
 
     By default skips issues whose .txt file already exists (resume=True).
     Pass resume=False (via --force-ocr) to re-download everything.
@@ -975,17 +976,17 @@ def download_all_ocr(config: dict, resume: bool = True, workers: int = 8):
     Parallelism operates at two levels:
       • Issue level  — `workers` issues processed simultaneously
       • Page level   — all pages within each issue fetched simultaneously
-
-    Args:
-        config:   collection config dict
-        resume:   if True (default), skip already-downloaded files
-        workers:  number of parallel issue threads (default 8)
     """
     index_path = METADATA_DIR / "all_issues.json"
     if not index_path.exists():
         sys.exit("No issue index. Run --discover first.")
     with open(index_path, encoding="utf-8") as f:
         issues = json.load(f)
+
+    # Apply filters
+    if ark:       issues = [i for i in issues if i["ark_id"] == ark]
+    if date_from: issues = [i for i in issues if i.get("date", "") >= date_from]
+    if date_to:   issues = [i for i in issues if i.get("date", "") <= date_to]
 
     title = config["title_name"]
     OCR_DIR.mkdir(parents=True, exist_ok=True)
@@ -1440,7 +1441,8 @@ def main():
         discover_issues(config)
 
     if args.download_ocr:
-        download_all_ocr(config, resume=not args.force_ocr, workers=args.workers)
+        download_all_ocr(config, resume=not args.force_ocr, workers=args.workers,
+                         ark=args.ark, date_from=args.date_from, date_to=args.date_to)
 
     if args.download_pdf:
         download_all_pdfs(resume=args.resume)
