@@ -943,15 +943,27 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
     partial_borders = sorted([b for b in h_borders if not b["full_width"]],
                              key=lambda b: b["y"])
 
-    # ── Masthead: first full-width border in top 20% ────────────────────
+    # ── Masthead: first full-width border in top 15% ──────────────────
+    # The masthead is separated from the body by a full-width horizontal
+    # rule line.  Use the first such line near the top.  If there's
+    # a second full-width line close below it (<5% of page height),
+    # prefer the lower one (the masthead may have internal rules between
+    # title, date line, and motto).
     masthead = None
     body_top = top
-    mast_limit = top + ch * 20 // 100
-    for b in fw_borders:
-        if b["y"] < mast_limit and b["y"] - top >= 15:
-            masthead = (left, top, right, b["y"])
-            body_top = b["y"]
-            break
+    mast_limit = top + ch * 15 // 100
+    mast_candidates = [b for b in fw_borders
+                       if b["y"] < mast_limit and b["y"] - top >= 15]
+    if mast_candidates:
+        # Use first candidate, but extend if next is very close
+        chosen = mast_candidates[0]
+        for c in mast_candidates[1:]:
+            if c["y"] - chosen["y"] < ch * 5 // 100:
+                chosen = c  # extend to include internal rule
+            else:
+                break
+        masthead = (left, top, right, chosen["y"])
+        body_top = chosen["y"]
 
     # ── Footer: last full-width border in bottom 15% ────────────────────
     footer_top = bot
@@ -973,29 +985,68 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
             "col_span": (1, n_cols),
         })
 
-    # Ad zones from partial borders.
-    # An ad is bounded by a top and bottom horizontal border that share
-    # the same column span (or overlap).  Pair consecutive partial borders
-    # that have overlapping column spans.
+    # Ad zones from horizontal borders.
+    # An ad is bounded by a top border and a bottom border that share
+    # column span (overlap).  Borders can be full-width or partial.
+    #
+    # Two-phase strategy (order matters):
+    #   Phase 1: Pair partial borders with a full-width border above.
+    #            This catches ads that start at a section boundary
+    #            (masthead bottom, section break).  Run first because
+    #            these are higher-confidence pairings.
+    #   Phase 2: Pair remaining partial borders with overlapping col spans.
+    all_borders = sorted(fw_borders + partial_borders, key=lambda b: b["y"])
     ad_zones = []
-    used_partial = set()
-    for i, b_top in enumerate(partial_borders):
-        if i in used_partial:
+    used = set()  # indices into all_borders
+
+    # Phase 1: partial borders paired with full-width border above
+    for i, b in enumerate(all_borders):
+        if b["full_width"] or b["y"] < body_top or b["y"] > footer_top:
             continue
-        if b_top["y"] < body_top or b_top["y"] > footer_top:
-            continue
-        # Look for a matching bottom border
-        for j in range(i + 1, len(partial_borders)):
-            if j in used_partial:
-                continue
-            b_bot = partial_borders[j]
-            if b_bot["y"] > footer_top:
+        # Find nearest full-width border ABOVE
+        above_fw = None
+        for j in range(i - 1, -1, -1):
+            ab = all_borders[j]
+            if ab["full_width"] and ab["y"] >= top:
+                above_fw = ab
                 break
-            # Check overlapping column span
+        if above_fw is None and masthead:
+            above_fw = {"y": body_top, "full_width": True}
+        if above_fw:
+            gap = b["y"] - above_fw["y"]
+            # Only create an ad if:
+            # - spans fewer than all columns
+            # - the gap is moderate (not too large = normal column text
+            #   between section breaks; max ~35% of page height)
+            n_span = b["col_end"] - b["col_start"] + 1
+            if 30 < gap < ch * 35 // 100 and n_span < n_cols:
+                cs, ce = b["col_start"], b["col_end"]
+                x1 = col_bounds[cs - 1]
+                x2 = col_bounds[ce]
+                ad_zones.append({
+                    "type": "ad",
+                    "bbox": (x1, above_fw["y"], x2, b["y"]),
+                    "col_span": (cs, ce),
+                })
+                used.add(i)
+
+    # Phase 2: pair remaining partial borders with overlapping col spans
+    partial_idxs = [i for i, b in enumerate(all_borders)
+                    if not b["full_width"] and i not in used
+                    and body_top <= b["y"] <= footer_top]
+    for pi, i in enumerate(partial_idxs):
+        if i in used:
+            continue
+        b_top = all_borders[i]
+        for pj in range(pi + 1, len(partial_idxs)):
+            j = partial_idxs[pj]
+            if j in used:
+                continue
+            b_bot = all_borders[j]
             span_lo = max(b_top["col_start"], b_bot["col_start"])
             span_hi = min(b_top["col_end"], b_bot["col_end"])
             gap = b_bot["y"] - b_top["y"]
-            if span_lo <= span_hi and 15 < gap < ch // 3:
+            if span_lo <= span_hi and 15 < gap < ch // 2:
                 x1 = col_bounds[span_lo - 1]
                 x2 = col_bounds[span_hi]
                 ad_zones.append({
@@ -1003,11 +1054,42 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
                     "bbox": (x1, b_top["y"], x2, b_bot["y"]),
                     "col_span": (span_lo, span_hi),
                 })
-                used_partial.add(i)
-                used_partial.add(j)
+                used.add(i)
+                used.add(j)
                 break
 
-    zones.extend(ad_zones)
+    # Deduplicate overlapping ads: when multiple ads share the same
+    # starting y and column span, keep only the tightest (smallest area).
+    # This happens when Phase 1 pairs multiple partial borders below
+    # the same full-width border.
+    deduped = []
+    ad_zones.sort(key=lambda a: (a["bbox"][1], a["col_span"],
+                                 a["bbox"][3] - a["bbox"][1]))
+    for ad in ad_zones:
+        # Check if this ad is contained within an existing one
+        contained = False
+        for existing in deduped:
+            eb = existing["bbox"]
+            ab = ad["bbox"]
+            # Same or overlapping start, one contains the other
+            if (ab[0] >= eb[0] and ab[2] <= eb[2] and
+                    ab[1] >= eb[1] and ab[3] <= eb[3]):
+                contained = True
+                break
+            # Same start, same cols, different height — keep smaller
+            if (ab[1] == eb[1] and ad["col_span"] == existing["col_span"]):
+                contained = True
+                break
+        if not contained:
+            # Also remove any existing ads that this one contains
+            deduped = [e for e in deduped if not (
+                e["bbox"][0] >= ad["bbox"][0] and
+                e["bbox"][2] <= ad["bbox"][2] and
+                e["bbox"][1] >= ad["bbox"][1] and
+                e["bbox"][3] <= ad["bbox"][3])]
+            deduped.append(ad)
+
+    zones.extend(deduped)
 
     # Column zones (body columns between masthead and footer)
     for ci in range(n_cols):
@@ -1031,7 +1113,8 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
 
 
 def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
-                        n_cols: int = 0) -> dict:
+                        n_cols: int = 0,
+                        override_gutters: list = None) -> dict:
     """
     Analyze a single page's layout by building a 2D grid from vertical
     column gutters and horizontal rule-line borders, then classifying
@@ -1045,7 +1128,8 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
     top and bottom, and begin/end aligned to column gutters (spanning
     1+ columns).
 
-    If n_cols > 0 (from cross-page consensus), uses that column count.
+    If override_gutters is provided (from cross-page median), uses those
+    gutter positions directly.  If n_cols > 0, detects per-page gutters.
     Otherwise falls back to per-page best-guess (scoring pass).
 
     Returns a layout dict with:
@@ -1061,7 +1145,10 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
     rule_lines = _detect_rule_lines(img_gray, content_bounds)
 
     # Step 2: Detect vertical gutters
-    if n_cols > 0:
+    if override_gutters:
+        gutter_xs = list(override_gutters)
+        n_cols = len(gutter_xs) + 1
+    elif n_cols > 0:
         gutter_xs = _detect_gutters_equidistant(
             img_gray, content_bounds, n_cols, rule_lines=rule_lines)
     else:
@@ -1270,15 +1357,51 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
     tprint(f"  │  consensus: {expected_cols} columns",
            worker=worker_id, level=1)
 
-    # ── Pass 2: finalize layouts with consensus column count ─────────────
+    # ── Pass 2: compute per-page gutters and take cross-page median ────
+    # Column widths are mechanically consistent across pages.  Individual
+    # pages may have ads or mastheads that disrupt the gutter signal.
+    # Computing the median gutter position (as fraction of content width)
+    # across all pages eliminates per-page noise.
+    per_page_rel_gutters = []  # list of [frac_1, ..., frac_N-1] per page
+    per_page_raw = {}          # pg → raw gutter_xs before refinement
+    for pg in pages_to_analyze:
+        if pg not in page_images:
+            continue
+        img_gray, bounds = page_images[pg]
+        left, _, right, _ = bounds
+        cw = right - left
+        gutter_xs = _detect_gutters_equidistant(
+            img_gray, bounds, expected_cols)
+        per_page_raw[pg] = gutter_xs
+        per_page_rel_gutters.append(
+            [(gx - left) / cw for gx in gutter_xs])
+
+    # Median relative positions across pages
+    if per_page_rel_gutters:
+        median_rel = []
+        for gi in range(expected_cols - 1):
+            vals = [rel[gi] for rel in per_page_rel_gutters
+                    if gi < len(rel)]
+            median_rel.append(float(np.median(vals)))
+        tprint(f"  │  median gutter fractions: "
+               f"{[f'{r:.3f}' for r in median_rel]}",
+               worker=worker_id, level=3)
+
+    # ── Pass 3: finalize layouts using median gutter positions ───────────
     page_layouts = {}
     for pg in pages_to_analyze:
         if pg not in page_images:
             continue
         img_gray, bounds = page_images[pg]
+        left, _, right, _ = bounds
+        cw = right - left
+
+        # Apply median gutter positions (converted back to page coords)
+        median_gutters = [int(left + r * cw) for r in median_rel]
 
         layout = analyze_page_layout(img_gray, pg, bounds,
-                                     n_cols=expected_cols)
+                                     n_cols=expected_cols,
+                                     override_gutters=median_gutters)
         layout["skew_deg"] = skew_deg
         page_layouts[pg] = layout
 
