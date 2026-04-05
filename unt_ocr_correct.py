@@ -1896,59 +1896,59 @@ def preprocess_image(img_gray):
 
 def detect_content_bounds(img_gray):
     """
-    Trim dark microfilm borders and torn/tattered edges.
-    Returns (left, top, right, bottom).
+    Trim the solid black microfilm border.  Returns (left, top, right, bottom).
 
-    Uses a sustained-brightness approach: the content edge is where
-    the column/row mean brightness first stays above threshold for
-    a run of consecutive pixels (not just the first bright pixel).
-    This avoids tattered edges where brightness fluctuates before
-    the actual printed content begins.
+    The content boundary is where the microfilm frame ends — the first
+    column/row where mean brightness rises above the black border level.
+    Uses a low threshold (15 on raw grayscale) to include ALL content,
+    even degraded/tattered edges.  Those edges contain real text; the
+    OCR engines and alignment steps handle degraded input.
+
+    Cross-page median bounds (in analyze_issue_layout) further refine
+    these per-page bounds using the most inclusive edges across all pages.
     """
     if not HAS_CV2:
         h, w = img_gray.shape
         return int(w*.05), int(h*.02), int(w*.97), int(h*.98)
     h, w = img_gray.shape
-    _, bw = cv2.threshold(img_gray, 60, 255, cv2.THRESH_BINARY)
 
-    # Use the MIDDLE 50% of the page for column brightness (avoids
-    # masthead/footer regions that can mask torn edges).
+    # Use raw grayscale (not binarized) — tattered edges have low but
+    # non-zero brightness that binarization destroys.
+    # Sample the middle 50% vertically to avoid masthead/footer effects.
     mid_top = h * 25 // 100
     mid_bot = h * 75 // 100
-    cl = np.mean(bw[mid_top:mid_bot, :], axis=0)
+    cl = img_gray[mid_top:mid_bot, :].mean(axis=0).astype(float)
 
-    # Use the MIDDLE 50% for row brightness (avoids left/right edge)
     mid_left = w * 15 // 100
     mid_right = w * 85 // 100
-    rl = np.mean(bw[:, mid_left:mid_right], axis=1)
+    rl = img_gray[:, mid_left:mid_right].mean(axis=1).astype(float)
 
-    # Find where brightness sustains above threshold for ≥8 consecutive
-    # columns/rows.  On torn edges, brightness flickers in and out;
-    # real content has sustained brightness.
-    threshold = 140
-    run_needed = 8
+    # Threshold: just above pure black microfilm border.
+    # Microfilm frame is ~0-5 brightness; any content (even degraded) is >10.
+    threshold = 15
 
-    def _find_sustained(profile, forward=True):
+    def _find_edge(profile, forward=True):
+        """Find where brightness first sustains above threshold."""
         n = len(profile)
         rng = range(n) if forward else range(n - 1, -1, -1)
         run = 0
         for i in rng:
             if profile[i] > threshold:
                 run += 1
-                if run >= run_needed:
-                    return i - (run_needed - 1) if forward else i + (run_needed - 1)
+                if run >= 5:
+                    return (i - 4) if forward else (i + 4)
             else:
                 run = 0
-        # Fallback: first bright pixel
+        # Fallback
         for i in rng:
-            if profile[i] > 120:
+            if profile[i] > threshold:
                 return i
         return 0 if forward else n - 1
 
-    left  = _find_sustained(cl, forward=True) + 3
-    right = _find_sustained(cl, forward=False) - 3
-    top   = _find_sustained(rl, forward=True) + 3
-    bot   = _find_sustained(rl, forward=False) - 3
+    left  = _find_edge(cl, forward=True)
+    right = _find_edge(cl, forward=False)
+    top   = _find_edge(rl, forward=True)
+    bot   = _find_edge(rl, forward=False)
     return max(0, left), max(0, top), min(w, right), min(h, bot)
 
 
