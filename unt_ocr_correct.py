@@ -391,14 +391,115 @@ ZONE_COLORS = {
 }
 
 
-def _detect_gutters_unconstrained(img_gray, content_bounds) -> list:
+def _detect_rule_lines(img_gray, content_bounds) -> dict:
     """
-    Find column gutters from the image without constraining to expected_cols.
-    Returns list of gutter x-coordinates (in page coords).
+    Detect continuous black rule lines that form column borders and section
+    separators. Most newspapers use thin (~1-3px) black lines running the
+    full height (vertical) or width (horizontal) of the content area.
 
-    A real newspaper column gutter is a vertical gap that runs the full height
-    of the text area. We use multiple scan zones and require consistency:
-    gutters must appear in both the middle and bottom thirds of the page.
+    Returns:
+      {"vertical": [x1, x2, ...],    # x-coords of vertical rule lines
+       "horizontal": [y1, y2, ...]}   # y-coords of horizontal rule lines
+    """
+    if not HAS_CV2:
+        return {"vertical": [], "horizontal": []}
+    left, top, right, bot = content_bounds
+    cw = right - left
+    ch = bot - top
+    if cw < 100 or ch < 100:
+        return {"vertical": [], "horizontal": []}
+
+    # Binarize: dark pixels = 1, light = 0
+    _, bw = cv2.threshold(img_gray, 80, 1, cv2.THRESH_BINARY_INV)
+    content = bw[top:bot, left:right]
+
+    # ── Vertical rule lines ──────────────────────────────────────────────
+    # A real column divider is dark for a large fraction of the page height.
+    # Normal text columns are dark only ~30-50% (letters + whitespace).
+    # Rule lines are dark >60% of the height in a narrow band.
+    col_dark_frac = content.mean(axis=0)  # fraction of dark pixels per x
+
+    # Find narrow peaks (1-5px wide) where darkness is high
+    # Smooth very lightly to merge adjacent pixel lines
+    col_smooth = uniform_filter1d(col_dark_frac, size=3)
+
+    # A rule line stands out as a spike above its neighbors.
+    # Use local contrast: compare each position to a wide local average
+    col_local_avg = uniform_filter1d(col_dark_frac, size=40)
+    col_contrast = col_smooth - col_local_avg
+
+    # Rule lines: darkness > 55% AND stands out > 15% above local average
+    rule_threshold = 0.55
+    contrast_threshold = 0.12
+    v_candidates = []
+    i = 0
+    while i < len(col_dark_frac):
+        if col_smooth[i] > rule_threshold and col_contrast[i] > contrast_threshold:
+            # Found start of a rule line — find its extent
+            j = i
+            while j < len(col_dark_frac) and col_smooth[j] > rule_threshold * 0.7:
+                j += 1
+            # Rule line center (must be narrow: 1-8px)
+            width = j - i
+            if width <= 8:
+                center = left + (i + j) // 2
+                v_candidates.append(center)
+            i = j + 1
+        else:
+            i += 1
+
+    # Merge rule lines that are very close (within 5px) — probably the same line
+    vertical = []
+    for vx in v_candidates:
+        if not vertical or vx - vertical[-1] > 5:
+            vertical.append(vx)
+        else:
+            # Average with the previous detection
+            vertical[-1] = (vertical[-1] + vx) // 2
+
+    tprint(f"      rule lines: {len(vertical)} vertical at x={vertical}", level=4)
+
+    # ── Horizontal rule lines ────────────────────────────────────────────
+    # Same approach but row-wise. Horizontal rules span most of the width.
+    row_dark_frac = content.mean(axis=1)
+    row_smooth = uniform_filter1d(row_dark_frac, size=3)
+    row_local_avg = uniform_filter1d(row_dark_frac, size=40)
+    row_contrast = row_smooth - row_local_avg
+
+    h_candidates = []
+    i = 0
+    while i < len(row_dark_frac):
+        if row_smooth[i] > rule_threshold and row_contrast[i] > contrast_threshold:
+            j = i
+            while j < len(row_dark_frac) and row_smooth[j] > rule_threshold * 0.7:
+                j += 1
+            width = j - i
+            if width <= 8:
+                center = top + (i + j) // 2
+                h_candidates.append(center)
+            i = j + 1
+        else:
+            i += 1
+
+    horizontal = []
+    for hy in h_candidates:
+        if not horizontal or hy - horizontal[-1] > 5:
+            horizontal.append(hy)
+        else:
+            horizontal[-1] = (horizontal[-1] + hy) // 2
+
+    tprint(f"      rule lines: {len(horizontal)} horizontal at y={horizontal}", level=4)
+
+    return {"vertical": vertical, "horizontal": horizontal}
+
+
+def _detect_gutters_unconstrained(img_gray, content_bounds,
+                                  rule_lines: dict = None) -> list:
+    """
+    Find column gutters. Primary signal: vertical rule lines detected by
+    _detect_rule_lines(). Fallback: cross-zone ink density projection.
+
+    Returns list of gutter x-coordinates (in page coords).
     """
     if not HAS_CV2:
         return []
@@ -408,6 +509,21 @@ def _detect_gutters_unconstrained(img_gray, content_bounds) -> list:
     if cw < 200 or ch < 200:
         return []
 
+    # ── Primary: use rule lines if available ──────────────────────────────
+    # Vertical rule lines are the most reliable signal — they're the actual
+    # printed column borders, not inferred from text density.
+    if rule_lines and rule_lines.get("vertical"):
+        v_rules = rule_lines["vertical"]
+        # Filter to lines within content area, away from edges
+        edge_margin = cw // 15
+        gutters = [x for x in v_rules
+                   if x > left + edge_margin and x < right - edge_margin]
+        if gutters:
+            tprint(f"      gutters from rule lines: {len(gutters)} at x={gutters}", level=3)
+            return sorted(gutters)
+        tprint(f"      rule lines found but all near edges — falling back to projection", level=4)
+
+    # ── Fallback: cross-zone ink density projection ──────────────────────
     # Minimum column width: real newspaper columns are at least 100px wide
     # at typical scan resolutions (1200-1500px wide page).
     min_col_width = max(80, cw // 20)
@@ -563,17 +679,34 @@ def _detect_masthead_zone(img_gray, content_bounds, gutter_xs) -> tuple | None:
 
 def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
     """
-    Analyze a single page's layout: content bounds, gutters, masthead, zones.
+    Analyze a single page's layout: rule lines, gutters, masthead, zones.
     Returns a layout dict with all detected geometry.
     """
     left, top, right, bot = content_bounds
 
-    # Detect gutters without column count constraint
-    gutter_xs = _detect_gutters_unconstrained(img_gray, content_bounds)
+    # Step 1: Detect printed rule lines (the most reliable geometric signal)
+    rule_lines = _detect_rule_lines(img_gray, content_bounds)
+
+    # Step 2: Detect gutters using rule lines first, projection as fallback
+    gutter_xs = _detect_gutters_unconstrained(img_gray, content_bounds,
+                                              rule_lines=rule_lines)
     n_cols = len(gutter_xs) + 1
 
-    # Detect masthead zone
-    masthead = _detect_masthead_zone(img_gray, content_bounds, gutter_xs)
+    # Step 3: Detect masthead using horizontal rules first, then density
+    masthead = None
+    # If horizontal rule lines exist in the top 25%, the first one is likely
+    # the bottom of the masthead
+    h_rules = rule_lines.get("horizontal", [])
+    top_quarter = top + (bot - top) // 4
+    header_rules = [y for y in h_rules if y < top_quarter and y - top > 30]
+    if header_rules:
+        mast_y = header_rules[0]  # first horizontal rule = masthead bottom
+        masthead = (left, top, right, mast_y)
+        tprint(f"      masthead from rule line: y={mast_y} "
+               f"({mast_y - top}px tall)", level=3)
+    else:
+        # Fall back to ink density analysis
+        masthead = _detect_masthead_zone(img_gray, content_bounds, gutter_xs)
 
     # Build column zones (below masthead if present)
     body_top = masthead[3] if masthead else top
@@ -588,7 +721,7 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
                 "bbox": (x1, body_top, x2, bot),
             })
 
-    # Assemble zones
+    # Assemble all zones
     zones = []
     if masthead:
         zones.append({
@@ -600,6 +733,7 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
     return {
         "page_num": page_num,
         "content_bounds": content_bounds,
+        "rule_lines": rule_lines,
         "gutter_xs": gutter_xs,
         "n_cols": n_cols,
         "masthead": masthead,
@@ -642,14 +776,30 @@ def render_layout_overlay(img_gray, layout: dict, page_num: int) -> bytes:
         cv2.putText(overlay, label, (x1 + 4, y1 + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    # Page number
+    # Page number and column count
     cv2.putText(overlay, f"Page {page_num}  ({layout['n_cols']} cols)",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    # Draw gutter lines through full height
+    l, t, r, b = layout["content_bounds"]
+    rule_lines = layout.get("rule_lines", {})
+
+    # Draw detected rule lines (cyan, dashed appearance via thickness)
+    for vx in rule_lines.get("vertical", []):
+        cv2.line(overlay, (vx, t), (vx, b), (255, 255, 0), 1)  # cyan
+    for hy in rule_lines.get("horizontal", []):
+        cv2.line(overlay, (l, hy), (r, hy), (255, 255, 0), 1)  # cyan
+
+    # Draw gutters (thicker yellow-green, these are the confirmed column dividers)
     for gx in layout["gutter_xs"]:
-        cv2.line(overlay, (gx, layout["content_bounds"][1]),
-                 (gx, layout["content_bounds"][3]), (0, 255, 255), 1)
+        cv2.line(overlay, (gx, t), (gx, b), (0, 255, 255), 2)
+
+    # Legend
+    legend_y = b + 15 if b + 30 < img_gray.shape[0] else t - 15
+    v_count = len(rule_lines.get("vertical", []))
+    h_count = len(rule_lines.get("horizontal", []))
+    cv2.putText(overlay,
+                f"Rule lines: {v_count}V + {h_count}H | Gutters: {len(layout['gutter_xs'])}",
+                (10, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     _, png = cv2.imencode(".png", overlay)
     return png.tobytes()
