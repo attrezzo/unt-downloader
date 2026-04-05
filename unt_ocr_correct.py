@@ -1542,23 +1542,25 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
     # ── Cross-page median content bounds ────────────────────────────────
     # All pages of the same issue are the same physical size on the same
     # microfilm.  Tattered/torn edges on individual pages produce outlier
-    # content bounds.  Using the median across pages corrects these.
+    # content bounds.  The median across pages is the most reliable
+    # estimate — apply it to ALL pages directly.  A page with a tattered
+    # edge has its left bound too far right (e.g., 59 instead of 36);
+    # the median from clean pages corrects this.
     if len(page_images) >= 3:
         all_bounds = [b for _, b in page_images.values()]
-        med_left = int(np.median([b[0] for b in all_bounds]))
-        med_top  = int(np.median([b[1] for b in all_bounds]))
+        med_left  = int(np.median([b[0] for b in all_bounds]))
+        med_top   = int(np.median([b[1] for b in all_bounds]))
         med_right = int(np.median([b[2] for b in all_bounds]))
-        med_bot  = int(np.median([b[3] for b in all_bounds]))
+        med_bot   = int(np.median([b[3] for b in all_bounds]))
         for pg in page_images:
             img_gray, old_bounds = page_images[pg]
             h, w = img_gray.shape
-            # Use median, but don't expand beyond the per-page detection
-            # (a page with a genuinely smaller image shouldn't be stretched)
+            # Use median bounds directly, clamped to image dimensions
             new_bounds = (
-                max(med_left, old_bounds[0]),
-                max(med_top,  old_bounds[1]),
-                min(med_right, old_bounds[2]),
-                min(med_bot,  old_bounds[3]),
+                max(0, min(med_left, w - 100)),
+                max(0, min(med_top,  h - 100)),
+                min(w, max(med_right, 100)),
+                min(h, max(med_bot,   100)),
             )
             if new_bounds != old_bounds:
                 tprint(f"  │  p{pg:02d} bounds adjusted: "
