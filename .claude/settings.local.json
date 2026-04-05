@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python unt_archive_downloader.py --status)",
+      "Bash(PYTHONIOENCODING=utf-8 python unt_ocr_correct.py --config-path bellville_wochenblatt/collection.json --ark metapth1478565)",
+      "Bash(PYTHONIOENCODING=utf-8 python unt_ocr_correct.py --config-path bellville_wochenblatt/collection.json --ark metapth1478565 --verbose)"
+    ]
+  }
+}
