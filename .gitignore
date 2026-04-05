@@ -19,3 +19,4 @@ __pycache__/
 config.json
 collection.json
 */collection.json
+*/calibration.json

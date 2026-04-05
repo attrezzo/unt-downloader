@@ -2,6 +2,203 @@
 # Items below are design notes for Claude Code to implement later.
 # Each item includes enough context to act on without re-research.
 
+## Interactive layout calibration GUI (--calibrate)
+
+### Problem
+Auto-detected column boundaries and mastheads are wrong often enough that
+the user needs a way to correct them before committing to a full batch run.
+Different newspaper collections may have 4, 5, 6, or variable column counts,
+different masthead sizes, ads in unusual positions, etc. The detection
+parameters (prominence thresholds, minimum column widths) that work for the
+Bellville Wochenblatt will not work for all collections.
+
+### Design overview
+
+New CLI step `--calibrate` that:
+1. Picks a single issue (first, or user-specified via --ark)
+2. Runs Stage 0 layout analysis on all pages
+3. Opens an interactive GUI showing each page with detected boundaries
+4. User corrects/confirms boundaries, draws missing ones
+5. Saves tuning data to `{collection}/calibration.json`
+6. Prompts: "Tune next issue or start batch?"
+7. Batch `--correct` reads calibration.json and uses tuned parameters
+
+### CLI integration
+
+```
+python unt_archive_downloader.py --calibrate          # calibrate first issue
+python unt_archive_downloader.py --calibrate --ark ID  # calibrate specific issue
+python unt_archive_downloader.py --correct --resume    # uses calibration.json
+```
+
+`--calibrate` should be run AFTER `--preload-images` (needs page scans) and
+BEFORE `--correct`. The orchestrator should check for calibration.json and
+warn if it doesn't exist when running --correct.
+
+### GUI tool: `unt_calibrate_gui.py`
+
+**Framework:** tkinter (stdlib, no extra deps). Falls back to Pillow
+ImageShow + console prompts if tkinter is unavailable (headless server).
+
+**Window layout:**
+```
+┌──────────────────────────────────────────────────────┐
+│ Page 1/8  metapth1478562        [< Prev] [Next >]    │
+│                                                      │
+│  ┌─────────────────────────────────────────────────┐ │
+│  │                                                 │ │
+│  │  Page image with overlay:                       │ │
+│  │  - Green boxes = detected columns               │ │
+│  │  - Red box = detected masthead                  │ │
+│  │  - Blue box = detected ads                      │ │
+│  │  - Yellow dashed = detected rule lines          │ │
+│  │                                                 │ │
+│  │  Click+drag to draw new boundary box            │ │
+│  │  Click existing box edge to adjust              │ │
+│  │  Right-click box to delete                      │ │
+│  │                                                 │ │
+│  └─────────────────────────────────────────────────┘ │
+│                                                      │
+│  Zone type: [Column ▾]  [Add Zone]  [Delete Zone]    │
+│                                                      │
+│  Detected: 6 cols, 1 masthead, 0 ads                 │
+│  [Accept Page] [Accept All Remaining] [Redo Auto]    │
+│                                                      │
+│  ┌─ Tuning Parameters ───────────────────┐           │
+│  │ Rule line threshold: [0.55] ─────○──  │           │
+│  │ Min column width:    [80]  ──○──────  │           │
+│  │ Prominence:          [0.15] ────○───  │           │
+│  │ [Re-detect with new parameters]       │           │
+│  └───────────────────────────────────────┘           │
+│                                                      │
+│  [Save & Continue to Next Issue]  [Save & Start OCR] │
+└──────────────────────────────────────────────────────┘
+```
+
+**Interactions:**
+- Left-click + drag on empty area → draw new zone box
+- Left-click + drag on box edge → resize
+- Left-click on box → select (highlight, show type in dropdown)
+- Right-click on box → delete with confirmation
+- Zone type dropdown: column, masthead, ad, separator
+- "Redo Auto" re-runs _detect_rule_lines + _detect_gutters with current params
+- Tuning sliders adjust detection parameters and preview immediately
+
+**Canvas rendering:**
+- Load page image as tkinter PhotoImage (via PIL.ImageTk)
+- Scale to fit window (typically 800x1100 or similar)
+- Draw zone rectangles as canvas items (movable, resizable)
+- Coordinate mapping: canvas pixels ↔ original image pixels
+
+### calibration.json format
+
+```json
+{
+  "version": 1,
+  "calibrated_from": "metapth1478562",
+  "calibrated_at": "2026-04-05T15:30:00",
+  "tuning_params": {
+    "rule_line_threshold": 0.55,
+    "rule_line_contrast": 0.12,
+    "min_column_width": 80,
+    "prominence": 0.15,
+    "masthead_scan_fraction": 0.25
+  },
+  "page_layouts": {
+    "1": {
+      "masthead": [85, 41, 1444, 213],
+      "columns": [
+        [85, 213, 305, 2155],
+        [305, 213, 530, 2155],
+        [530, 213, 722, 2155],
+        [722, 213, 945, 2155],
+        [945, 213, 1168, 2155],
+        [1168, 213, 1395, 2155]
+      ],
+      "ads": [
+        [723, 250, 1395, 860]
+      ],
+      "user_corrected": true
+    },
+    "2": {
+      "columns": [...],
+      "user_corrected": false
+    }
+  },
+  "expected_cols": 6,
+  "notes": "6-column layout, masthead on p1 only, ad in upper-right of p1"
+}
+```
+
+### Integration with --correct
+
+In process_issue(), before the per-page loop:
+```python
+# Load calibration data if available
+cal_path = collection_dir / "calibration.json"
+if cal_path.exists():
+    cal = json.loads(cal_path.read_text())
+    expected_cols = cal.get("expected_cols", expected_cols)
+    # Override page_layouts with calibrated versions
+    for pg_str, pg_layout in cal.get("page_layouts", {}).items():
+        pg = int(pg_str)
+        if pg_layout.get("user_corrected"):
+            page_layouts[pg] = _layout_from_calibration(pg_layout, pg)
+    # Override detection parameters
+    tuning = cal.get("tuning_params", {})
+    # Pass tuning params to _detect_rule_lines, _detect_gutters, etc.
+```
+
+For pages that weren't explicitly corrected, the tuned parameters from the
+calibration issue are used for auto-detection on all other issues. This
+means the user only needs to calibrate once per collection — the parameters
+generalize to all issues with similar layout.
+
+### Implementation order
+
+1. **calibration.json writer** — simplest first: after Stage 0, save the
+   auto-detected layout to calibration.json. No GUI yet, just the data.
+   User edits the JSON manually if needed. This unblocks --correct immediately.
+
+2. **calibration.json reader** — wire into process_issue to load and use
+   calibrated layouts and tuning params.
+
+3. **Console-based calibration** — show the overlay image path, print
+   detected zones, let user type corrections (e.g. "masthead_bottom=213",
+   "delete col 4"). Works on headless servers.
+
+4. **tkinter GUI** — full interactive tool. Build as a standalone script
+   (unt_calibrate_gui.py) that can be launched independently or via
+   --calibrate flag from the orchestrator.
+
+5. **Parameter learning** — after user corrects a few pages, infer optimal
+   detection parameters (thresholds, minimum widths) that would have
+   produced the correct result automatically. Save to tuning_params.
+
+### Files to create/modify
+- NEW: unt_calibrate_gui.py — standalone GUI tool
+- unt_ocr_correct.py: read calibration.json in process_issue, add
+  _layout_from_calibration() converter
+- unt_archive_downloader.py: add --calibrate flag, dispatch to GUI tool
+- {collection}/calibration.json: tuning data (git-ignored in .gitignore)
+
+### Dependencies
+- tkinter (Python stdlib — usually included, but not always on minimal
+  Linux installs: `apt install python3-tk`)
+- Pillow (already required for Kraken/Tesseract)
+- No new pip dependencies
+
+### Key design decisions
+- Calibration data is per-collection, not per-issue. One calibration issue
+  sets parameters for the entire batch.
+- User corrections for specific pages override auto-detection entirely.
+  For uncorrected pages, tuned parameters drive auto-detection.
+- The GUI must work on Windows, macOS, and Linux. tkinter is the safest
+  cross-platform choice (avoids Qt/wx dependency hell).
+- The console fallback ensures headless servers can still calibrate.
+- calibration.json is human-editable — power users can tune by hand.
+
+
 ## CUDA detection and guided install during --configure
 
 ### Problem

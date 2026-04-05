@@ -391,9 +391,114 @@ ZONE_COLORS = {
 }
 
 
-def _detect_gutters_unconstrained(img_gray, content_bounds) -> list:
+def _detect_rule_lines(img_gray, content_bounds) -> dict:
     """
-    Find column gutters from the image without constraining to expected_cols.
+    Detect continuous black rule lines that form column borders and section
+    separators. Most newspapers use thin (~1-3px) black lines running the
+    full height (vertical) or width (horizontal) of the content area.
+
+    Returns:
+      {"vertical": [x1, x2, ...],    # x-coords of vertical rule lines
+       "horizontal": [y1, y2, ...]}   # y-coords of horizontal rule lines
+    """
+    if not HAS_CV2:
+        return {"vertical": [], "horizontal": []}
+    left, top, right, bot = content_bounds
+    cw = right - left
+    ch = bot - top
+    if cw < 100 or ch < 100:
+        return {"vertical": [], "horizontal": []}
+
+    # Binarize: dark pixels = 1, light = 0
+    _, bw = cv2.threshold(img_gray, 80, 1, cv2.THRESH_BINARY_INV)
+    content = bw[top:bot, left:right]
+
+    # ── Vertical rule lines ──────────────────────────────────────────────
+    # A real column divider is dark for a large fraction of the page height.
+    # Normal text columns are dark only ~30-50% (letters + whitespace).
+    # Rule lines are dark >60% of the height in a narrow band.
+    col_dark_frac = content.mean(axis=0)  # fraction of dark pixels per x
+
+    # Find narrow peaks (1-5px wide) where darkness is high
+    # Smooth very lightly to merge adjacent pixel lines
+    col_smooth = uniform_filter1d(col_dark_frac, size=3)
+
+    # A rule line stands out as a spike above its neighbors.
+    # Use local contrast: compare each position to a wide local average
+    col_local_avg = uniform_filter1d(col_dark_frac, size=40)
+    col_contrast = col_smooth - col_local_avg
+
+    # Rule lines: darkness > 55% AND stands out > 15% above local average
+    rule_threshold = 0.55
+    contrast_threshold = 0.12
+    v_candidates = []
+    i = 0
+    while i < len(col_dark_frac):
+        if col_smooth[i] > rule_threshold and col_contrast[i] > contrast_threshold:
+            # Found start of a rule line — find its extent
+            j = i
+            while j < len(col_dark_frac) and col_smooth[j] > rule_threshold * 0.7:
+                j += 1
+            # Rule line center (must be narrow: 1-8px)
+            width = j - i
+            if width <= 8:
+                center = left + (i + j) // 2
+                v_candidates.append(center)
+            i = j + 1
+        else:
+            i += 1
+
+    # Merge rule lines that are very close (within 5px) — probably the same line
+    vertical = []
+    for vx in v_candidates:
+        if not vertical or vx - vertical[-1] > 5:
+            vertical.append(vx)
+        else:
+            # Average with the previous detection
+            vertical[-1] = (vertical[-1] + vx) // 2
+
+    tprint(f"      rule lines: {len(vertical)} vertical at x={vertical}", level=4)
+
+    # ── Horizontal rule lines ────────────────────────────────────────────
+    # Same approach but row-wise. Horizontal rules span most of the width.
+    row_dark_frac = content.mean(axis=1)
+    row_smooth = uniform_filter1d(row_dark_frac, size=3)
+    row_local_avg = uniform_filter1d(row_dark_frac, size=40)
+    row_contrast = row_smooth - row_local_avg
+
+    h_candidates = []
+    i = 0
+    while i < len(row_dark_frac):
+        if row_smooth[i] > rule_threshold and row_contrast[i] > contrast_threshold:
+            j = i
+            while j < len(row_dark_frac) and row_smooth[j] > rule_threshold * 0.7:
+                j += 1
+            width = j - i
+            if width <= 8:
+                center = top + (i + j) // 2
+                h_candidates.append(center)
+            i = j + 1
+        else:
+            i += 1
+
+    horizontal = []
+    for hy in h_candidates:
+        if not horizontal or hy - horizontal[-1] > 5:
+            horizontal.append(hy)
+        else:
+            horizontal[-1] = (horizontal[-1] + hy) // 2
+
+    tprint(f"      rule lines: {len(horizontal)} horizontal at y={horizontal}", level=4)
+
+    return {"vertical": vertical, "horizontal": horizontal}
+
+
+def _detect_gutters_unconstrained(img_gray, content_bounds,
+                                  rule_lines: dict = None) -> list:
+    """
+    Find column gutters. Primary signal: vertical rule lines detected by
+    _detect_rule_lines(). Fallback: cross-zone ink density projection.
+
     Returns list of gutter x-coordinates (in page coords).
     """
     if not HAS_CV2:
@@ -404,85 +509,204 @@ def _detect_gutters_unconstrained(img_gray, content_bounds) -> list:
     if cw < 200 or ch < 200:
         return []
 
-    # Use bottom 30% to avoid masthead spanning text
-    zt = top + ch * 7 // 10
-    zb = top + ch * 95 // 100
-    region   = img_gray[zt:zb, left:right]
-    dark     = (region < 128).sum(axis=0).astype(float)
-    smoothed = uniform_filter1d(dark, size=12)
+    # ── Primary: use rule lines if available ──────────────────────────────
+    # Vertical rule lines are the most reliable signal — they're the actual
+    # printed column borders, not inferred from text density.
+    if rule_lines and rule_lines.get("vertical"):
+        v_rules = rule_lines["vertical"]
+        # Filter to lines within content area, away from edges
+        edge_margin = cw // 15
+        gutters = [x for x in v_rules
+                   if x > left + edge_margin and x < right - edge_margin]
+        if gutters:
+            tprint(f"      gutters from rule lines: {len(gutters)} at x={gutters}", level=3)
+            return sorted(gutters)
+        tprint(f"      rule lines found but all near edges — falling back to projection", level=4)
 
-    # Accept all valleys above a moderate prominence threshold
-    valleys, props = find_peaks(-smoothed, distance=60,
-                                prominence=smoothed.max() * 0.04)
-    if len(valleys) == 0:
+    # ── Fallback: cross-zone ink density projection ──────────────────────
+    # Minimum column width: real newspaper columns are at least 100px wide
+    # at typical scan resolutions (1200-1500px wide page).
+    min_col_width = max(80, cw // 20)
+
+    def _find_valleys(region):
+        """Find vertical gaps (valleys in ink density) in a horizontal region."""
+        dark     = (region < 128).sum(axis=0).astype(float)
+        smoothed = uniform_filter1d(dark, size=15)
+        if smoothed.max() < 10:
+            return []
+        # Require strong valleys: prominence at least 15% of max density,
+        # and gutters at least min_col_width apart.
+        valleys, props = find_peaks(-smoothed, distance=min_col_width,
+                                    prominence=smoothed.max() * 0.15)
+        return list(valleys)
+
+    # Scan two independent vertical zones and require agreement.
+    # Zone A: middle third (40%-65%) — avoids both masthead and footer
+    za_top = top + ch * 40 // 100
+    za_bot = top + ch * 65 // 100
+    # Zone B: bottom quarter (70%-90%)
+    zb_top = top + ch * 70 // 100
+    zb_bot = top + ch * 90 // 100
+
+    valleys_a = _find_valleys(img_gray[za_top:za_bot, left:right])
+    valleys_b = _find_valleys(img_gray[zb_top:zb_bot, left:right])
+
+    tprint(f"      gutter scan: zone A({za_top}-{za_bot}) found {len(valleys_a)}, "
+           f"zone B({zb_top}-{zb_bot}) found {len(valleys_b)}", level=4)
+
+    if not valleys_a and not valleys_b:
         return []
 
-    gutter_xs = sorted(int(v) + left for v in valleys)
-    return gutter_xs
+    # A gutter is confirmed only if both zones agree (within tolerance).
+    # This eliminates false positives from ads, illustrations, or headlines
+    # that create vertical gaps in only one part of the page.
+    snap_tol = max(15, cw // 100)  # ~1% of page width
+    confirmed = []
+
+    # Use the zone with more detections as anchor, match against the other
+    if len(valleys_a) >= len(valleys_b):
+        anchor, check = valleys_a, valleys_b
+    else:
+        anchor, check = valleys_b, valleys_a
+
+    for va in anchor:
+        for vb in check:
+            if abs(va - vb) < snap_tol:
+                # Average the two detections for better accuracy
+                confirmed.append(int((va + vb) / 2) + left)
+                break
+        else:
+            # No match in the other zone — include only if prominently detected
+            # (single-zone gutters are often false positives)
+            pass
+
+    # If cross-zone matching eliminated everything, fall back to the
+    # zone with stronger signal but require very high prominence
+    if not confirmed and (valleys_a or valleys_b):
+        best_zone = valleys_a if len(valleys_a) > len(valleys_b) else valleys_b
+        tprint(f"      ⚠ no cross-zone agreement, using single zone ({len(best_zone)} valleys)", level=4)
+        confirmed = [int(v) + left for v in best_zone]
+
+    # Remove gutters that are too close to the edges (probably border artifacts)
+    edge_margin = cw // 15
+    confirmed = [g for g in confirmed
+                 if g > left + edge_margin and g < right - edge_margin]
+
+    tprint(f"      confirmed gutters: {len(confirmed)} at x={confirmed}", level=4)
+    return sorted(confirmed)
 
 
 def _detect_masthead_zone(img_gray, content_bounds, gutter_xs) -> tuple | None:
     """
     Detect a masthead/header zone at the top of the page.
-    The masthead is a region at the top that spans more columns than the body.
+
+    Strategy: compare the gutter pattern in the top portion vs the body.
+    The masthead spans the full width (no gutters or different gutters),
+    while the body has the regular column structure. The transition
+    between them is the masthead boundary.
+
+    Also detects the masthead via horizontal rule lines (thick dark
+    horizontal stripes that newspapers use to separate the title block).
+
     Returns (left, top, right, masthead_bottom) or None if no masthead detected.
     """
-    if not HAS_CV2 or not gutter_xs:
+    if not HAS_CV2:
         return None
     left, top, right, bot = content_bounds
+    cw = right - left
     ch = bot - top
-
-    # Scan top 25% of the page for horizontal bands with high ink density
-    # that span multiple columns (i.e. cross at least one gutter)
-    scan_bottom = top + ch // 4
-    region = img_gray[top:scan_bottom, left:right]
-    if region.size == 0:
+    if ch < 200:
         return None
 
-    # Row-wise ink density: how much dark content per row
-    row_dark = (region < 128).mean(axis=1)
+    # Method 1: Look for a horizontal rule line in the top 30% of the page.
+    # Newspaper mastheads are typically separated by a thick horizontal line.
+    scan_h = min(ch // 3, 700)
+    top_region = img_gray[top:top + scan_h, left:right]
 
-    # Find where ink density drops (transition from masthead to columns)
-    # The masthead typically has thick title text, then drops to thinner column text
-    if len(row_dark) < 20:
-        return None
+    # Row-wise mean darkness: a rule line is a row (or band of rows) that
+    # is much darker than the rows above and below it
+    row_means = np.mean(top_region, axis=1)
+    # Invert: lower mean = darker row = more ink
+    row_ink = 255 - row_means
 
-    # Smooth and find the first significant drop
-    row_smooth = uniform_filter1d(row_dark, size=15)
-    # Look for the row where density drops to < 40% of the peak
-    peak_density = row_smooth[:len(row_smooth)//2].max()
+    # Smooth to find bands, not individual pixel rows
+    row_smooth = uniform_filter1d(row_ink, size=5)
+
+    # Find peaks in ink density (horizontal dark bands)
+    if row_smooth.max() > 30:
+        peaks, props = find_peaks(row_smooth, height=row_smooth.max() * 0.4,
+                                  prominence=20, distance=20)
+        # The masthead boundary is the first strong horizontal rule
+        # that spans most of the page width
+        for pk in peaks:
+            y = top + int(pk)
+            # Verify this row is dark across most of the page width
+            row_slice = img_gray[y, left:right]
+            dark_frac = (row_slice < 128).mean()
+            if dark_frac > 0.3:  # at least 30% of the row is dark
+                tprint(f"      masthead: rule line at y={y} "
+                       f"(dark fraction={dark_frac:.2f})", level=4)
+                # Masthead ends just below this rule line
+                mast_end = y + 5
+                if mast_end - top >= 30:
+                    return (left, top, right, mast_end)
+
+    # Method 2: Ink density profile — find where dense title text
+    # transitions to sparser column text
+    row_dark_frac = (top_region < 128).mean(axis=1)
+    row_dark_smooth = uniform_filter1d(row_dark_frac, size=15)
+
+    peak_density = row_dark_smooth[:scan_h // 2].max() if scan_h > 0 else 0
     if peak_density < 0.05:
-        return None  # no significant ink in top quarter
+        return None
 
-    threshold = peak_density * 0.3
+    # Find transition: density drops to < 25% of peak and stays low
+    threshold = peak_density * 0.25
     mast_end = top
-    for i in range(20, len(row_smooth)):
-        if row_smooth[i] < threshold and all(row_smooth[i:i+10] < threshold):
+    for i in range(30, len(row_dark_smooth)):
+        window = row_dark_smooth[i:i+15]
+        if len(window) >= 10 and all(w < threshold for w in window):
             mast_end = top + i
             break
 
-    # Masthead must be at least 30px tall and less than 25% of the page
     if mast_end - top < 30:
         return None
-    if mast_end - top > ch // 4:
-        mast_end = top + ch // 4
+    if mast_end - top > ch // 3:
+        mast_end = top + ch // 3
 
     return (left, top, right, mast_end)
 
 
 def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
     """
-    Analyze a single page's layout: content bounds, gutters, masthead, zones.
+    Analyze a single page's layout: rule lines, gutters, masthead, zones.
     Returns a layout dict with all detected geometry.
     """
     left, top, right, bot = content_bounds
 
-    # Detect gutters without column count constraint
-    gutter_xs = _detect_gutters_unconstrained(img_gray, content_bounds)
+    # Step 1: Detect printed rule lines (the most reliable geometric signal)
+    rule_lines = _detect_rule_lines(img_gray, content_bounds)
+
+    # Step 2: Detect gutters using rule lines first, projection as fallback
+    gutter_xs = _detect_gutters_unconstrained(img_gray, content_bounds,
+                                              rule_lines=rule_lines)
     n_cols = len(gutter_xs) + 1
 
-    # Detect masthead zone
-    masthead = _detect_masthead_zone(img_gray, content_bounds, gutter_xs)
+    # Step 3: Detect masthead using horizontal rules first, then density
+    masthead = None
+    # If horizontal rule lines exist in the top 25%, the first one is likely
+    # the bottom of the masthead
+    h_rules = rule_lines.get("horizontal", [])
+    top_quarter = top + (bot - top) // 4
+    header_rules = [y for y in h_rules if y < top_quarter and y - top > 30]
+    if header_rules:
+        mast_y = header_rules[0]  # first horizontal rule = masthead bottom
+        masthead = (left, top, right, mast_y)
+        tprint(f"      masthead from rule line: y={mast_y} "
+               f"({mast_y - top}px tall)", level=3)
+    else:
+        # Fall back to ink density analysis
+        masthead = _detect_masthead_zone(img_gray, content_bounds, gutter_xs)
 
     # Build column zones (below masthead if present)
     body_top = masthead[3] if masthead else top
@@ -497,7 +721,7 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
                 "bbox": (x1, body_top, x2, bot),
             })
 
-    # Assemble zones
+    # Assemble all zones
     zones = []
     if masthead:
         zones.append({
@@ -509,6 +733,7 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
     return {
         "page_num": page_num,
         "content_bounds": content_bounds,
+        "rule_lines": rule_lines,
         "gutter_xs": gutter_xs,
         "n_cols": n_cols,
         "masthead": masthead,
@@ -551,14 +776,30 @@ def render_layout_overlay(img_gray, layout: dict, page_num: int) -> bytes:
         cv2.putText(overlay, label, (x1 + 4, y1 + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    # Page number
+    # Page number and column count
     cv2.putText(overlay, f"Page {page_num}  ({layout['n_cols']} cols)",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    # Draw gutter lines through full height
+    l, t, r, b = layout["content_bounds"]
+    rule_lines = layout.get("rule_lines", {})
+
+    # Draw detected rule lines (cyan, dashed appearance via thickness)
+    for vx in rule_lines.get("vertical", []):
+        cv2.line(overlay, (vx, t), (vx, b), (255, 255, 0), 1)  # cyan
+    for hy in rule_lines.get("horizontal", []):
+        cv2.line(overlay, (l, hy), (r, hy), (255, 255, 0), 1)  # cyan
+
+    # Draw gutters (thicker yellow-green, these are the confirmed column dividers)
     for gx in layout["gutter_xs"]:
-        cv2.line(overlay, (gx, layout["content_bounds"][1]),
-                 (gx, layout["content_bounds"][3]), (0, 255, 255), 1)
+        cv2.line(overlay, (gx, t), (gx, b), (0, 255, 255), 2)
+
+    # Legend
+    legend_y = b + 15 if b + 30 < img_gray.shape[0] else t - 15
+    v_count = len(rule_lines.get("vertical", []))
+    h_count = len(rule_lines.get("horizontal", []))
+    cv2.putText(overlay,
+                f"Rule lines: {v_count}V + {h_count}H | Gutters: {len(layout['gutter_xs'])}",
+                (10, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     _, png = cv2.imencode(".png", overlay)
     return png.tobytes()
@@ -634,6 +875,93 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
                worker=worker_id, level=1)
 
     return expected_cols, page_layouts
+
+
+def save_calibration(collection_dir: Path, ark_id: str,
+                     expected_cols: int, page_layouts: dict):
+    """
+    Save auto-detected layout as calibration.json for user review/correction.
+    The user can edit this file manually or use the GUI tool to adjust.
+    """
+    cal = {
+        "version": 1,
+        "calibrated_from": ark_id,
+        "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "expected_cols": expected_cols,
+        "tuning_params": {
+            "rule_line_threshold": 0.55,
+            "rule_line_contrast": 0.12,
+            "min_column_width": 80,
+            "prominence": 0.15,
+        },
+        "page_layouts": {},
+    }
+    for pg, layout in sorted(page_layouts.items()):
+        entry = {"user_corrected": False, "n_cols": layout["n_cols"]}
+        if layout.get("masthead"):
+            entry["masthead"] = list(layout["masthead"])
+        entry["columns"] = [list(c["bbox"]) for c in layout.get("columns", [])]
+        entry["gutter_xs"] = layout.get("gutter_xs", [])
+        rules = layout.get("rule_lines", {})
+        if rules:
+            entry["rule_lines_v"] = rules.get("vertical", [])
+            entry["rule_lines_h"] = rules.get("horizontal", [])
+        cal["page_layouts"][str(pg)] = entry
+
+    cal_path = collection_dir / "calibration.json"
+    cal_path.write_text(json.dumps(cal, indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8")
+    tprint(f"  Calibration saved → {cal_path}", level=1)
+    tprint(f"  Review overlay images in artifacts/layout/{ark_id}/ and edit", level=1)
+    tprint(f"  calibration.json to correct any wrong boundaries.", level=1)
+    return cal_path
+
+
+def load_calibration(collection_dir: Path) -> dict | None:
+    """Load calibration.json if it exists. Returns None if not found."""
+    cal_path = collection_dir / "calibration.json"
+    if not cal_path.exists():
+        return None
+    try:
+        cal = json.loads(cal_path.read_text(encoding="utf-8"))
+        tprint(f"  Calibration loaded from {cal_path} "
+               f"(calibrated from {cal.get('calibrated_from', '?')})", level=1)
+        return cal
+    except Exception as e:
+        tprint(f"  ⚠ Failed to load calibration: {e}", level=1)
+        return None
+
+
+def _layout_from_calibration(cal_page: dict, page_num: int,
+                              content_bounds: tuple) -> dict:
+    """Convert a calibration.json page entry back to a page_layout dict."""
+    left, top, right, bot = content_bounds
+    masthead = tuple(cal_page["masthead"]) if cal_page.get("masthead") else None
+    body_top = masthead[3] if masthead else top
+
+    columns = []
+    for i, bbox in enumerate(cal_page.get("columns", []), 1):
+        columns.append({"type": "column", "index": i, "bbox": tuple(bbox)})
+
+    zones = []
+    if masthead:
+        zones.append({"type": "masthead", "bbox": masthead})
+    zones.extend(columns)
+
+    return {
+        "page_num": page_num,
+        "content_bounds": content_bounds,
+        "rule_lines": {
+            "vertical": cal_page.get("rule_lines_v", []),
+            "horizontal": cal_page.get("rule_lines_h", []),
+        },
+        "gutter_xs": cal_page.get("gutter_xs", []),
+        "n_cols": cal_page.get("n_cols", len(columns)),
+        "masthead": masthead,
+        "body_top": body_top,
+        "columns": columns,
+        "zones": zones,
+    }
 
 
 # ============================================================================
@@ -2224,10 +2552,33 @@ def process_issue(issue, api_key, correction_prompt, delay,
     has_abbyy = axml is not None
 
     # ── Stage 0: Layout analysis ──────────────────────────────────────────
-    # Analyze all pages to determine column structure before any OCR.
+    # Check for calibration data first; if none, run auto-detection and save.
+    collection_dir = CORRECTED_DIR.parent
+    cal = load_calibration(collection_dir)
     pages_to_analyze = [pg for pg, needs_redo in pages_to_process if needs_redo]
-    expected_cols, page_layouts = analyze_issue_layout(
-        ark_id, pages_to_analyze, worker_id=worker_id)
+
+    if cal and cal.get("page_layouts"):
+        # Use calibrated layout data
+        expected_cols = cal.get("expected_cols", 5)
+        page_layouts = {}
+        for pg in pages_to_analyze:
+            pg_str = str(pg)
+            if pg_str in cal["page_layouts"]:
+                bounds = detect_content_bounds(
+                    cv2.imdecode(
+                        np.frombuffer(fetch_page_image(ark_id, pg)[0], np.uint8),
+                        cv2.IMREAD_GRAYSCALE))
+                page_layouts[pg] = _layout_from_calibration(
+                    cal["page_layouts"][pg_str], pg, bounds)
+            # Pages not in calibration will get auto-detected in process_page_local
+        tprint(f"  Using calibration: {expected_cols} cols, "
+               f"{len(page_layouts)} page layouts loaded",
+               worker=worker_id, level=1)
+    else:
+        # Auto-detect and save calibration for user review
+        expected_cols, page_layouts = analyze_issue_layout(
+            ark_id, pages_to_analyze, worker_id=worker_id)
+        save_calibration(collection_dir, ark_id, expected_cols, page_layouts)
 
     engines = ["Tesseract" if tess_lang else None,
                "Kraken" if HAS_KRAKEN else None,
