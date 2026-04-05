@@ -1000,18 +1000,22 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
     used = set()  # indices into all_borders
 
     # Phase 1: partial borders paired with the masthead bottom.
-    # Only the masthead boundary is used as an ad-top reference — NOT
-    # arbitrary full-width section breaks in the body (which would
-    # cause normal article text between section breaks to be mislabeled
-    # as ads).  This catches ads that start immediately below the
-    # masthead (e.g., "Der Deutsche Tag!" spanning cols 4-6).
+    # Catches ads that start immediately below the masthead (e.g.,
+    # "Der Deutsche Tag!" spanning cols 4-6 on page 1).
+    #
+    # Guard: the ad must NOT start at column 1.  A partial border
+    # starting at col 1 that pairs with the masthead would cover
+    # the entire left portion of the page — that's article text,
+    # not an ad.  Real masthead-adjacent ads start at interior columns.
     if masthead:
         for i, b in enumerate(all_borders):
             if b["full_width"] or b["y"] <= body_top or b["y"] > footer_top:
                 continue
             gap = b["y"] - body_top
             n_span = b["col_end"] - b["col_start"] + 1
-            if 30 < gap < ch * 40 // 100 and n_span < n_cols:
+            if (30 < gap < ch * 40 // 100
+                    and n_span < n_cols
+                    and b["col_start"] > 1):
                 cs, ce = b["col_start"], b["col_end"]
                 x1, x2 = col_bounds[cs - 1], col_bounds[ce]
                 ad_zones.append({
@@ -1101,7 +1105,35 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
                 e["bbox"][3] <= ad["bbox"][3])]
             deduped.append(ad)
 
-    zones.extend(deduped)
+    # Merge adjacent ads: ads are typically butted against each other.
+    # If two ads in the same (or overlapping) columns are separated by
+    # a small gap (< 50px ≈ 1-10 lines of text), merge them into one.
+    # This also catches borders that were incorrectly detected within
+    # a single continuous ad.
+    merge_gap = max(50, ch * 4 // 100)
+    deduped.sort(key=lambda a: (a["col_span"], a["bbox"][1]))
+    merged_ads = []
+    for ad in deduped:
+        merged = False
+        for i, existing in enumerate(merged_ads):
+            # Same column span and small vertical gap?
+            if ad["col_span"] == existing["col_span"]:
+                eg = existing["bbox"]
+                ag = ad["bbox"]
+                gap = ag[1] - eg[3]  # top of new - bottom of existing
+                if 0 <= gap <= merge_gap:
+                    # Merge: extend existing ad downward
+                    merged_ads[i] = {
+                        "type": "ad",
+                        "bbox": (eg[0], eg[1], eg[2], ag[3]),
+                        "col_span": existing["col_span"],
+                    }
+                    merged = True
+                    break
+        if not merged:
+            merged_ads.append(ad)
+
+    zones.extend(merged_ads)
 
     # Column zones (body columns between masthead and footer)
     for ci in range(n_cols):
