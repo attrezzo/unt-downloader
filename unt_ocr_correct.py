@@ -999,38 +999,32 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
     ad_zones = []
     used = set()  # indices into all_borders
 
-    # Phase 1: partial borders paired with full-width border above
-    for i, b in enumerate(all_borders):
-        if b["full_width"] or b["y"] < body_top or b["y"] > footer_top:
-            continue
-        # Find nearest full-width border ABOVE
-        above_fw = None
-        for j in range(i - 1, -1, -1):
-            ab = all_borders[j]
-            if ab["full_width"] and ab["y"] >= top:
-                above_fw = ab
-                break
-        if above_fw is None and masthead:
-            above_fw = {"y": body_top, "full_width": True}
-        if above_fw:
-            gap = b["y"] - above_fw["y"]
-            # Only create an ad if:
-            # - spans fewer than all columns
-            # - the gap is moderate (not too large = normal column text
-            #   between section breaks; max ~35% of page height)
+    # Phase 1: partial borders paired with the masthead bottom.
+    # Only the masthead boundary is used as an ad-top reference — NOT
+    # arbitrary full-width section breaks in the body (which would
+    # cause normal article text between section breaks to be mislabeled
+    # as ads).  This catches ads that start immediately below the
+    # masthead (e.g., "Der Deutsche Tag!" spanning cols 4-6).
+    if masthead:
+        for i, b in enumerate(all_borders):
+            if b["full_width"] or b["y"] <= body_top or b["y"] > footer_top:
+                continue
+            gap = b["y"] - body_top
             n_span = b["col_end"] - b["col_start"] + 1
-            if 30 < gap < ch * 35 // 100 and n_span < n_cols:
+            if 30 < gap < ch * 40 // 100 and n_span < n_cols:
                 cs, ce = b["col_start"], b["col_end"]
-                x1 = col_bounds[cs - 1]
-                x2 = col_bounds[ce]
+                x1, x2 = col_bounds[cs - 1], col_bounds[ce]
                 ad_zones.append({
                     "type": "ad",
-                    "bbox": (x1, above_fw["y"], x2, b["y"]),
+                    "bbox": (x1, body_top, x2, b["y"]),
                     "col_span": (cs, ce),
                 })
                 used.add(i)
 
-    # Phase 2: pair remaining partial borders with overlapping col spans
+    # Phase 2: pair remaining partial borders with MATCHING col spans.
+    # Require that the top and bottom borders span the same columns
+    # (within 1 column tolerance).  This prevents section-break rules
+    # (which span varying widths) from being paired as ad boxes.
     partial_idxs = [i for i, b in enumerate(all_borders)
                     if not b["full_width"] and i not in used
                     and body_top <= b["y"] <= footer_top]
@@ -1043,10 +1037,22 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
             if j in used:
                 continue
             b_bot = all_borders[j]
+            # Require exact matching span: both borders must cover the
+            # same columns.  Section-break rules have ragged detection
+            # that spans different column counts; real ad boxes have
+            # precise, consistent top and bottom borders.
+            start_match = b_top["col_start"] == b_bot["col_start"]
+            end_match = b_top["col_end"] == b_bot["col_end"]
             span_lo = max(b_top["col_start"], b_bot["col_start"])
             span_hi = min(b_top["col_end"], b_bot["col_end"])
             gap = b_bot["y"] - b_top["y"]
-            if span_lo <= span_hi and 15 < gap < ch // 2:
+            # Also reject if there's a full-width border between the
+            # top and bottom — that indicates a section break, meaning
+            # the two partial borders bound different content regions.
+            fw_between = any(fb["y"] > b_top["y"] and fb["y"] < b_bot["y"]
+                             for fb in fw_borders)
+            if (start_match and end_match and span_lo <= span_hi
+                    and 15 < gap < ch // 2 and not fw_between):
                 x1 = col_bounds[span_lo - 1]
                 x2 = col_bounds[span_hi]
                 ad_zones.append({
@@ -1057,6 +1063,12 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
                 used.add(i)
                 used.add(j)
                 break
+
+    # Filter: minimum ad height (5% of page height).  Tiny "ads"
+    # are usually just pairs of nearby section-break rules.
+    min_ad_h = max(40, ch * 5 // 100)
+    ad_zones = [a for a in ad_zones
+                if a["bbox"][3] - a["bbox"][1] >= min_ad_h]
 
     # Deduplicate overlapping ads: when multiple ads share the same
     # starting y and column span, keep only the tightest (smallest area).
@@ -1556,19 +1568,61 @@ def preprocess_image(img_gray):
 
 
 def detect_content_bounds(img_gray):
-    """Trim dark microfilm borders. Returns (left, top, right, bottom)."""
+    """
+    Trim dark microfilm borders and torn/tattered edges.
+    Returns (left, top, right, bottom).
+
+    Uses a sustained-brightness approach: the content edge is where
+    the column/row mean brightness first stays above threshold for
+    a run of consecutive pixels (not just the first bright pixel).
+    This avoids tattered edges where brightness fluctuates before
+    the actual printed content begins.
+    """
     if not HAS_CV2:
         h, w = img_gray.shape
         return int(w*.05), int(h*.02), int(w*.97), int(h*.98)
-    h, w  = img_gray.shape
+    h, w = img_gray.shape
     _, bw = cv2.threshold(img_gray, 60, 255, cv2.THRESH_BINARY)
-    cl    = np.mean(bw, axis=0)
-    rl    = np.mean(bw, axis=1)
-    left  = int(np.argmax(cl > 120)) + 5
-    right = int(w - np.argmax((cl > 120)[::-1])) - 5
-    top   = int(np.argmax(rl > 120)) + 5
-    bot   = int(h - np.argmax((rl > 120)[::-1])) - 5
-    return max(0,left), max(0,top), min(w,right), min(h,bot)
+
+    # Use the MIDDLE 50% of the page for column brightness (avoids
+    # masthead/footer regions that can mask torn edges).
+    mid_top = h * 25 // 100
+    mid_bot = h * 75 // 100
+    cl = np.mean(bw[mid_top:mid_bot, :], axis=0)
+
+    # Use the MIDDLE 50% for row brightness (avoids left/right edge)
+    mid_left = w * 15 // 100
+    mid_right = w * 85 // 100
+    rl = np.mean(bw[:, mid_left:mid_right], axis=1)
+
+    # Find where brightness sustains above threshold for ≥8 consecutive
+    # columns/rows.  On torn edges, brightness flickers in and out;
+    # real content has sustained brightness.
+    threshold = 140
+    run_needed = 8
+
+    def _find_sustained(profile, forward=True):
+        n = len(profile)
+        rng = range(n) if forward else range(n - 1, -1, -1)
+        run = 0
+        for i in rng:
+            if profile[i] > threshold:
+                run += 1
+                if run >= run_needed:
+                    return i - (run_needed - 1) if forward else i + (run_needed - 1)
+            else:
+                run = 0
+        # Fallback: first bright pixel
+        for i in rng:
+            if profile[i] > 120:
+                return i
+        return 0 if forward else n - 1
+
+    left  = _find_sustained(cl, forward=True) + 3
+    right = _find_sustained(cl, forward=False) - 3
+    top   = _find_sustained(rl, forward=True) + 3
+    bot   = _find_sustained(rl, forward=False) - 3
+    return max(0, left), max(0, top), min(w, right), min(h, bot)
 
 
 # ============================================================================
