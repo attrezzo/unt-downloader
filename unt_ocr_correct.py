@@ -1394,54 +1394,101 @@ def _layoutparser_detect(img_gray) -> list:
         return []
     try:
         if _LP_MODEL is None:
-            # Try Detectron2 model zoo directly (Facebook CDN, reliable)
-            # then fall back to LayoutParser's Dropbox-hosted models.
+            # PubLayNet weights: Hugging Face mirror (Dropbox links are
+            # broken since late 2023).  Downloads config (~5KB) and
+            # weights (~330MB) on first run, cached locally afterward.
+            _hf_base = "https://huggingface.co/layoutparser/detectron2" \
+                       "/resolve/main/PubLayNet/faster_rcnn_R_50_FPN_3x"
+            _hf_weights = "https://huggingface.co/nlpconnect/" \
+                          "PubLayNet-faster_rcnn_R_50_FPN_3x" \
+                          "/resolve/main/model_final.pth"
+            cache_dir = os.path.join(os.path.expanduser("~"),
+                                      ".cache", "layoutparser")
+            os.makedirs(cache_dir, exist_ok=True)
+            cfg_path = os.path.join(cache_dir, "publaynet_frcnn_config.yml")
+            wts_path = os.path.join(cache_dir, "publaynet_frcnn_weights.pth")
+
             try:
-                from detectron2 import model_zoo
+                # Download config if not cached
+                if not os.path.exists(cfg_path):
+                    tprint("  Downloading PubLayNet config...", level=1)
+                    urllib.request.urlretrieve(
+                        _hf_base + "/config.yml", cfg_path)
+                # Download weights if not cached
+                if not os.path.exists(wts_path):
+                    tprint("  Downloading PubLayNet weights (~330MB)...",
+                           level=1)
+                    urllib.request.urlretrieve(_hf_weights, wts_path)
+
                 from detectron2.config import get_cfg
                 from detectron2.engine import DefaultPredictor
+                import torch
 
                 cfg = get_cfg()
-                cfg.merge_from_file(model_zoo.get_config_file(
-                    "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"))
+                cfg.merge_from_file(cfg_path)
+                cfg.MODEL.WEIGHTS = wts_path
                 cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-                cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
-                    "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
-                # Use GPU if available, CPU otherwise
-                import torch
                 cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() \
                     else "cpu"
-                _LP_MODEL = DefaultPredictor(cfg)
-                _LP_MODEL._is_detectron2_direct = True
-                tprint(f"  Detectron2 model loaded: "
-                       f"faster_rcnn_R_50_FPN_3x ({cfg.MODEL.DEVICE})",
-                       level=1)
-            except Exception as d2_err:
-                tprint(f"  Detectron2 direct: {d2_err}", level=3)
-                # Fall back to LayoutParser model zoo (Dropbox)
-                lp_configs = [
-                    ("lp://PubLayNet/mask_rcnn_R_50_FPN_3x/config",
+                # PubLayNet has 5 classes
+                cfg.MODEL.ROI_HEADS.NUM_CLASSES = 5
+
+                predictor = DefaultPredictor(cfg)
+                # Wrap in a compat object with .detect() method
+                _LP_LABEL_MAP = {0: "Text", 1: "Title", 2: "List",
+                                 3: "Table", 4: "Figure"}
+
+                class _PubLayNetPredictor:
+                    """Thin wrapper giving DefaultPredictor a .detect() API."""
+                    def __init__(self, pred, label_map):
+                        self._pred = pred
+                        self._labels = label_map
+                    def detect(self, img):
+                        outputs = self._pred(img)
+                        inst = outputs["instances"].to("cpu")
+                        blocks = []
+                        for i in range(len(inst)):
+                            box = inst.pred_boxes[i].tensor[0].numpy()
+                            score = float(inst.scores[i])
+                            cls = int(inst.pred_classes[i])
+                            label = self._labels.get(cls, f"cls_{cls}")
+
+                            class _Block:
+                                pass
+                            b = _Block()
+                            b.coordinates = tuple(map(int, box))
+                            b.type = label
+                            b.score = score
+                            blocks.append(b)
+                        return blocks
+
+                _LP_MODEL = _PubLayNetPredictor(predictor, _LP_LABEL_MAP)
+                tprint(f"  PubLayNet model loaded (Faster R-CNN, "
+                       f"{cfg.MODEL.DEVICE})", level=1)
+            except Exception as e:
+                tprint(f"  PubLayNet load failed: {e}", level=2)
+                # Fall back to LayoutParser Dropbox models (may also fail)
+                for config, label_map in [
+                    ("lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config",
                      {0: "Text", 1: "Title", 2: "List",
                       3: "Table", 4: "Figure"}),
-                ]
-                for config, label_map in lp_configs:
+                ]:
                     try:
                         _LP_MODEL = lp.Detectron2LayoutModel(
                             config_path=config,
                             label_map=label_map,
                             extra_config=[
                                 "MODEL.ROI_HEADS.SCORE_THRESH_TEST",
-                                0.5],
-                        )
-                        tprint(f"  LayoutParser model loaded: {config}",
+                                0.5])
+                        tprint(f"  LayoutParser model: {config}",
                                level=1)
                         break
-                    except Exception as lp_err:
-                        tprint(f"  LayoutParser {config}: {lp_err}",
-                               level=3)
+                    except Exception:
                         continue
             if _LP_MODEL is None:
-                tprint("  ⚠ LayoutParser: no model could be loaded", level=1)
+                tprint("  ⚠ LayoutParser: no document-layout model loaded "
+                       "(Dropbox model links may be broken — using "
+                       "geometric detection only)", level=1)
                 return []
 
         # Convert grayscale to RGB (models expect color)
@@ -1451,35 +1498,14 @@ def _layoutparser_detect(img_gray) -> list:
             img_rgb = img_gray
 
         results = []
-
-        if getattr(_LP_MODEL, '_is_detectron2_direct', False):
-            # Detectron2 DefaultPredictor: returns instances
-            outputs = _LP_MODEL(img_rgb)
-            instances = outputs["instances"].to("cpu")
-            # COCO class names (we care about general region boxes)
-            for i in range(len(instances)):
-                box = instances.pred_boxes[i].tensor[0].numpy()
-                x1, y1, x2, y2 = map(int, box)
-                score = float(instances.scores[i])
-                cls_id = int(instances.pred_classes[i])
-                # Map COCO classes to layout labels
-                # Key classes: 0=person (skip), 73=book, 84=book (skip most)
-                # For document layout, treat all detections as generic regions
-                results.append({
-                    "bbox": (x1, y1, x2, y2),
-                    "label": f"region_{cls_id}",
-                    "score": score,
-                })
-        else:
-            # LayoutParser Detectron2LayoutModel: has .detect()
-            layout = _LP_MODEL.detect(img_rgb)
-            for block in layout:
-                x1, y1, x2, y2 = map(int, block.coordinates)
-                results.append({
-                    "bbox": (x1, y1, x2, y2),
-                    "label": block.type,
-                    "score": float(block.score),
-                })
+        layout = _LP_MODEL.detect(img_rgb)
+        for block in layout:
+            x1, y1, x2, y2 = map(int, block.coordinates)
+            results.append({
+                "bbox": (x1, y1, x2, y2),
+                "label": block.type,
+                "score": float(block.score),
+            })
 
         tprint(f"      LayoutParser: {len(results)} regions detected",
                level=3)
