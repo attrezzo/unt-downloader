@@ -1539,6 +1539,34 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
         tprint(f"  │  deskew: {skew_deg:+.2f}° (within tolerance, no rotation)",
                worker=worker_id, level=3)
 
+    # ── Cross-page median content bounds ────────────────────────────────
+    # All pages of the same issue are the same physical size on the same
+    # microfilm.  Tattered/torn edges on individual pages produce outlier
+    # content bounds.  Using the median across pages corrects these.
+    if len(page_images) >= 3:
+        all_bounds = [b for _, b in page_images.values()]
+        med_left = int(np.median([b[0] for b in all_bounds]))
+        med_top  = int(np.median([b[1] for b in all_bounds]))
+        med_right = int(np.median([b[2] for b in all_bounds]))
+        med_bot  = int(np.median([b[3] for b in all_bounds]))
+        for pg in page_images:
+            img_gray, old_bounds = page_images[pg]
+            h, w = img_gray.shape
+            # Use median, but don't expand beyond the per-page detection
+            # (a page with a genuinely smaller image shouldn't be stretched)
+            new_bounds = (
+                max(med_left, old_bounds[0]),
+                max(med_top,  old_bounds[1]),
+                min(med_right, old_bounds[2]),
+                min(med_bot,  old_bounds[3]),
+            )
+            if new_bounds != old_bounds:
+                tprint(f"  │  p{pg:02d} bounds adjusted: "
+                       f"left {old_bounds[0]}→{new_bounds[0]}  "
+                       f"right {old_bounds[2]}→{new_bounds[2]}",
+                       worker=worker_id, level=4)
+            page_images[pg] = (img_gray, new_bounds)
+
     # ── Pass 1: score column-count hypotheses ────────────────────────────
     cross_scores = {}  # N → list of (total_contrast, min_contrast) per page
 
@@ -1574,33 +1602,27 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
            worker=worker_id, level=1)
 
     # ── Pass 2: compute per-page gutters and take cross-page median ────
-    # Column widths are mechanically consistent across pages.  Individual
-    # pages may have ads or mastheads that disrupt the gutter signal.
-    # Computing the median gutter position (as fraction of content width)
-    # across all pages eliminates per-page noise.
-    per_page_rel_gutters = []  # list of [frac_1, ..., frac_N-1] per page
-    per_page_raw = {}          # pg → raw gutter_xs before refinement
+    # Column gutters are at fixed ABSOLUTE positions on every page of an
+    # issue (mechanically typeset).  Using absolute median positions
+    # (not relative fractions) ensures that tattered/torn edges on
+    # individual pages don't shift the column grid.
+    per_page_gutters = []  # list of [x1, ..., xN-1] per page
     for pg in pages_to_analyze:
         if pg not in page_images:
             continue
         img_gray, bounds = page_images[pg]
-        left, _, right, _ = bounds
-        cw = right - left
         gutter_xs = _detect_gutters_equidistant(
             img_gray, bounds, expected_cols)
-        per_page_raw[pg] = gutter_xs
-        per_page_rel_gutters.append(
-            [(gx - left) / cw for gx in gutter_xs])
+        per_page_gutters.append(gutter_xs)
 
-    # Median relative positions across pages
-    if per_page_rel_gutters:
-        median_rel = []
+    # Median ABSOLUTE gutter positions across pages
+    median_gutters = []
+    if per_page_gutters:
         for gi in range(expected_cols - 1):
-            vals = [rel[gi] for rel in per_page_rel_gutters
-                    if gi < len(rel)]
-            median_rel.append(float(np.median(vals)))
-        tprint(f"  │  median gutter fractions: "
-               f"{[f'{r:.3f}' for r in median_rel]}",
+            vals = [pg_g[gi] for pg_g in per_page_gutters
+                    if gi < len(pg_g)]
+            median_gutters.append(int(np.median(vals)))
+        tprint(f"  │  median gutters (absolute): {median_gutters}",
                worker=worker_id, level=3)
 
     # ── Pass 3: finalize layouts using median gutter positions ───────────
@@ -1609,11 +1631,6 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
         if pg not in page_images:
             continue
         img_gray, bounds = page_images[pg]
-        left, _, right, _ = bounds
-        cw = right - left
-
-        # Apply median gutter positions (converted back to page coords)
-        median_gutters = [int(left + r * cw) for r in median_rel]
 
         layout = analyze_page_layout(img_gray, pg, bounds,
                                      n_cols=expected_cols,
