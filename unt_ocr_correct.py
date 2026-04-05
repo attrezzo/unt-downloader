@@ -1472,32 +1472,19 @@ def _merge_lp_zones(zones: list, lp_regions: list,
     """
     Merge LayoutParser / Detectron2 detections into geometric zones.
 
-    PHILOSOPHY: geometric detection (gutters, h_borders) provides
-    structural hints — column grid, rule lines.  The trained model
-    is the PRIMARY authority when available.  LP bbox predictions
-    OVERRIDE geometric boundaries because the model has learned what
-    real content regions look like, while geometry can be fooled by
-    artifacts, tattered edges, and noisy scans.
+    PHILOSOPHY: LP tells us WHAT things are (ads, headlines, figures).
+    Geometry tells us WHERE the precise boundaries are (column edges,
+    mastheads, footers).  LP is trained on scientific papers and gets
+    newspaper structural boundaries wrong — it should NOT clip columns
+    or modify content bounds.
 
-    How each LP label affects the layout:
-
-      Table  — PubLayNet sees newspaper column grids as "tables."
-               The Table bbox defines where actual printed content is.
-               ALL column zones are clipped to fit within it.
-               This is the highest-impact correction: it trims columns
-               that extend into artifact/tattered areas.
-
-      Text   — Confirms body content.  If LP Text extends BEYOND the
-               geometric columns, the columns are EXPANDED to include
-               the LP-detected content (LP found text that geometry missed).
-
-      Title/Headline — Added as headline zones.
-
-      List   — Treated like Text (classified/notice sections).
-
-      Figure/Photograph/Illustration — Added as figure zones.
-
-      Advertisement — Added as ad zones.
+    LP contributions (ADD zones only, never modify existing ones):
+      Advertisement — snapped to geometric column edges
+      Title/Headline — added as headline zones
+      Figure/Photograph/Illustration — added as figure zones
+      Table — ignored (PubLayNet sees columns as "tables" but its
+              bbox clips content short, missing footer areas)
+      Text/List — ignored (confirmation only, no structural change)
     """
     if not lp_regions:
         return zones
@@ -1517,45 +1504,11 @@ def _merge_lp_zones(zones: list, lp_regions: list,
         if score < 0.4:
             continue
 
-        if label in ("Table",):
-            # Table = the column grid.  LP's bbox is the authoritative
-            # content boundary.  Clip ALL column zones to fit within it.
-            if score >= 0.6:
-                for i, z in enumerate(new_zones):
-                    if z["type"] != "column":
-                        continue
-                    zx1, zy1, zx2, zy2 = z["bbox"]
-                    # Clip column vertically to Table bbox
-                    new_top = max(zy1, ly1)
-                    new_bot = min(zy2, ly2)
-                    if new_top < new_bot:
-                        new_zones[i] = dict(z)
-                        new_zones[i]["bbox"] = (zx1, new_top, zx2, new_bot)
-                # Also clip masthead: if Table starts below masthead
-                # bottom, masthead is confirmed.  If Table starts above
-                # masthead, masthead may be wrong — but we keep it.
-                tprint(f"      LP Table (score={score:.2f}): columns "
-                       f"clipped to y={ly1}→{ly2}", level=4)
-
-        elif label in ("Text", "List"):
-            # LP found text/list content.  If it extends beyond any
-            # column zone, EXPAND that column to include the LP content
-            # (LP detected real text that geometry missed).
-            if score >= 0.5:
-                for i, z in enumerate(new_zones):
-                    if z["type"] != "column":
-                        continue
-                    zx1, zy1, zx2, zy2 = z["bbox"]
-                    # Check horizontal overlap (same column?)
-                    if lx1 < zx2 and lx2 > zx1:
-                        # Expand vertically if LP extends beyond
-                        expanded = False
-                        new_y1 = min(zy1, ly1) if ly1 < zy1 else zy1
-                        new_y2 = max(zy2, ly2) if ly2 > zy2 else zy2
-                        if new_y1 != zy1 or new_y2 != zy2:
-                            new_zones[i] = dict(z)
-                            new_zones[i]["bbox"] = (zx1, new_y1,
-                                                     zx2, new_y2)
+        if label in ("Table", "Text", "List"):
+            # Table/Text/List: structural regions that geometry already
+            # handles well.  Don't modify column boundaries — LP's
+            # bbox for these often clips content short on newspapers.
+            pass
 
         elif label in ("Title", "Headline"):
             if score >= 0.5 and (ly2 - ly1) > 15:
@@ -1710,48 +1663,23 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
                        worker=worker_id, level=4)
             page_images[pg] = (img_gray, new_bounds)
 
-    # ── LP pre-scan: run LayoutParser on a few pages to find the
-    #    content grid (Table detection) BEFORE geometric scoring.
-    #    LP's Table bbox tells us where columns actually are, which
-    #    constrains the geometric gutter search.
-    lp_content_bounds = None  # (left, top, right, bot) from LP Table
-    lp_page_regions = {}      # pg → list of LP detections
+    # ── LP pre-scan: run LayoutParser on a few pages to cache results.
+    # LP tells us WHAT things are (ads, headlines, figures) but NOT where
+    # structural boundaries are.  Geometry handles content bounds, column
+    # edges, mastheads, and footers.  LP should not constrain/clip the
+    # content area — it's trained on scientific papers and gets newspaper
+    # page extents wrong (e.g., "Table" detection misses the footer area,
+    # clipping columns short).
+    lp_page_regions = {}  # pg → list of LP detections
     if HAS_LAYOUTPARSER:
         for pg in list(page_images)[:min(3, len(page_images))]:
             img_gray, bounds = page_images[pg]
             regions = _layoutparser_detect(img_gray)
             lp_page_regions[pg] = regions
-            for r in regions:
-                if r["label"] == "Table" and r["score"] >= 0.6:
-                    tb = r["bbox"]
-                    if lp_content_bounds is None:
-                        lp_content_bounds = tb
-                    else:
-                        # Union of all Table detections
-                        lp_content_bounds = (
-                            min(lp_content_bounds[0], tb[0]),
-                            min(lp_content_bounds[1], tb[1]),
-                            max(lp_content_bounds[2], tb[2]),
-                            max(lp_content_bounds[3], tb[3]),
-                        )
-        if lp_content_bounds:
-            tprint(f"  │  LP content grid: ({lp_content_bounds[0]},"
-                   f"{lp_content_bounds[1]})→({lp_content_bounds[2]},"
-                   f"{lp_content_bounds[3]})", worker=worker_id, level=3)
-            # Refine page bounds: LP's Table bbox is the authoritative
-            # content area.  Use it to constrain gutter scoring.
-            for pg in page_images:
-                img_gray, old_bounds = page_images[pg]
-                h, w = img_gray.shape
-                # LP constrains top/bottom but geometry constrains
-                # left/right (LP Table often spans full width)
-                new_bounds = (
-                    old_bounds[0],  # keep geometric left
-                    max(old_bounds[1], lp_content_bounds[1]),
-                    old_bounds[2],  # keep geometric right
-                    min(old_bounds[3], lp_content_bounds[3]),
-                )
-                page_images[pg] = (img_gray, new_bounds)
+            if regions:
+                tprint(f"  │  LP p{pg:02d}: {len(regions)} regions "
+                       f"({', '.join(r['label'] for r in regions)})",
+                       worker=worker_id, level=3)
 
     # ── Pass 1: score column-count hypotheses ────────────────────────────
     cross_scores = {}  # N → list of (total_contrast, min_contrast) per page
