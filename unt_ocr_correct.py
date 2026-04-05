@@ -493,54 +493,83 @@ def _detect_rule_lines(img_gray, content_bounds) -> dict:
     return {"vertical": vertical, "horizontal": horizontal}
 
 
-def _composite_brightness(img_gray, content_bounds):
+def _gutter_profile(img_gray, content_bounds):
     """
-    Build a composite column-wise brightness profile by averaging 5 narrow
-    horizontal bands across the page body.  Gutters appear as peaks (bright
-    vertical whitespace strips) in this profile.
+    Build a composite gutter-detection profile that captures the printed
+    newspaper column-border pattern: whitespace | dark rule line | whitespace.
 
-    Returns (smoothed_profile, left, cw) where profile is in LOCAL coords
-    (index 0 = left edge of content area).
+    Combines two signals via geometric mean:
+      1. Darkness contrast: how much darker is each x-column vs its ±15px
+         local background?  Rule lines spike high.
+      2. Flanking brightness: are the columns ±3-6px away brighter than
+         this one?  True gutter rule lines have whitespace on both sides;
+         text columns do not.
+
+    Returns (gutter_score, brightness) in LOCAL coords (0 = content left).
     """
     left, top, right, bot = content_bounds
     cw, ch = right - left, bot - top
-    zone_specs = [(20, 30), (33, 43), (47, 57), (62, 72), (78, 88)]
+
+    # Average brightness across 4 vertical zones (20-80% of page body)
+    zone_specs = [(20, 35), (35, 50), (50, 65), (65, 80)]
     profiles = []
     for pct_s, pct_e in zone_specs:
         zt = top + ch * pct_s // 100
         zb = top + ch * pct_e // 100
-        profiles.append(img_gray[zt:zb, left:right].mean(axis=0).astype(float))
+        profiles.append(
+            img_gray[zt:zb, left:right].mean(axis=0).astype(float))
     composite = np.mean(profiles, axis=0)
-    return uniform_filter1d(composite, size=7), left, cw
+    n = len(composite)
+
+    # Signal 1: local darkness contrast (rule line darker than neighbors)
+    local_bg = uniform_filter1d(composite, size=30)
+    darkness_dip = uniform_filter1d(local_bg - composite, size=3)
+
+    # Signal 2: flanking brightness (whitespace on both sides)
+    flank_score = np.zeros(n)
+    for x in range(5, n - 5):
+        left_flank  = composite[x - 5 : x - 1].mean()
+        right_flank = composite[x + 2 : x + 6].mean()
+        flank_score[x] = min(left_flank, right_flank) - composite[x]
+
+    # Normalize each to [0, 1] and combine via geometric mean
+    d_max = darkness_dip.max()
+    f_max = flank_score.max()
+    d_norm = np.clip(darkness_dip / d_max, 0, 1) if d_max > 0 else np.zeros(n)
+    f_norm = np.clip(flank_score / f_max, 0, 1) if f_max > 0 else np.zeros(n)
+    gutter_score = np.sqrt(d_norm * f_norm)
+
+    return gutter_score, composite
 
 
-def _score_equidistant(composite, cw, N):
+def _score_equidistant(gutter_score, cw, N):
     """
     Score an N-column hypothesis by placing N-1 equidistant gutters and
-    measuring how much brighter each gutter position is than the column
-    centers on either side (contrast).
+    measuring how strong the gutter-pattern signal is at each position
+    relative to the column centers on either side.
 
     Returns (total_contrast, min_contrast, snapped_local_xs) where xs are
     in LOCAL coordinates (0 = left edge of content).
     """
     spacing = cw / N
-    window = max(8, int(spacing * 0.15))   # search ±15% of column width
-    half_col = int(spacing * 0.35)          # sample 35% into column
+    window = max(8, int(spacing * 0.15))    # search ±15% of column width
+    half_col = int(spacing * 0.40)           # sample 40% into column
 
     contrasts = []
     snapped = []
     for k in range(1, N):
         gx = int(spacing * k)
         lo = max(0, gx - window)
-        hi = min(len(composite), gx + window + 1)
-        snap_x = lo + int(np.argmax(composite[lo:hi]))
-        gutter_b = float(composite[snap_x])
+        hi = min(len(gutter_score), gx + window + 1)
+        snap_x = lo + int(np.argmax(gutter_score[lo:hi]))
+        peak_val = float(gutter_score[snap_x])
         snapped.append(snap_x)
 
-        left_c = max(0, snap_x - half_col)
-        right_c = min(len(composite) - 1, snap_x + half_col)
-        col_b = min(float(composite[left_c]), float(composite[right_c]))
-        contrasts.append(gutter_b - col_b)
+        # Background: gutter score at column centers on either side
+        left_c  = max(0, snap_x - half_col)
+        right_c = min(len(gutter_score) - 1, snap_x + half_col)
+        bg = max(float(gutter_score[left_c]), float(gutter_score[right_c]))
+        contrasts.append(peak_val - bg)
 
     return sum(contrasts), min(contrasts), snapped
 
@@ -549,13 +578,14 @@ def _detect_gutters_equidistant(img_gray, content_bounds, n_cols,
                                 rule_lines: dict = None) -> list:
     """
     Place gutters for a known N-column layout.  Primary signal: vertical
-    rule lines.  Fallback: equidistant placement snapped to brightness peaks
-    in the composite profile.
+    rule lines from `_detect_rule_lines()`.  Fallback: equidistant placement
+    snapped to peaks in the gutter-pattern profile (whitespace-rule-whitespace).
 
     Args:
         n_cols: number of columns (determined by cross-page consensus)
 
-    Returns list of gutter x-coordinates (in page coords).
+    Returns list of gutter x-coordinates (in page coords, at the rule line
+    center — the dark line between whitespace strips).
     """
     if not HAS_CV2:
         return []
@@ -576,12 +606,11 @@ def _detect_gutters_equidistant(img_gray, content_bounds, n_cols,
                    f"x={gutters}", level=3)
             return sorted(gutters)
         tprint(f"      rule lines: {len(gutters)} found but need "
-               f"{n_cols - 1} — using brightness profile", level=4)
+               f"{n_cols - 1} — using gutter profile", level=4)
 
-    # ── Equidistant placement snapped to brightness peaks ────────────────
-    composite, comp_left, comp_cw = _composite_brightness(
-        img_gray, content_bounds)
-    _, _, snapped_local = _score_equidistant(composite, cw, n_cols)
+    # ── Equidistant placement snapped to gutter-pattern peaks ────────────
+    gscore, _ = _gutter_profile(img_gray, content_bounds)
+    _, _, snapped_local = _score_equidistant(gscore, cw, n_cols)
     gutters = sorted(x + left for x in snapped_local)
 
     tprint(f"      equidistant ({n_cols} cols): gutters at x={gutters}",
@@ -692,12 +721,13 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
         gutter_xs = _detect_gutters_equidistant(
             img_gray, content_bounds, n_cols, rule_lines=rule_lines)
     else:
-        # Unconstrained: scoring pass — use composite brightness profile
+        # Unconstrained: scoring pass — use gutter-pattern profile
         # to produce a best-effort per-page layout
-        composite, _, cw = _composite_brightness(img_gray, content_bounds)
+        gscore, _ = _gutter_profile(img_gray, content_bounds)
+        cw = right - left
         best_n, best_score, best_gutters = 3, -999, []
         for cand_n in range(3, 9):
-            total, mn, snapped = _score_equidistant(composite, cw, cand_n)
+            total, mn, snapped = _score_equidistant(gscore, cw, cand_n)
             if total > best_score:
                 best_score, best_n = total, cand_n
                 best_gutters = [x + left for x in snapped]
@@ -823,13 +853,13 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
     Stage 0: Analyze layout of all pages in an issue.
 
     Two-pass approach:
-      Pass 1 — Score column-count hypotheses (N=3..8) across all pages using
-               equidistant gutter placement on composite brightness profiles.
-               Pick the N with the highest total contrast (brightness at
-               gutter positions minus brightness at column centers).
-      Pass 2 — Re-analyze every page with the winning N, snapping equidistant
-               gutters to actual brightness peaks.  Also detects mastheads
-               and produces debug overlays.
+      Pass 1 — Score column-count hypotheses (N=3..8) across all pages.
+               For each N, places equidistant gutters and measures the
+               whitespace-rule_line-whitespace gutter pattern signal.
+               Picks the N with the highest cross-page consensus.
+      Pass 2 — Re-analyze every page with the winning N, snapping
+               equidistant gutters to actual rule-line positions.
+               Also detects mastheads and produces debug overlays.
 
     Returns:
       expected_cols: int — consensus column count
@@ -854,9 +884,10 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
         bounds   = detect_content_bounds(img_gray)
         page_images[pg] = (img_gray, bounds)
 
-        composite, _, cw = _composite_brightness(img_gray, bounds)
+        gscore, _ = _gutter_profile(img_gray, bounds)
+        cw = bounds[2] - bounds[0]
         for N in range(3, 9):
-            total, mn, _ = _score_equidistant(composite, cw, N)
+            total, mn, _ = _score_equidistant(gscore, cw, N)
             cross_scores.setdefault(N, []).append((total, mn))
 
     # Pick the N with best cross-page consensus.
