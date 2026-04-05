@@ -131,6 +131,14 @@ except ImportError:
     HAS_KRAKEN = False
 
 try:
+    # iopath (used by LayoutParser/Detectron2) has a Windows bug where
+    # cached URLs contain '?' which is invalid in Windows filenames.
+    # Fix: set FVCORE_CACHE to a clean directory before importing.
+    if sys.platform == "win32" and "FVCORE_CACHE" not in os.environ:
+        _lp_cache = os.path.join(os.path.expanduser("~"),
+                                  ".cache", "layoutparser")
+        os.makedirs(_lp_cache, exist_ok=True)
+        os.environ["FVCORE_CACHE"] = _lp_cache
     import layoutparser as lp
     HAS_LAYOUTPARSER = True
     _LP_MODEL = None   # lazy-loaded on first use
