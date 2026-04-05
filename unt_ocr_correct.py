@@ -372,6 +372,271 @@ def abbyy_column_boundaries(block_bounds: list) -> list:
 
 
 # ============================================================================
+# STAGE 0 — LAYOUT ANALYSIS (runs once per issue, before OCR)
+# ============================================================================
+# Analyzes all page images to determine the consistent column structure,
+# detect mastheads, and produce debug overlay images with colored bboxes.
+# Outputs:
+#   - expected_cols: int (mode of column counts across all pages)
+#   - page_layouts: dict of page_num → PageLayout
+#   - overlay images saved to artifacts/layout/ (if artifacts dir exists)
+
+# Zone types for colored overlay rendering
+ZONE_COLORS = {
+    "masthead":  (255, 100, 100),   # red
+    "column":    (100, 200, 100),   # green
+    "ad":        (100, 100, 255),   # blue
+    "separator": (200, 200, 0),     # yellow
+    "unknown":   (180, 180, 180),   # gray
+}
+
+
+def _detect_gutters_unconstrained(img_gray, content_bounds) -> list:
+    """
+    Find column gutters from the image without constraining to expected_cols.
+    Returns list of gutter x-coordinates (in page coords).
+    """
+    if not HAS_CV2:
+        return []
+    left, top, right, bot = content_bounds
+    cw = right - left
+    ch = bot - top
+    if cw < 200 or ch < 200:
+        return []
+
+    # Use bottom 30% to avoid masthead spanning text
+    zt = top + ch * 7 // 10
+    zb = top + ch * 95 // 100
+    region   = img_gray[zt:zb, left:right]
+    dark     = (region < 128).sum(axis=0).astype(float)
+    smoothed = uniform_filter1d(dark, size=12)
+
+    # Accept all valleys above a moderate prominence threshold
+    valleys, props = find_peaks(-smoothed, distance=60,
+                                prominence=smoothed.max() * 0.04)
+    if len(valleys) == 0:
+        return []
+
+    gutter_xs = sorted(int(v) + left for v in valleys)
+    return gutter_xs
+
+
+def _detect_masthead_zone(img_gray, content_bounds, gutter_xs) -> tuple | None:
+    """
+    Detect a masthead/header zone at the top of the page.
+    The masthead is a region at the top that spans more columns than the body.
+    Returns (left, top, right, masthead_bottom) or None if no masthead detected.
+    """
+    if not HAS_CV2 or not gutter_xs:
+        return None
+    left, top, right, bot = content_bounds
+    ch = bot - top
+
+    # Scan top 25% of the page for horizontal bands with high ink density
+    # that span multiple columns (i.e. cross at least one gutter)
+    scan_bottom = top + ch // 4
+    region = img_gray[top:scan_bottom, left:right]
+    if region.size == 0:
+        return None
+
+    # Row-wise ink density: how much dark content per row
+    row_dark = (region < 128).mean(axis=1)
+
+    # Find where ink density drops (transition from masthead to columns)
+    # The masthead typically has thick title text, then drops to thinner column text
+    if len(row_dark) < 20:
+        return None
+
+    # Smooth and find the first significant drop
+    row_smooth = uniform_filter1d(row_dark, size=15)
+    # Look for the row where density drops to < 40% of the peak
+    peak_density = row_smooth[:len(row_smooth)//2].max()
+    if peak_density < 0.05:
+        return None  # no significant ink in top quarter
+
+    threshold = peak_density * 0.3
+    mast_end = top
+    for i in range(20, len(row_smooth)):
+        if row_smooth[i] < threshold and all(row_smooth[i:i+10] < threshold):
+            mast_end = top + i
+            break
+
+    # Masthead must be at least 30px tall and less than 25% of the page
+    if mast_end - top < 30:
+        return None
+    if mast_end - top > ch // 4:
+        mast_end = top + ch // 4
+
+    return (left, top, right, mast_end)
+
+
+def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
+    """
+    Analyze a single page's layout: content bounds, gutters, masthead, zones.
+    Returns a layout dict with all detected geometry.
+    """
+    left, top, right, bot = content_bounds
+
+    # Detect gutters without column count constraint
+    gutter_xs = _detect_gutters_unconstrained(img_gray, content_bounds)
+    n_cols = len(gutter_xs) + 1
+
+    # Detect masthead zone
+    masthead = _detect_masthead_zone(img_gray, content_bounds, gutter_xs)
+
+    # Build column zones (below masthead if present)
+    body_top = masthead[3] if masthead else top
+    splits = [left] + gutter_xs + [right]
+    columns = []
+    for i in range(len(splits) - 1):
+        x1, x2 = splits[i], splits[i+1]
+        if x2 - x1 >= 30:
+            columns.append({
+                "type": "column",
+                "index": i + 1,
+                "bbox": (x1, body_top, x2, bot),
+            })
+
+    # Assemble zones
+    zones = []
+    if masthead:
+        zones.append({
+            "type": "masthead",
+            "bbox": masthead,
+        })
+    zones.extend(columns)
+
+    return {
+        "page_num": page_num,
+        "content_bounds": content_bounds,
+        "gutter_xs": gutter_xs,
+        "n_cols": n_cols,
+        "masthead": masthead,
+        "body_top": body_top,
+        "columns": columns,
+        "zones": zones,
+    }
+
+
+def render_layout_overlay(img_gray, layout: dict, page_num: int) -> bytes:
+    """
+    Render a debug overlay image with colored bboxes for each detected zone.
+    Returns PNG bytes. Colors:
+      Red = masthead, Green = columns, Blue = ads, Yellow = separators
+    """
+    if not HAS_CV2:
+        return b""
+
+    # Convert grayscale to BGR for colored overlay
+    overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+    alpha = 0.3
+
+    for zone in layout["zones"]:
+        ztype = zone["type"]
+        color = ZONE_COLORS.get(ztype, ZONE_COLORS["unknown"])
+        x1, y1, x2, y2 = zone["bbox"]
+
+        # Semi-transparent filled rectangle
+        sub = overlay[y1:y2, x1:x2].copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+        overlay[y1:y2, x1:x2] = cv2.addWeighted(overlay[y1:y2, x1:x2], alpha, sub, 1 - alpha, 0)
+
+        # Border
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+
+        # Label
+        label = ztype
+        if ztype == "column":
+            label = f"col {zone.get('index', '?')}"
+        cv2.putText(overlay, label, (x1 + 4, y1 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    # Page number
+    cv2.putText(overlay, f"Page {page_num}  ({layout['n_cols']} cols)",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    # Draw gutter lines through full height
+    for gx in layout["gutter_xs"]:
+        cv2.line(overlay, (gx, layout["content_bounds"][1]),
+                 (gx, layout["content_bounds"][3]), (0, 255, 255), 1)
+
+    _, png = cv2.imencode(".png", overlay)
+    return png.tobytes()
+
+
+def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
+                         worker_id: str = "") -> tuple:
+    """
+    Stage 0: Analyze layout of all pages in an issue.
+
+    Returns:
+      expected_cols: int — the modal (most common) column count
+      page_layouts:  dict of page_num → layout dict
+
+    Also saves debug overlay images to artifacts/layout/{ark_id}/.
+    """
+    tprint(f"  ┌─ Stage 0: Layout analysis ───────────────────────────────",
+           worker=worker_id, level=1)
+
+    page_layouts = {}
+    col_counts = []
+
+    for pg in pages_to_analyze:
+        img_bytes, _ = fetch_page_image(ark_id, pg)
+        if not img_bytes:
+            tprint(f"  │  p{pg:02d} ⚠ no image", worker=worker_id, level=1)
+            continue
+
+        nparr    = np.frombuffer(img_bytes, np.uint8)
+        img_gray = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        bounds   = detect_content_bounds(img_gray)
+
+        layout = analyze_page_layout(img_gray, pg, bounds)
+        page_layouts[pg] = layout
+        col_counts.append(layout["n_cols"])
+
+        mast_str = ""
+        if layout["masthead"]:
+            mh = layout["masthead"]
+            mast_str = f"  masthead={mh[3]-mh[1]}px tall"
+        tprint(f"  │  p{pg:02d}: {layout['n_cols']} columns, "
+               f"{len(layout['gutter_xs'])} gutters{mast_str}",
+               worker=worker_id, level=1)
+        if LOG_LEVEL >= 4:
+            for z in layout["zones"]:
+                b = z["bbox"]
+                tprint(f"  │    {z['type']}: ({b[0]},{b[1]})→({b[2]},{b[3]}) "
+                       f"{b[2]-b[0]}x{b[3]-b[1]}px", level=4)
+
+        # Save debug overlay
+        try:
+            artifacts_dir = CORRECTED_DIR.parent / "artifacts" / "layout" / ark_id
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            overlay_png = render_layout_overlay(img_gray, layout, pg)
+            if overlay_png:
+                (artifacts_dir / f"page_{pg:02d}_layout.png").write_bytes(overlay_png)
+                tprint(f"  │    overlay → artifacts/layout/{ark_id}/page_{pg:02d}_layout.png",
+                       level=3)
+        except Exception as e:
+            tprint(f"  │    ⚠ overlay save failed: {e}", level=3)
+
+    # Derive expected_cols from the mode (most common column count)
+    if col_counts:
+        from collections import Counter
+        col_mode = Counter(col_counts).most_common(1)[0]
+        expected_cols = col_mode[0]
+        tprint(f"  └─ Layout: {expected_cols} columns (mode), "
+               f"distribution: {dict(Counter(col_counts))}",
+               worker=worker_id, level=1)
+    else:
+        expected_cols = 5
+        tprint(f"  └─ Layout: defaulting to {expected_cols} columns (no images)",
+               worker=worker_id, level=1)
+
+    return expected_cols, page_layouts
+
+
+# ============================================================================
 # STAGE 2 — PREPROCESSING
 # ============================================================================
 
@@ -1220,10 +1485,14 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
                        abbyy_page_tokens: list,
                        abbyy_blocks: list,
                        expected_cols: int = 5,
-                       worker_id: str = "") -> dict:
+                       worker_id: str = "",
+                       page_layout: dict = None) -> dict:
     """
     LOCAL stages only (1-7): image → preprocess → columns → Tesseract → Kraken → align.
     Returns a dict with all data needed for Claude (or a no-disputes fast path).
+
+    If page_layout is provided (from Stage 0), uses its pre-detected column
+    geometry instead of re-running column detection.
 
     Keys in returned dict:
       - 'agreed_text', 'all_disputes': raw alignment output
@@ -1259,14 +1528,27 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     tprint(f"      preprocessing (CLAHE + median blur) ...", level=3)
     enhanced = preprocess_image(img_gray)
 
-    # Stage 3: Detect columns
-    tprint(f"      detecting columns ...", level=3)
-    bounds       = detect_content_bounds(img_gray)
-    left, top, right, bot = bounds
-    opencv_cols  = detect_columns_from_image(img_gray, bounds, expected_cols=expected_cols)
-    n_opencv     = len(opencv_cols)
-    tprint(f"      → {n_opencv} columns detected  "
-           f"content bounds=({left},{top})→({right},{bot})", level=3)
+    # Stage 3: Detect columns (use pre-analyzed layout if available)
+    if page_layout and page_layout.get("columns"):
+        tprint(f"      using pre-analyzed layout ({page_layout['n_cols']} cols)", level=3)
+        bounds = page_layout["content_bounds"]
+        left, top, right, bot = bounds
+        # Extract column (x1, x2) pairs from layout zones
+        opencv_cols = [(z["bbox"][0], z["bbox"][2]) for z in page_layout["columns"]]
+        n_opencv = len(opencv_cols)
+        # Use body_top from layout so OCR skips the masthead zone
+        if page_layout.get("masthead"):
+            top = page_layout["body_top"]
+            tprint(f"      masthead detected — OCR starts at y={top}", level=3)
+    else:
+        tprint(f"      detecting columns ...", level=3)
+        bounds = detect_content_bounds(img_gray)
+        left, top, right, bot = bounds
+        opencv_cols = detect_columns_from_image(img_gray, bounds, expected_cols=expected_cols)
+        n_opencv = len(opencv_cols)
+
+    tprint(f"      → {n_opencv} columns  "
+           f"content=({left},{top})→({right},{bot})", level=3)
     if LOG_LEVEL >= 5:
         for ci, (cx1, cx2) in enumerate(opencv_cols, 1):
             tprint(f"        col {ci}: x={cx1}→{cx2} ({cx2-cx1}px wide)", level=5)
@@ -1940,7 +2222,13 @@ def process_issue(issue, api_key, correction_prompt, delay,
     # Check for ABBYY XML (one XML covers whole issue, multiple pages inside)
     axml = abbyy_xml_path(fname)
     has_abbyy = axml is not None
-    expected_cols = int(issue_meta_config.get("expected_cols", 5)) if hasattr(process_issue, '_config') else 5
+
+    # ── Stage 0: Layout analysis ──────────────────────────────────────────
+    # Analyze all pages to determine column structure before any OCR.
+    pages_to_analyze = [pg for pg, needs_redo in pages_to_process if needs_redo]
+    expected_cols, page_layouts = analyze_issue_layout(
+        ark_id, pages_to_analyze, worker_id=worker_id)
+
     engines = ["Tesseract" if tess_lang else None,
                "Kraken" if HAS_KRAKEN else None,
                "ABBYY" if has_abbyy else None]
@@ -1982,7 +2270,9 @@ def process_issue(issue, api_key, correction_prompt, delay,
                 tess_lang=tess_lang,
                 abbyy_page_tokens=abbyy_tokens,
                 abbyy_blocks=abbyy_blocks,
+                expected_cols=expected_cols,
                 worker_id=worker_id,
+                page_layout=page_layouts.get(pg),
             )
             local_results[pg] = local
             disputes = len(local.get("all_disputes", []))
