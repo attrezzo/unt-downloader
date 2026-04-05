@@ -493,35 +493,67 @@ def _detect_rule_lines(img_gray, content_bounds) -> dict:
     return {"vertical": vertical, "horizontal": horizontal}
 
 
-def _verify_gutter_local(img_gray, x_candidate, top, bot, left, right,
-                         tolerance=20):
+def _composite_brightness(img_gray, content_bounds):
     """
-    Verify a predicted gutter position by checking if there's a brightness
-    peak (whitespace strip) near x_candidate in the middle 50% of the page.
-    Returns True if the candidate position is notably brighter than context.
+    Build a composite column-wise brightness profile by averaging 5 narrow
+    horizontal bands across the page body.  Gutters appear as peaks (bright
+    vertical whitespace strips) in this profile.
+
+    Returns (smoothed_profile, left, cw) where profile is in LOCAL coords
+    (index 0 = left edge of content area).
     """
-    ch = bot - top
-    scan_top = top + ch * 25 // 100
-    scan_bot = top + ch * 75 // 100
-    x_lo = max(left, x_candidate - tolerance)
-    x_hi = min(right, x_candidate + tolerance + 1)
-    if x_hi <= x_lo:
-        return False
-    region = img_gray[scan_top:scan_bot, x_lo:x_hi]
-    peak_brightness = float(region.mean(axis=0).max())
-    # Wider context for contrast comparison
-    ctx_lo = max(left, x_candidate - tolerance * 4)
-    ctx_hi = min(right, x_candidate + tolerance * 4 + 1)
-    ctx_mean = float(img_gray[scan_top:scan_bot, ctx_lo:ctx_hi].mean())
-    return peak_brightness > ctx_mean + 3
+    left, top, right, bot = content_bounds
+    cw, ch = right - left, bot - top
+    zone_specs = [(20, 30), (33, 43), (47, 57), (62, 72), (78, 88)]
+    profiles = []
+    for pct_s, pct_e in zone_specs:
+        zt = top + ch * pct_s // 100
+        zb = top + ch * pct_e // 100
+        profiles.append(img_gray[zt:zb, left:right].mean(axis=0).astype(float))
+    composite = np.mean(profiles, axis=0)
+    return uniform_filter1d(composite, size=7), left, cw
 
 
-def _detect_gutters_unconstrained(img_gray, content_bounds,
-                                  rule_lines: dict = None) -> list:
+def _score_equidistant(composite, cw, N):
     """
-    Find column gutters. Primary signal: vertical rule lines detected by
-    _detect_rule_lines(). Fallback: multi-zone brightness peak detection
-    with clustering and regularity-based interpolation.
+    Score an N-column hypothesis by placing N-1 equidistant gutters and
+    measuring how much brighter each gutter position is than the column
+    centers on either side (contrast).
+
+    Returns (total_contrast, min_contrast, snapped_local_xs) where xs are
+    in LOCAL coordinates (0 = left edge of content).
+    """
+    spacing = cw / N
+    window = max(8, int(spacing * 0.15))   # search ±15% of column width
+    half_col = int(spacing * 0.35)          # sample 35% into column
+
+    contrasts = []
+    snapped = []
+    for k in range(1, N):
+        gx = int(spacing * k)
+        lo = max(0, gx - window)
+        hi = min(len(composite), gx + window + 1)
+        snap_x = lo + int(np.argmax(composite[lo:hi]))
+        gutter_b = float(composite[snap_x])
+        snapped.append(snap_x)
+
+        left_c = max(0, snap_x - half_col)
+        right_c = min(len(composite) - 1, snap_x + half_col)
+        col_b = min(float(composite[left_c]), float(composite[right_c]))
+        contrasts.append(gutter_b - col_b)
+
+    return sum(contrasts), min(contrasts), snapped
+
+
+def _detect_gutters_equidistant(img_gray, content_bounds, n_cols,
+                                rule_lines: dict = None) -> list:
+    """
+    Place gutters for a known N-column layout.  Primary signal: vertical
+    rule lines.  Fallback: equidistant placement snapped to brightness peaks
+    in the composite profile.
+
+    Args:
+        n_cols: number of columns (determined by cross-page consensus)
 
     Returns list of gutter x-coordinates (in page coords).
     """
@@ -534,162 +566,27 @@ def _detect_gutters_unconstrained(img_gray, content_bounds,
         return []
 
     # ── Primary: use rule lines if available ──────────────────────────────
-    # Vertical rule lines are the most reliable signal — they're the actual
-    # printed column borders, not inferred from text density.
     if rule_lines and rule_lines.get("vertical"):
         v_rules = rule_lines["vertical"]
-        # Filter to lines within content area, away from edges
         edge_margin = cw // 15
         gutters = [x for x in v_rules
                    if x > left + edge_margin and x < right - edge_margin]
-        if gutters:
-            tprint(f"      gutters from rule lines: {len(gutters)} at x={gutters}", level=3)
+        if len(gutters) == n_cols - 1:
+            tprint(f"      gutters from rule lines: {len(gutters)} at "
+                   f"x={gutters}", level=3)
             return sorted(gutters)
-        tprint(f"      rule lines found but all near edges — falling back to projection", level=4)
+        tprint(f"      rule lines: {len(gutters)} found but need "
+               f"{n_cols - 1} — using brightness profile", level=4)
 
-    # ── Fallback: multi-zone brightness-based gutter detection ───────────
-    # Sample 5 narrow horizontal bands across the page body. For each band,
-    # compute column-wise mean brightness; peaks = whitespace gutters.
-    # A gutter is confirmed if detected in ≥2 of 5 zones.
-    min_col_width = max(60, cw // 25)
-    snap_tol = max(20, cw // 70)  # ~1.4% of page width
+    # ── Equidistant placement snapped to brightness peaks ────────────────
+    composite, comp_left, comp_cw = _composite_brightness(
+        img_gray, content_bounds)
+    _, _, snapped_local = _score_equidistant(composite, cw, n_cols)
+    gutters = sorted(x + left for x in snapped_local)
 
-    zone_specs = [
-        (20, 30),   # upper body
-        (33, 43),   # upper-mid
-        (47, 57),   # center
-        (62, 72),   # lower-mid
-        (78, 88),   # lower body
-    ]
-
-    all_zone_valleys = []
-    for zi, (pct_start, pct_end) in enumerate(zone_specs):
-        zt = top + ch * pct_start // 100
-        zb = top + ch * pct_end // 100
-        region = img_gray[zt:zb, left:right]
-
-        # Mean brightness per column — gutters are bright vertical strips
-        brightness = region.mean(axis=0).astype(float)
-        smoothed = uniform_filter1d(brightness, size=7)
-
-        brange = smoothed.max() - smoothed.min()
-        if brange < 3:
-            all_zone_valleys.append([])
-            continue
-
-        # Find peaks in brightness (= whitespace gutters)
-        prom_threshold = max(2.0, brange * 0.06)
-        peaks, _ = find_peaks(smoothed, distance=min_col_width,
-                              prominence=prom_threshold)
-        zone_valleys = [int(p) for p in peaks]
-        all_zone_valleys.append(zone_valleys)
-        if LOG_LEVEL >= 5:
-            tprint(f"      zone {zi} ({pct_start}-{pct_end}%): "
-                   f"{len(zone_valleys)} candidates "
-                   f"at x={[v + left for v in zone_valleys]}", level=5)
-
-    # ── Cluster gutters across zones ─────────────────────────────────────
-    # Collect all candidates with zone labels, sort by x, cluster nearby
-    all_candidates = []
-    for zi, valleys in enumerate(all_zone_valleys):
-        for v in valleys:
-            all_candidates.append((v, zi))
-
-    if not all_candidates:
-        tprint(f"      gutter scan: 5 zones found no candidates", level=4)
-        return []
-
-    all_candidates.sort(key=lambda x: x[0])
-    clusters = []
-    current_cluster = [all_candidates[0]]
-    for i in range(1, len(all_candidates)):
-        x, zi = all_candidates[i]
-        cluster_mean = sum(c[0] for c in current_cluster) / len(current_cluster)
-        if abs(x - cluster_mean) <= snap_tol:
-            current_cluster.append((x, zi))
-        else:
-            clusters.append(current_cluster)
-            current_cluster = [(x, zi)]
-    clusters.append(current_cluster)
-
-    # Confirm clusters with detections from ≥2 distinct zones
-    min_zones = 2
-    confirmed = []
-    for cluster in clusters:
-        zones_present = len(set(zi for _, zi in cluster))
-        mean_x = int(sum(x for x, _ in cluster) / len(cluster)) + left
-        if zones_present >= min_zones:
-            confirmed.append(mean_x)
-            tprint(f"      cluster x≈{mean_x}: {zones_present}/5 zones agree ✓",
-                   level=5)
-        else:
-            tprint(f"      cluster x≈{mean_x}: only {zones_present} zone — rejected",
-                   level=5)
-
-    zone_counts = [len(v) for v in all_zone_valleys]
-    tprint(f"      gutter scan: 5 zones found {zone_counts} → "
-           f"{len(confirmed)} confirmed", level=4)
-
-    # ── Regularity heuristic: fill missing gutters ───────────────────────
-    # If the confirmed gutters suggest a regular spacing pattern, look for
-    # missing gutters at predicted positions and verify with a local scan.
-    if len(confirmed) >= 2:
-        spacings = [confirmed[i+1] - confirmed[i]
-                    for i in range(len(confirmed) - 1)]
-        median_spacing = int(sorted(spacings)[len(spacings) // 2])
-
-        # Check if most spacings are close to the median (within 35%)
-        regular_count = sum(1 for s in spacings
-                            if 0.65 * median_spacing <= s <= 1.35 * median_spacing)
-        is_regular = regular_count >= len(spacings) * 0.6 and median_spacing > 0
-
-        if is_regular:
-            tprint(f"      regularity: median spacing={median_spacing}px, "
-                   f"{regular_count}/{len(spacings)} spacings regular", level=4)
-
-            # Extend left: add gutters at -median_spacing intervals
-            leftmost = confirmed[0]
-            edge_margin = cw // 15
-            while leftmost - median_spacing > left + edge_margin:
-                candidate = int(leftmost - median_spacing)
-                if _verify_gutter_local(img_gray, candidate, top, bot,
-                                        left, right, snap_tol):
-                    confirmed.insert(0, candidate)
-                    tprint(f"      regularity: +gutter x≈{candidate} "
-                           f"(left extension)", level=4)
-                leftmost -= median_spacing
-
-            # Extend right
-            rightmost = confirmed[-1]
-            while rightmost + median_spacing < right - edge_margin:
-                candidate = int(rightmost + median_spacing)
-                if _verify_gutter_local(img_gray, candidate, top, bot,
-                                        left, right, snap_tol):
-                    confirmed.append(candidate)
-                    tprint(f"      regularity: +gutter x≈{candidate} "
-                           f"(right extension)", level=4)
-                rightmost += median_spacing
-
-            # Fill interior gaps where spacing ≈ 2× median
-            i = 0
-            while i < len(confirmed) - 1:
-                gap = confirmed[i+1] - confirmed[i]
-                if 1.6 * median_spacing <= gap <= 2.5 * median_spacing:
-                    candidate = (confirmed[i] + confirmed[i+1]) // 2
-                    if _verify_gutter_local(img_gray, candidate, top, bot,
-                                            left, right, snap_tol):
-                        confirmed.insert(i + 1, candidate)
-                        tprint(f"      regularity: +gutter x≈{candidate} "
-                               f"(gap fill)", level=4)
-                i += 1
-
-    # Remove gutters that are too close to the edges (probably border artifacts)
-    edge_margin = cw // 15
-    confirmed = [g for g in confirmed
-                 if g > left + edge_margin and g < right - edge_margin]
-
-    tprint(f"      confirmed gutters: {len(confirmed)} at x={confirmed}", level=4)
-    return sorted(confirmed)
+    tprint(f"      equidistant ({n_cols} cols): gutters at x={gutters}",
+           level=4)
+    return gutters
 
 
 def _detect_masthead_zone(img_gray, content_bounds, gutter_xs) -> tuple | None:
@@ -773,9 +670,15 @@ def _detect_masthead_zone(img_gray, content_bounds, gutter_xs) -> tuple | None:
     return (left, top, right, mast_end)
 
 
-def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
+def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
+                        n_cols: int = 0) -> dict:
     """
     Analyze a single page's layout: rule lines, gutters, masthead, zones.
+
+    If n_cols > 0 (from cross-page consensus), places equidistant gutters
+    snapped to brightness peaks.  Otherwise falls back to unconstrained
+    detection (used only during the scoring pass).
+
     Returns a layout dict with all detected geometry.
     """
     left, top, right, bot = content_bounds
@@ -783,10 +686,23 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple) -> dict:
     # Step 1: Detect printed rule lines (the most reliable geometric signal)
     rule_lines = _detect_rule_lines(img_gray, content_bounds)
 
-    # Step 2: Detect gutters using rule lines first, projection as fallback
-    gutter_xs = _detect_gutters_unconstrained(img_gray, content_bounds,
-                                              rule_lines=rule_lines)
-    n_cols = len(gutter_xs) + 1
+    # Step 2: Detect gutters
+    if n_cols > 0:
+        # Constrained: cross-page consensus told us how many columns
+        gutter_xs = _detect_gutters_equidistant(
+            img_gray, content_bounds, n_cols, rule_lines=rule_lines)
+    else:
+        # Unconstrained: scoring pass — use composite brightness profile
+        # to produce a best-effort per-page layout
+        composite, _, cw = _composite_brightness(img_gray, content_bounds)
+        best_n, best_score, best_gutters = 3, -999, []
+        for cand_n in range(3, 9):
+            total, mn, snapped = _score_equidistant(composite, cw, cand_n)
+            if total > best_score:
+                best_score, best_n = total, cand_n
+                best_gutters = [x + left for x in snapped]
+        gutter_xs = sorted(best_gutters)
+        n_cols = best_n
 
     # Step 3: Detect masthead using horizontal rules first, then density
     masthead = None
@@ -906,8 +822,17 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
     """
     Stage 0: Analyze layout of all pages in an issue.
 
+    Two-pass approach:
+      Pass 1 — Score column-count hypotheses (N=3..8) across all pages using
+               equidistant gutter placement on composite brightness profiles.
+               Pick the N with the highest total contrast (brightness at
+               gutter positions minus brightness at column centers).
+      Pass 2 — Re-analyze every page with the winning N, snapping equidistant
+               gutters to actual brightness peaks.  Also detects mastheads
+               and produces debug overlays.
+
     Returns:
-      expected_cols: int — the modal (most common) column count
+      expected_cols: int — consensus column count
       page_layouts:  dict of page_num → layout dict
 
     Also saves debug overlay images to artifacts/layout/{ark_id}/.
@@ -915,22 +840,58 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
     tprint(f"  ┌─ Stage 0: Layout analysis ───────────────────────────────",
            worker=worker_id, level=1)
 
-    page_layouts = {}
-    col_counts = []
+    # ── Pass 1: load images and score column-count hypotheses ────────────
+    page_images = {}   # pg → (img_gray, bounds)
+    cross_scores = {}  # N → list of (total_contrast, min_contrast) per page
 
     for pg in pages_to_analyze:
         img_bytes, _ = fetch_page_image(ark_id, pg)
         if not img_bytes:
             tprint(f"  │  p{pg:02d} ⚠ no image", worker=worker_id, level=1)
             continue
-
         nparr    = np.frombuffer(img_bytes, np.uint8)
         img_gray = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
         bounds   = detect_content_bounds(img_gray)
+        page_images[pg] = (img_gray, bounds)
 
-        layout = analyze_page_layout(img_gray, pg, bounds)
+        composite, _, cw = _composite_brightness(img_gray, bounds)
+        for N in range(3, 9):
+            total, mn, _ = _score_equidistant(composite, cw, N)
+            cross_scores.setdefault(N, []).append((total, mn))
+
+    # Pick the N with best cross-page consensus.
+    # Score = sum of total_contrast across pages × fraction of pages where
+    # the weakest gutter still has positive contrast (all gutters real).
+    best_n, best_consensus = 5, -999
+    for N in sorted(cross_scores):
+        scores = cross_scores[N]
+        total_sum = sum(t for t, m in scores)
+        pages_ok = sum(1 for t, m in scores if m > 0)
+        consensus = total_sum * (pages_ok / max(1, len(scores)))
+        marker = ""
+        if consensus > best_consensus:
+            best_consensus = consensus
+            best_n = N
+            marker = " ← best"
+        tprint(f"  │  score N={N}: total={total_sum:7.1f}  "
+               f"pages_ok={pages_ok}/{len(scores)}  "
+               f"consensus={consensus:7.1f}{marker}",
+               worker=worker_id, level=3)
+
+    expected_cols = best_n
+    tprint(f"  │  consensus: {expected_cols} columns",
+           worker=worker_id, level=1)
+
+    # ── Pass 2: finalize layouts with consensus column count ─────────────
+    page_layouts = {}
+    for pg in pages_to_analyze:
+        if pg not in page_images:
+            continue
+        img_gray, bounds = page_images[pg]
+
+        layout = analyze_page_layout(img_gray, pg, bounds,
+                                     n_cols=expected_cols)
         page_layouts[pg] = layout
-        col_counts.append(layout["n_cols"])
 
         mast_str = ""
         if layout["masthead"]:
@@ -952,23 +913,13 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
             overlay_png = render_layout_overlay(img_gray, layout, pg)
             if overlay_png:
                 (artifacts_dir / f"page_{pg:02d}_layout.png").write_bytes(overlay_png)
-                tprint(f"  │    overlay → artifacts/layout/{ark_id}/page_{pg:02d}_layout.png",
-                       level=3)
+                tprint(f"  │    overlay → artifacts/layout/{ark_id}/"
+                       f"page_{pg:02d}_layout.png", level=3)
         except Exception as e:
             tprint(f"  │    ⚠ overlay save failed: {e}", level=3)
 
-    # Derive expected_cols from the mode (most common column count)
-    if col_counts:
-        from collections import Counter
-        col_mode = Counter(col_counts).most_common(1)[0]
-        expected_cols = col_mode[0]
-        tprint(f"  └─ Layout: {expected_cols} columns (mode), "
-               f"distribution: {dict(Counter(col_counts))}",
-               worker=worker_id, level=1)
-    else:
-        expected_cols = 5
-        tprint(f"  └─ Layout: defaulting to {expected_cols} columns (no images)",
-               worker=worker_id, level=1)
+    tprint(f"  └─ Layout: {expected_cols} columns (cross-page consensus)",
+           worker=worker_id, level=1)
 
     return expected_cols, page_layouts
 
