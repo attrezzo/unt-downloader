@@ -2379,6 +2379,12 @@ def _download_kraken_model() -> str:
 
 
 _kraken_load_lock = threading.Lock()
+# Kraken's blla.segment() and rpred.rpred() produce noisy stdout/stderr output.
+# We used to suppress this with contextlib.redirect_stdout/redirect_stderr, but
+# those modify global sys.stdout/sys.stderr and are NOT thread-safe. Instead we
+# serialize all Kraken inference through a dedicated lock so only one thread
+# touches stdout redirection at a time.
+_kraken_infer_lock = threading.Lock()
 
 
 def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
@@ -2400,16 +2406,18 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
                     _KRAKEN_MODEL = kraken_models.load_any(model_path)
                     tprint(f"  Kraken model: {model_path}", level=3)
         pil = PILImage.fromarray(col_img)
-        # Suppress ALL Kraken output during segmentation + recognition.
-        # Polygonizer warnings go to stdout/stderr/logging unpredictably.
+        # Suppress Kraken output during segmentation + recognition.
+        # Serialized through _kraken_infer_lock because redirect_stdout/stderr
+        # modify global sys.stdout/sys.stderr and are NOT thread-safe.
         import warnings, logging, io, contextlib
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            logging.getLogger("kraken").setLevel(logging.CRITICAL)
-            devnull = io.StringIO()
-            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                seg = blla.segment(pil)
-                records = list(rpred.rpred(_KRAKEN_MODEL, pil, seg))
+        with _kraken_infer_lock:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                logging.getLogger("kraken").setLevel(logging.CRITICAL)
+                devnull = io.StringIO()
+                with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                    seg = blla.segment(pil)
+                    records = list(rpred.rpred(_KRAKEN_MODEL, pil, seg))
         tokens = []
         for record in records:
             text = record.prediction.strip()
@@ -2453,7 +2461,8 @@ def kraken_tokens(col_img, source_tag: str = "kraken") -> list:
     except Exception as e:
         err = str(e).lower()
         if "model" in err or "not loadable" in err or ".mlmodel" in err:
-            HAS_KRAKEN = False
+            with _kraken_load_lock:
+                HAS_KRAKEN = False
             tprint(f"  ⚠ Kraken disabled for this run: {e}", level=1)
         else:
             tprint(f"    ⚠ Kraken error: {e}", level=2)
@@ -3761,16 +3770,27 @@ def process_issue(issue, api_key, correction_prompt, delay,
         tprint(f"  │  parallelizing {len(work_items)} pages across "
                f"{n_ocr_workers} threads",
                worker=worker_id, level=1)
+        # Timeout per page: 10 minutes should be generous for local OCR.
+        PAGE_OCR_TIMEOUT = 600
         with ThreadPoolExecutor(max_workers=n_ocr_workers) as pool:
             futures = {pool.submit(_run_local_ocr, pg): pg
                        for pg in work_items}
-            for future in as_completed(futures):
+            for future in as_completed(futures,
+                                       timeout=PAGE_OCR_TIMEOUT * len(work_items)):
                 pg = futures[future]
                 try:
-                    _, local = future.result()
+                    _, local = future.result(timeout=PAGE_OCR_TIMEOUT)
                     local_results[pg] = local
                     tprint(f"  │  p{pg:02d} ✓ [{local['summary']}]",
                            worker=worker_id, level=1)
+                except TimeoutError:
+                    tprint(f"  │  p{pg:02d} ✗ TIMED OUT after "
+                           f"{PAGE_OCR_TIMEOUT}s",
+                           worker=worker_id, level=1)
+                    unt_ocr = strip_ocr_html(ocr_pages.get(pg, ""))
+                    corrected_pages[pg] = (
+                        f"[CORRECTION FAILED: local OCR timed out]\n\n"
+                        f"{unt_ocr}")
                 except Exception as e:
                     tprint(f"  │  p{pg:02d} ✗ FAILED: {e}",
                            worker=worker_id, level=1)
