@@ -133,17 +133,35 @@ except ImportError:
 try:
     # iopath (used by LayoutParser/Detectron2) has a Windows bug where
     # cached URLs contain '?' which is invalid in Windows filenames.
-    # Fix: monkey-patch iopath's _get_local_path to sanitize filenames.
+    # Fix: monkey-patch iopath's file_lock to sanitize the lock filename,
+    # and the cache path computation to strip query params from filenames
+    # (but NOT from the download URL).
     if sys.platform == "win32":
         try:
             import iopath.common.file_io as _iopath_fio
             _orig_http_get_local = _iopath_fio.HTTPURLHandler._get_local_path
+
             def _patched_http_get_local(self, path, **kwargs):
-                # Sanitize the cached filename by replacing invalid chars
-                import urllib.parse
-                parsed = urllib.parse.urlparse(path)
-                clean = parsed._replace(query="", fragment="").geturl()
-                return _orig_http_get_local(self, clean, **kwargs)
+                """Download with original URL, but cache under sanitized name."""
+                import hashlib
+                # Build a safe cache path from a hash of the full URL
+                cache_dir = os.path.join(
+                    os.path.expanduser("~"), ".cache", "layoutparser")
+                os.makedirs(cache_dir, exist_ok=True)
+                url_hash = hashlib.md5(path.encode()).hexdigest()[:12]
+                # Guess extension from URL path
+                ext = os.path.splitext(
+                    path.split("?")[0].split("/")[-1])[-1] or ".bin"
+                cached = os.path.join(cache_dir, url_hash + ext)
+                if os.path.exists(cached):
+                    return cached
+                # Download using urllib (Dropbox needs ?dl=1)
+                import urllib.request
+                tprint(f"  Downloading LayoutParser model: {path[:80]}...",
+                       level=1)
+                urllib.request.urlretrieve(path, cached)
+                return cached
+
             _iopath_fio.HTTPURLHandler._get_local_path = _patched_http_get_local
         except Exception:
             pass
