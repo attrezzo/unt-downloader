@@ -395,6 +395,10 @@ def _detect_gutters_unconstrained(img_gray, content_bounds) -> list:
     """
     Find column gutters from the image without constraining to expected_cols.
     Returns list of gutter x-coordinates (in page coords).
+
+    A real newspaper column gutter is a vertical gap that runs the full height
+    of the text area. We use multiple scan zones and require consistency:
+    gutters must appear in both the middle and bottom thirds of the page.
     """
     if not HAS_CV2:
         return []
@@ -404,68 +408,155 @@ def _detect_gutters_unconstrained(img_gray, content_bounds) -> list:
     if cw < 200 or ch < 200:
         return []
 
-    # Use bottom 30% to avoid masthead spanning text
-    zt = top + ch * 7 // 10
-    zb = top + ch * 95 // 100
-    region   = img_gray[zt:zb, left:right]
-    dark     = (region < 128).sum(axis=0).astype(float)
-    smoothed = uniform_filter1d(dark, size=12)
+    # Minimum column width: real newspaper columns are at least 100px wide
+    # at typical scan resolutions (1200-1500px wide page).
+    min_col_width = max(80, cw // 20)
 
-    # Accept all valleys above a moderate prominence threshold
-    valleys, props = find_peaks(-smoothed, distance=60,
-                                prominence=smoothed.max() * 0.04)
-    if len(valleys) == 0:
+    def _find_valleys(region):
+        """Find vertical gaps (valleys in ink density) in a horizontal region."""
+        dark     = (region < 128).sum(axis=0).astype(float)
+        smoothed = uniform_filter1d(dark, size=15)
+        if smoothed.max() < 10:
+            return []
+        # Require strong valleys: prominence at least 15% of max density,
+        # and gutters at least min_col_width apart.
+        valleys, props = find_peaks(-smoothed, distance=min_col_width,
+                                    prominence=smoothed.max() * 0.15)
+        return list(valleys)
+
+    # Scan two independent vertical zones and require agreement.
+    # Zone A: middle third (40%-65%) — avoids both masthead and footer
+    za_top = top + ch * 40 // 100
+    za_bot = top + ch * 65 // 100
+    # Zone B: bottom quarter (70%-90%)
+    zb_top = top + ch * 70 // 100
+    zb_bot = top + ch * 90 // 100
+
+    valleys_a = _find_valleys(img_gray[za_top:za_bot, left:right])
+    valleys_b = _find_valleys(img_gray[zb_top:zb_bot, left:right])
+
+    tprint(f"      gutter scan: zone A({za_top}-{za_bot}) found {len(valleys_a)}, "
+           f"zone B({zb_top}-{zb_bot}) found {len(valleys_b)}", level=4)
+
+    if not valleys_a and not valleys_b:
         return []
 
-    gutter_xs = sorted(int(v) + left for v in valleys)
-    return gutter_xs
+    # A gutter is confirmed only if both zones agree (within tolerance).
+    # This eliminates false positives from ads, illustrations, or headlines
+    # that create vertical gaps in only one part of the page.
+    snap_tol = max(15, cw // 100)  # ~1% of page width
+    confirmed = []
+
+    # Use the zone with more detections as anchor, match against the other
+    if len(valleys_a) >= len(valleys_b):
+        anchor, check = valleys_a, valleys_b
+    else:
+        anchor, check = valleys_b, valleys_a
+
+    for va in anchor:
+        for vb in check:
+            if abs(va - vb) < snap_tol:
+                # Average the two detections for better accuracy
+                confirmed.append(int((va + vb) / 2) + left)
+                break
+        else:
+            # No match in the other zone — include only if prominently detected
+            # (single-zone gutters are often false positives)
+            pass
+
+    # If cross-zone matching eliminated everything, fall back to the
+    # zone with stronger signal but require very high prominence
+    if not confirmed and (valleys_a or valleys_b):
+        best_zone = valleys_a if len(valleys_a) > len(valleys_b) else valleys_b
+        tprint(f"      ⚠ no cross-zone agreement, using single zone ({len(best_zone)} valleys)", level=4)
+        confirmed = [int(v) + left for v in best_zone]
+
+    # Remove gutters that are too close to the edges (probably border artifacts)
+    edge_margin = cw // 15
+    confirmed = [g for g in confirmed
+                 if g > left + edge_margin and g < right - edge_margin]
+
+    tprint(f"      confirmed gutters: {len(confirmed)} at x={confirmed}", level=4)
+    return sorted(confirmed)
 
 
 def _detect_masthead_zone(img_gray, content_bounds, gutter_xs) -> tuple | None:
     """
     Detect a masthead/header zone at the top of the page.
-    The masthead is a region at the top that spans more columns than the body.
+
+    Strategy: compare the gutter pattern in the top portion vs the body.
+    The masthead spans the full width (no gutters or different gutters),
+    while the body has the regular column structure. The transition
+    between them is the masthead boundary.
+
+    Also detects the masthead via horizontal rule lines (thick dark
+    horizontal stripes that newspapers use to separate the title block).
+
     Returns (left, top, right, masthead_bottom) or None if no masthead detected.
     """
-    if not HAS_CV2 or not gutter_xs:
+    if not HAS_CV2:
         return None
     left, top, right, bot = content_bounds
+    cw = right - left
     ch = bot - top
-
-    # Scan top 25% of the page for horizontal bands with high ink density
-    # that span multiple columns (i.e. cross at least one gutter)
-    scan_bottom = top + ch // 4
-    region = img_gray[top:scan_bottom, left:right]
-    if region.size == 0:
+    if ch < 200:
         return None
 
-    # Row-wise ink density: how much dark content per row
-    row_dark = (region < 128).mean(axis=1)
+    # Method 1: Look for a horizontal rule line in the top 30% of the page.
+    # Newspaper mastheads are typically separated by a thick horizontal line.
+    scan_h = min(ch // 3, 700)
+    top_region = img_gray[top:top + scan_h, left:right]
 
-    # Find where ink density drops (transition from masthead to columns)
-    # The masthead typically has thick title text, then drops to thinner column text
-    if len(row_dark) < 20:
-        return None
+    # Row-wise mean darkness: a rule line is a row (or band of rows) that
+    # is much darker than the rows above and below it
+    row_means = np.mean(top_region, axis=1)
+    # Invert: lower mean = darker row = more ink
+    row_ink = 255 - row_means
 
-    # Smooth and find the first significant drop
-    row_smooth = uniform_filter1d(row_dark, size=15)
-    # Look for the row where density drops to < 40% of the peak
-    peak_density = row_smooth[:len(row_smooth)//2].max()
+    # Smooth to find bands, not individual pixel rows
+    row_smooth = uniform_filter1d(row_ink, size=5)
+
+    # Find peaks in ink density (horizontal dark bands)
+    if row_smooth.max() > 30:
+        peaks, props = find_peaks(row_smooth, height=row_smooth.max() * 0.4,
+                                  prominence=20, distance=20)
+        # The masthead boundary is the first strong horizontal rule
+        # that spans most of the page width
+        for pk in peaks:
+            y = top + int(pk)
+            # Verify this row is dark across most of the page width
+            row_slice = img_gray[y, left:right]
+            dark_frac = (row_slice < 128).mean()
+            if dark_frac > 0.3:  # at least 30% of the row is dark
+                tprint(f"      masthead: rule line at y={y} "
+                       f"(dark fraction={dark_frac:.2f})", level=4)
+                # Masthead ends just below this rule line
+                mast_end = y + 5
+                if mast_end - top >= 30:
+                    return (left, top, right, mast_end)
+
+    # Method 2: Ink density profile — find where dense title text
+    # transitions to sparser column text
+    row_dark_frac = (top_region < 128).mean(axis=1)
+    row_dark_smooth = uniform_filter1d(row_dark_frac, size=15)
+
+    peak_density = row_dark_smooth[:scan_h // 2].max() if scan_h > 0 else 0
     if peak_density < 0.05:
-        return None  # no significant ink in top quarter
+        return None
 
-    threshold = peak_density * 0.3
+    # Find transition: density drops to < 25% of peak and stays low
+    threshold = peak_density * 0.25
     mast_end = top
-    for i in range(20, len(row_smooth)):
-        if row_smooth[i] < threshold and all(row_smooth[i:i+10] < threshold):
+    for i in range(30, len(row_dark_smooth)):
+        window = row_dark_smooth[i:i+15]
+        if len(window) >= 10 and all(w < threshold for w in window):
             mast_end = top + i
             break
 
-    # Masthead must be at least 30px tall and less than 25% of the page
     if mast_end - top < 30:
         return None
-    if mast_end - top > ch // 4:
-        mast_end = top + ch // 4
+    if mast_end - top > ch // 3:
+        mast_end = top + ch // 3
 
     return (left, top, right, mast_end)
 
