@@ -1033,146 +1033,93 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
         })
 
     # Ad zones from horizontal borders.
-    # An ad is bounded by a top border and a bottom border that share
-    # column span (overlap).  Borders can be full-width or partial.
     #
-    # Two-phase strategy (order matters):
-    #   Phase 1: Pair partial borders with a full-width border above.
-    #            This catches ads that start at a section boundary
-    #            (masthead bottom, section break).  Run first because
-    #            these are higher-confidence pairings.
-    #   Phase 2: Pair remaining partial borders with overlapping col spans.
-    all_borders = sorted(fw_borders + partial_borders, key=lambda b: b["y"])
+    # Key insight: ads stack VERTICALLY within columns (or 1-2 column
+    # spans), butted against each other.  The column next to an ad
+    # column is typically body text.  Ads are bounded top and bottom by
+    # horizontal rule lines and sit within the column grid.
+    #
+    # Strategy: for each horizontal border, check if it spans a small
+    # number of columns (1-2) — these are ad boundaries.  Pair borders
+    # that share the same column span to form ad rectangles.  Then
+    # merge vertically adjacent ads (butted against each other).
+    #
+    # Also detect ads that start at the masthead bottom (like
+    # "Der Deutsche Tag!" on page 1).
     ad_zones = []
-    used = set()  # indices into all_borders
 
-    # Phase 1: partial borders paired with the masthead bottom.
-    # Catches ads that start immediately below the masthead (e.g.,
-    # "Der Deutsche Tag!" spanning cols 4-6 on page 1).
-    #
-    # Guard: the ad must NOT start at column 1.  A partial border
-    # starting at col 1 that pairs with the masthead would cover
-    # the entire left portion of the page — that's article text,
-    # not an ad.  Real masthead-adjacent ads start at interior columns.
+    # Phase 1: masthead-anchored ads (start at masthead bottom,
+    # end at a partial border).  Must not start at column 1.
     if masthead:
-        for i, b in enumerate(all_borders):
-            if b["full_width"] or b["y"] <= body_top or b["y"] > footer_top:
+        for b in partial_borders:
+            if b["y"] <= body_top or b["y"] > footer_top:
                 continue
             gap = b["y"] - body_top
             n_span = b["col_end"] - b["col_start"] + 1
             if (30 < gap < ch * 40 // 100
-                    and n_span < n_cols
-                    and b["col_start"] > 1):
+                    and n_span <= 3 and b["col_start"] > 1):
                 cs, ce = b["col_start"], b["col_end"]
-                x1, x2 = col_bounds[cs - 1], col_bounds[ce]
                 ad_zones.append({
                     "type": "ad",
-                    "bbox": (x1, body_top, x2, b["y"]),
+                    "bbox": (col_bounds[cs - 1], body_top,
+                             col_bounds[ce], b["y"]),
                     "col_span": (cs, ce),
                 })
-                used.add(i)
 
-    # Phase 2: pair remaining partial borders with MATCHING col spans.
-    # Require that the top and bottom borders span the same columns
-    # (within 1 column tolerance).  This prevents section-break rules
-    # (which span varying widths) from being paired as ad boxes.
-    partial_idxs = [i for i, b in enumerate(all_borders)
-                    if not b["full_width"] and i not in used
-                    and body_top <= b["y"] <= footer_top]
-    for pi, i in enumerate(partial_idxs):
+    # Phase 2: pair partial borders within the body that share the
+    # same column span (1-2 columns).  These are individual ad boxes.
+    body_partials = [b for b in partial_borders
+                     if body_top <= b["y"] <= footer_top
+                     and b["col_end"] - b["col_start"] + 1 <= 2]
+    used = set()
+    for i, bt in enumerate(body_partials):
         if i in used:
             continue
-        b_top = all_borders[i]
-        for pj in range(pi + 1, len(partial_idxs)):
-            j = partial_idxs[pj]
+        for j in range(i + 1, len(body_partials)):
             if j in used:
                 continue
-            b_bot = all_borders[j]
-            # Require exact matching span: both borders must cover the
-            # same columns.  Section-break rules have ragged detection
-            # that spans different column counts; real ad boxes have
-            # precise, consistent top and bottom borders.
-            start_match = b_top["col_start"] == b_bot["col_start"]
-            end_match = b_top["col_end"] == b_bot["col_end"]
-            span_lo = max(b_top["col_start"], b_bot["col_start"])
-            span_hi = min(b_top["col_end"], b_bot["col_end"])
-            gap = b_bot["y"] - b_top["y"]
-            # Also reject if there's a full-width border between the
-            # top and bottom — that indicates a section break, meaning
-            # the two partial borders bound different content regions.
-            fw_between = any(fb["y"] > b_top["y"] and fb["y"] < b_bot["y"]
-                             for fb in fw_borders)
-            if (start_match and end_match and span_lo <= span_hi
-                    and 15 < gap < ch // 2 and not fw_between):
-                x1 = col_bounds[span_lo - 1]
-                x2 = col_bounds[span_hi]
-                ad_zones.append({
-                    "type": "ad",
-                    "bbox": (x1, b_top["y"], x2, b_bot["y"]),
-                    "col_span": (span_lo, span_hi),
-                })
-                used.add(i)
-                used.add(j)
-                break
+            bb = body_partials[j]
+            # Exact same column span
+            if (bt["col_start"] == bb["col_start"]
+                    and bt["col_end"] == bb["col_end"]):
+                gap = bb["y"] - bt["y"]
+                # No full-width border between them
+                fw_between = any(fb["y"] > bt["y"] and fb["y"] < bb["y"]
+                                 for fb in fw_borders)
+                if 15 < gap < ch // 3 and not fw_between:
+                    cs, ce = bt["col_start"], bt["col_end"]
+                    ad_zones.append({
+                        "type": "ad",
+                        "bbox": (col_bounds[cs - 1], bt["y"],
+                                 col_bounds[ce], bb["y"]),
+                        "col_span": (cs, ce),
+                    })
+                    used.add(i)
+                    used.add(j)
+                    break
 
-    # Filter: minimum ad height (5% of page height).  Tiny "ads"
-    # are usually just pairs of nearby section-break rules.
+    # Filter: minimum ad height (5% of page height)
     min_ad_h = max(40, ch * 5 // 100)
     ad_zones = [a for a in ad_zones
                 if a["bbox"][3] - a["bbox"][1] >= min_ad_h]
 
-    # Deduplicate overlapping ads: when multiple ads share the same
-    # starting y and column span, keep only the tightest (smallest area).
-    # This happens when Phase 1 pairs multiple partial borders below
-    # the same full-width border.
-    deduped = []
-    ad_zones.sort(key=lambda a: (a["bbox"][1], a["col_span"],
-                                 a["bbox"][3] - a["bbox"][1]))
-    for ad in ad_zones:
-        # Check if this ad is contained within an existing one
-        contained = False
-        for existing in deduped:
-            eb = existing["bbox"]
-            ab = ad["bbox"]
-            # Same or overlapping start, one contains the other
-            if (ab[0] >= eb[0] and ab[2] <= eb[2] and
-                    ab[1] >= eb[1] and ab[3] <= eb[3]):
-                contained = True
-                break
-            # Same start, same cols, different height — keep smaller
-            if (ab[1] == eb[1] and ad["col_span"] == existing["col_span"]):
-                contained = True
-                break
-        if not contained:
-            # Also remove any existing ads that this one contains
-            deduped = [e for e in deduped if not (
-                e["bbox"][0] >= ad["bbox"][0] and
-                e["bbox"][2] <= ad["bbox"][2] and
-                e["bbox"][1] >= ad["bbox"][1] and
-                e["bbox"][3] <= ad["bbox"][3])]
-            deduped.append(ad)
-
-    # Merge adjacent ads: ads are typically butted against each other.
-    # If two ads in the same (or overlapping) columns are separated by
-    # a small gap (< 50px ≈ 1-10 lines of text), merge them into one.
-    # This also catches borders that were incorrectly detected within
-    # a single continuous ad.
+    # Merge vertically adjacent ads: ads butt against each other
+    # vertically within the same columns.  If two ads in the same
+    # column span are separated by < 50px, merge them.
     merge_gap = max(50, ch * 4 // 100)
-    deduped.sort(key=lambda a: (a["col_span"], a["bbox"][1]))
+    ad_zones.sort(key=lambda a: (a["col_span"], a["bbox"][1]))
     merged_ads = []
-    for ad in deduped:
+    for ad in ad_zones:
         merged = False
         for i, existing in enumerate(merged_ads):
-            # Same column span and small vertical gap?
             if ad["col_span"] == existing["col_span"]:
                 eg = existing["bbox"]
                 ag = ad["bbox"]
-                gap = ag[1] - eg[3]  # top of new - bottom of existing
-                if 0 <= gap <= merge_gap:
-                    # Merge: extend existing ad downward
+                gap = ag[1] - eg[3]
+                if -5 <= gap <= merge_gap:
                     merged_ads[i] = {
                         "type": "ad",
-                        "bbox": (eg[0], eg[1], eg[2], ag[3]),
+                        "bbox": (eg[0], eg[1], eg[2], max(eg[3], ag[3])),
                         "col_span": existing["col_span"],
                     }
                     merged = True
