@@ -133,12 +133,20 @@ except ImportError:
 try:
     # iopath (used by LayoutParser/Detectron2) has a Windows bug where
     # cached URLs contain '?' which is invalid in Windows filenames.
-    # Fix: set FVCORE_CACHE to a clean directory before importing.
-    if sys.platform == "win32" and "FVCORE_CACHE" not in os.environ:
-        _lp_cache = os.path.join(os.path.expanduser("~"),
-                                  ".cache", "layoutparser")
-        os.makedirs(_lp_cache, exist_ok=True)
-        os.environ["FVCORE_CACHE"] = _lp_cache
+    # Fix: monkey-patch iopath's _get_local_path to sanitize filenames.
+    if sys.platform == "win32":
+        try:
+            import iopath.common.file_io as _iopath_fio
+            _orig_http_get_local = _iopath_fio.HTTPURLHandler._get_local_path
+            def _patched_http_get_local(self, path, **kwargs):
+                # Sanitize the cached filename by replacing invalid chars
+                import urllib.parse
+                parsed = urllib.parse.urlparse(path)
+                clean = parsed._replace(query="", fragment="").geturl()
+                return _orig_http_get_local(self, clean, **kwargs)
+            _iopath_fio.HTTPURLHandler._get_local_path = _patched_http_get_local
+        except Exception:
+            pass
     import layoutparser as lp
     HAS_LAYOUTPARSER = True
     _LP_MODEL = None   # lazy-loaded on first use
