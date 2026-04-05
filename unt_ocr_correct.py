@@ -877,6 +877,93 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
     return expected_cols, page_layouts
 
 
+def save_calibration(collection_dir: Path, ark_id: str,
+                     expected_cols: int, page_layouts: dict):
+    """
+    Save auto-detected layout as calibration.json for user review/correction.
+    The user can edit this file manually or use the GUI tool to adjust.
+    """
+    cal = {
+        "version": 1,
+        "calibrated_from": ark_id,
+        "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "expected_cols": expected_cols,
+        "tuning_params": {
+            "rule_line_threshold": 0.55,
+            "rule_line_contrast": 0.12,
+            "min_column_width": 80,
+            "prominence": 0.15,
+        },
+        "page_layouts": {},
+    }
+    for pg, layout in sorted(page_layouts.items()):
+        entry = {"user_corrected": False, "n_cols": layout["n_cols"]}
+        if layout.get("masthead"):
+            entry["masthead"] = list(layout["masthead"])
+        entry["columns"] = [list(c["bbox"]) for c in layout.get("columns", [])]
+        entry["gutter_xs"] = layout.get("gutter_xs", [])
+        rules = layout.get("rule_lines", {})
+        if rules:
+            entry["rule_lines_v"] = rules.get("vertical", [])
+            entry["rule_lines_h"] = rules.get("horizontal", [])
+        cal["page_layouts"][str(pg)] = entry
+
+    cal_path = collection_dir / "calibration.json"
+    cal_path.write_text(json.dumps(cal, indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8")
+    tprint(f"  Calibration saved → {cal_path}", level=1)
+    tprint(f"  Review overlay images in artifacts/layout/{ark_id}/ and edit", level=1)
+    tprint(f"  calibration.json to correct any wrong boundaries.", level=1)
+    return cal_path
+
+
+def load_calibration(collection_dir: Path) -> dict | None:
+    """Load calibration.json if it exists. Returns None if not found."""
+    cal_path = collection_dir / "calibration.json"
+    if not cal_path.exists():
+        return None
+    try:
+        cal = json.loads(cal_path.read_text(encoding="utf-8"))
+        tprint(f"  Calibration loaded from {cal_path} "
+               f"(calibrated from {cal.get('calibrated_from', '?')})", level=1)
+        return cal
+    except Exception as e:
+        tprint(f"  ⚠ Failed to load calibration: {e}", level=1)
+        return None
+
+
+def _layout_from_calibration(cal_page: dict, page_num: int,
+                              content_bounds: tuple) -> dict:
+    """Convert a calibration.json page entry back to a page_layout dict."""
+    left, top, right, bot = content_bounds
+    masthead = tuple(cal_page["masthead"]) if cal_page.get("masthead") else None
+    body_top = masthead[3] if masthead else top
+
+    columns = []
+    for i, bbox in enumerate(cal_page.get("columns", []), 1):
+        columns.append({"type": "column", "index": i, "bbox": tuple(bbox)})
+
+    zones = []
+    if masthead:
+        zones.append({"type": "masthead", "bbox": masthead})
+    zones.extend(columns)
+
+    return {
+        "page_num": page_num,
+        "content_bounds": content_bounds,
+        "rule_lines": {
+            "vertical": cal_page.get("rule_lines_v", []),
+            "horizontal": cal_page.get("rule_lines_h", []),
+        },
+        "gutter_xs": cal_page.get("gutter_xs", []),
+        "n_cols": cal_page.get("n_cols", len(columns)),
+        "masthead": masthead,
+        "body_top": body_top,
+        "columns": columns,
+        "zones": zones,
+    }
+
+
 # ============================================================================
 # STAGE 2 — PREPROCESSING
 # ============================================================================
@@ -2465,10 +2552,33 @@ def process_issue(issue, api_key, correction_prompt, delay,
     has_abbyy = axml is not None
 
     # ── Stage 0: Layout analysis ──────────────────────────────────────────
-    # Analyze all pages to determine column structure before any OCR.
+    # Check for calibration data first; if none, run auto-detection and save.
+    collection_dir = CORRECTED_DIR.parent
+    cal = load_calibration(collection_dir)
     pages_to_analyze = [pg for pg, needs_redo in pages_to_process if needs_redo]
-    expected_cols, page_layouts = analyze_issue_layout(
-        ark_id, pages_to_analyze, worker_id=worker_id)
+
+    if cal and cal.get("page_layouts"):
+        # Use calibrated layout data
+        expected_cols = cal.get("expected_cols", 5)
+        page_layouts = {}
+        for pg in pages_to_analyze:
+            pg_str = str(pg)
+            if pg_str in cal["page_layouts"]:
+                bounds = detect_content_bounds(
+                    cv2.imdecode(
+                        np.frombuffer(fetch_page_image(ark_id, pg)[0], np.uint8),
+                        cv2.IMREAD_GRAYSCALE))
+                page_layouts[pg] = _layout_from_calibration(
+                    cal["page_layouts"][pg_str], pg, bounds)
+            # Pages not in calibration will get auto-detected in process_page_local
+        tprint(f"  Using calibration: {expected_cols} cols, "
+               f"{len(page_layouts)} page layouts loaded",
+               worker=worker_id, level=1)
+    else:
+        # Auto-detect and save calibration for user review
+        expected_cols, page_layouts = analyze_issue_layout(
+            ark_id, pages_to_analyze, worker_id=worker_id)
+        save_calibration(collection_dir, ark_id, expected_cols, page_layouts)
 
     engines = ["Tesseract" if tess_lang else None,
                "Kraken" if HAS_KRAKEN else None,
