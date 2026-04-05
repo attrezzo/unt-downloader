@@ -1153,7 +1153,8 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
 
 def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
                         n_cols: int = 0,
-                        override_gutters: list = None) -> dict:
+                        override_gutters: list = None,
+                        lp_regions: list = None) -> dict:
     """
     Analyze a single page's layout by building a 2D grid from vertical
     column gutters and horizontal rule-line borders, then classifying
@@ -1211,14 +1212,14 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
         content_bounds, gutter_xs, n_cols, h_borders)
 
     # Step 5: Deep-learning layout detection (LayoutParser / Detectron2)
-    # When available, LP is the PRIMARY authority for zone boundaries.
-    # Geometric detection (steps 1-4) provides structural hints —
-    # column grid, rule lines — but the trained model's bbox predictions
-    # are more likely correct for content boundaries.
-    if HAS_LAYOUTPARSER:
+    # LP informs the geometric grid: it knows WHAT things are (ads, text,
+    # headlines) and approximately WHERE they are.  Geometric detection
+    # provides the precise column grid.  LP's ad bboxes get snapped to
+    # column edges.  LP's Table bbox constrains column y-extents.
+    if lp_regions is None and HAS_LAYOUTPARSER:
         lp_regions = _layoutparser_detect(img_gray)
-        if lp_regions:
-            zones = _merge_lp_zones(zones, lp_regions, content_bounds)
+    if lp_regions:
+        zones = _merge_lp_zones(zones, lp_regions, content_bounds)
 
     # Extract column zones for backward compat with OCR pipeline
     columns = [z for z in zones if z["type"] == "column"]
@@ -1571,18 +1572,30 @@ def _merge_lp_zones(zones: list, lp_regions: list,
 
         elif label in ("Advertisement",):
             if score >= 0.5:
-                # Find which columns this overlaps
-                col_indices = []
+                # LP knows it's an ad but doesn't know column edges.
+                # Snap the ad bbox to the geometric column grid: find
+                # which columns it overlaps and use THEIR x-boundaries.
+                # Ads always start/end on column edges.
+                col_matches = []
                 for z in new_zones:
                     if z["type"] != "column":
                         continue
                     zx1, _, zx2, _ = z["bbox"]
-                    if lx1 < zx2 and lx2 > zx1:
-                        col_indices.append(z.get("index", 1))
-                if col_indices:
+                    # Column overlaps if LP ad covers >30% of column width
+                    overlap = min(lx2, zx2) - max(lx1, zx1)
+                    if overlap > (zx2 - zx1) * 0.3:
+                        col_matches.append(z)
+                if col_matches:
+                    # Snap x to column grid edges
+                    snap_x1 = min(z["bbox"][0] for z in col_matches)
+                    snap_x2 = max(z["bbox"][2] for z in col_matches)
+                    col_indices = [z.get("index", 1)
+                                   for z in col_matches]
+                    # Keep LP's y-extents (it knows where the ad
+                    # starts/ends vertically)
                     new_zones.append({
                         "type": "ad",
-                        "bbox": (lx1, ly1, lx2, ly2),
+                        "bbox": (snap_x1, ly1, snap_x2, ly2),
                         "col_span": (min(col_indices),
                                      max(col_indices)),
                         "lp_score": score,
@@ -1697,6 +1710,49 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
                        worker=worker_id, level=4)
             page_images[pg] = (img_gray, new_bounds)
 
+    # ── LP pre-scan: run LayoutParser on a few pages to find the
+    #    content grid (Table detection) BEFORE geometric scoring.
+    #    LP's Table bbox tells us where columns actually are, which
+    #    constrains the geometric gutter search.
+    lp_content_bounds = None  # (left, top, right, bot) from LP Table
+    lp_page_regions = {}      # pg → list of LP detections
+    if HAS_LAYOUTPARSER:
+        for pg in list(page_images)[:min(3, len(page_images))]:
+            img_gray, bounds = page_images[pg]
+            regions = _layoutparser_detect(img_gray)
+            lp_page_regions[pg] = regions
+            for r in regions:
+                if r["label"] == "Table" and r["score"] >= 0.6:
+                    tb = r["bbox"]
+                    if lp_content_bounds is None:
+                        lp_content_bounds = tb
+                    else:
+                        # Union of all Table detections
+                        lp_content_bounds = (
+                            min(lp_content_bounds[0], tb[0]),
+                            min(lp_content_bounds[1], tb[1]),
+                            max(lp_content_bounds[2], tb[2]),
+                            max(lp_content_bounds[3], tb[3]),
+                        )
+        if lp_content_bounds:
+            tprint(f"  │  LP content grid: ({lp_content_bounds[0]},"
+                   f"{lp_content_bounds[1]})→({lp_content_bounds[2]},"
+                   f"{lp_content_bounds[3]})", worker=worker_id, level=3)
+            # Refine page bounds: LP's Table bbox is the authoritative
+            # content area.  Use it to constrain gutter scoring.
+            for pg in page_images:
+                img_gray, old_bounds = page_images[pg]
+                h, w = img_gray.shape
+                # LP constrains top/bottom but geometry constrains
+                # left/right (LP Table often spans full width)
+                new_bounds = (
+                    old_bounds[0],  # keep geometric left
+                    max(old_bounds[1], lp_content_bounds[1]),
+                    old_bounds[2],  # keep geometric right
+                    min(old_bounds[3], lp_content_bounds[3]),
+                )
+                page_images[pg] = (img_gray, new_bounds)
+
     # ── Pass 1: score column-count hypotheses ────────────────────────────
     cross_scores = {}  # N → list of (total_contrast, min_contrast) per page
 
@@ -1756,15 +1812,21 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
                worker=worker_id, level=3)
 
     # ── Pass 3: finalize layouts using median gutter positions ───────────
+    # Pass cached LP regions to avoid re-running inference on pre-scanned
+    # pages.  Run LP on remaining pages.
     page_layouts = {}
     for pg in pages_to_analyze:
         if pg not in page_images:
             continue
         img_gray, bounds = page_images[pg]
 
+        # Use cached LP regions if available, otherwise LP runs inside
+        cached_lp = lp_page_regions.get(pg)
+
         layout = analyze_page_layout(img_gray, pg, bounds,
                                      n_cols=expected_cols,
-                                     override_gutters=median_gutters)
+                                     override_gutters=median_gutters,
+                                     lp_regions=cached_lp)
         layout["skew_deg"] = skew_deg
         page_layouts[pg] = layout
 
