@@ -1210,9 +1210,11 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
     masthead, body_top, footer_top, zones = _build_page_zones(
         content_bounds, gutter_xs, n_cols, h_borders)
 
-    # Step 5: Optional deep-learning layout detection (LayoutParser)
-    # Supplements geometric zones with semantic labels (Advertisement,
-    # Headline, Figure, etc.) when available.
+    # Step 5: Deep-learning layout detection (LayoutParser / Detectron2)
+    # When available, LP is the PRIMARY authority for zone boundaries.
+    # Geometric detection (steps 1-4) provides structural hints —
+    # column grid, rule lines — but the trained model's bbox predictions
+    # are more likely correct for content boundaries.
     if HAS_LAYOUTPARSER:
         lp_regions = _layoutparser_detect(img_gray)
         if lp_regions:
@@ -1467,27 +1469,34 @@ def _layoutparser_detect(img_gray) -> list:
 def _merge_lp_zones(zones: list, lp_regions: list,
                     content_bounds: tuple) -> list:
     """
-    Merge LayoutParser / Detectron2 detections into existing geometric zones.
+    Merge LayoutParser / Detectron2 detections into geometric zones.
 
-    All LP labels can influence the final layout:
+    PHILOSOPHY: geometric detection (gutters, h_borders) provides
+    structural hints — column grid, rule lines.  The trained model
+    is the PRIMARY authority when available.  LP bbox predictions
+    OVERRIDE geometric boundaries because the model has learned what
+    real content regions look like, while geometry can be fooled by
+    artifacts, tattered edges, and noisy scans.
 
-      Text   — confirms column body regions; can refine column y-extents
-      Title  — identifies headline regions (may span columns)
-      Table  — in newspapers, a "table" detection often corresponds to
-               the columnar body grid; confirms content area boundaries
-      List   — treated like text (classified/notice sections)
-      Figure — image/illustration regions; added as figure zones
-      Advertisement — added as ad zones (Newspaper Navigator model)
-      Headline — added as headline zones (Newspaper Navigator model)
+    How each LP label affects the layout:
 
-    LP detections can:
-      1. ADD new zones (figures, ads from LP that geometry missed)
-      2. REFINE existing zone boundaries (if LP bbox is tighter)
-      3. CONFIRM zones (LP agrees with geometric detection)
+      Table  — PubLayNet sees newspaper column grids as "tables."
+               The Table bbox defines where actual printed content is.
+               ALL column zones are clipped to fit within it.
+               This is the highest-impact correction: it trims columns
+               that extend into artifact/tattered areas.
 
-    LP is a supplementary signal — geometric structure wins when they
-    disagree, but LP can expand coverage where geometry is blind
-    (e.g., detecting figures/images that have no geometric signature).
+      Text   — Confirms body content.  If LP Text extends BEYOND the
+               geometric columns, the columns are EXPANDED to include
+               the LP-detected content (LP found text that geometry missed).
+
+      Title/Headline — Added as headline zones.
+
+      List   — Treated like Text (classified/notice sections).
+
+      Figure/Photograph/Illustration — Added as figure zones.
+
+      Advertisement — Added as ad zones.
     """
     if not lp_regions:
         return zones
@@ -1495,43 +1504,89 @@ def _merge_lp_zones(zones: list, lp_regions: list,
     left, top, right, bot = content_bounds
     new_zones = list(zones)
 
-    def _find_overlapping_columns(lx1, ly1, lx2, ly2):
-        """Find column zones that overlap with an LP region."""
-        matches = []
-        for i, z in enumerate(new_zones):
-            if z["type"] != "column":
-                continue
-            zx1, zy1, zx2, zy2 = z["bbox"]
-            ox1, oy1 = max(lx1, zx1), max(ly1, zy1)
-            ox2, oy2 = min(lx2, zx2), min(ly2, zy2)
-            if ox1 < ox2 and oy1 < oy2:
-                matches.append((i, z, (ox1, oy1, ox2, oy2)))
-        return matches
+    # Sort LP regions by score (highest first) so high-confidence
+    # detections take priority.
+    lp_sorted = sorted(lp_regions, key=lambda r: -r["score"])
 
-    for lr in lp_regions:
+    for lr in lp_sorted:
         lx1, ly1, lx2, ly2 = lr["bbox"]
         label = lr["label"]
         score = lr["score"]
 
         if score < 0.4:
-            continue  # low confidence — skip
+            continue
 
-        if label in ("Advertisement",):
-            # Ad detected by LP — add as ad zone clipped to columns
-            overlaps = _find_overlapping_columns(lx1, ly1, lx2, ly2)
-            if overlaps and score >= 0.6:
-                col_indices = [z.get("index", 1) for _, z, _ in overlaps]
-                # Use the union of overlapping column x-bounds
-                ox1 = min(o[0] for _, _, o in overlaps)
-                oy1 = min(o[1] for _, _, o in overlaps)
-                ox2 = max(o[2] for _, _, o in overlaps)
-                oy2 = max(o[3] for _, _, o in overlaps)
-                new_zones.append({
-                    "type": "ad",
-                    "bbox": (ox1, oy1, ox2, oy2),
-                    "col_span": (min(col_indices), max(col_indices)),
-                    "lp_score": score,
-                })
+        if label in ("Table",):
+            # Table = the column grid.  LP's bbox is the authoritative
+            # content boundary.  Clip ALL column zones to fit within it.
+            if score >= 0.6:
+                for i, z in enumerate(new_zones):
+                    if z["type"] != "column":
+                        continue
+                    zx1, zy1, zx2, zy2 = z["bbox"]
+                    # Clip column vertically to Table bbox
+                    new_top = max(zy1, ly1)
+                    new_bot = min(zy2, ly2)
+                    if new_top < new_bot:
+                        new_zones[i] = dict(z)
+                        new_zones[i]["bbox"] = (zx1, new_top, zx2, new_bot)
+                # Also clip masthead: if Table starts below masthead
+                # bottom, masthead is confirmed.  If Table starts above
+                # masthead, masthead may be wrong — but we keep it.
+                tprint(f"      LP Table (score={score:.2f}): columns "
+                       f"clipped to y={ly1}→{ly2}", level=4)
+
+        elif label in ("Text", "List"):
+            # LP found text/list content.  If it extends beyond any
+            # column zone, EXPAND that column to include the LP content
+            # (LP detected real text that geometry missed).
+            if score >= 0.5:
+                for i, z in enumerate(new_zones):
+                    if z["type"] != "column":
+                        continue
+                    zx1, zy1, zx2, zy2 = z["bbox"]
+                    # Check horizontal overlap (same column?)
+                    if lx1 < zx2 and lx2 > zx1:
+                        # Expand vertically if LP extends beyond
+                        expanded = False
+                        new_y1 = min(zy1, ly1) if ly1 < zy1 else zy1
+                        new_y2 = max(zy2, ly2) if ly2 > zy2 else zy2
+                        if new_y1 != zy1 or new_y2 != zy2:
+                            new_zones[i] = dict(z)
+                            new_zones[i]["bbox"] = (zx1, new_y1,
+                                                     zx2, new_y2)
+
+        elif label in ("Title", "Headline"):
+            if score >= 0.5 and (ly2 - ly1) > 15:
+                is_masthead = any(
+                    z["type"] == "masthead"
+                    and ly1 >= z["bbox"][1] and ly2 <= z["bbox"][3]
+                    for z in new_zones)
+                if not is_masthead:
+                    new_zones.append({
+                        "type": "headline",
+                        "bbox": (lx1, ly1, lx2, ly2),
+                        "lp_score": score,
+                    })
+
+        elif label in ("Advertisement",):
+            if score >= 0.5:
+                # Find which columns this overlaps
+                col_indices = []
+                for z in new_zones:
+                    if z["type"] != "column":
+                        continue
+                    zx1, _, zx2, _ = z["bbox"]
+                    if lx1 < zx2 and lx2 > zx1:
+                        col_indices.append(z.get("index", 1))
+                if col_indices:
+                    new_zones.append({
+                        "type": "ad",
+                        "bbox": (lx1, ly1, lx2, ly2),
+                        "col_span": (min(col_indices),
+                                     max(col_indices)),
+                        "lp_score": score,
+                    })
 
         elif label in ("Figure", "Photograph", "Illustration",
                         "Map", "Comic", "Editorial_Cartoon"):
@@ -1543,53 +1598,9 @@ def _merge_lp_zones(zones: list, lp_regions: list,
                     "lp_score": score,
                 })
 
-        elif label in ("Title", "Headline"):
-            # Title/headline — tag as a headline zone if it's large enough
-            # and doesn't just duplicate an existing masthead
-            h = ly2 - ly1
-            if score >= 0.5 and h > 15:
-                # Check it's not inside the existing masthead
-                is_masthead = any(z["type"] == "masthead" and
-                                  ly1 >= z["bbox"][1] and ly2 <= z["bbox"][3]
-                                  for z in new_zones)
-                if not is_masthead:
-                    new_zones.append({
-                        "type": "headline",
-                        "bbox": (lx1, ly1, lx2, ly2),
-                        "lp_score": score,
-                    })
-
-        elif label in ("Table",):
-            # "Table" on a newspaper often means the detector sees the
-            # column grid as a table.  Use its bbox to CONFIRM or REFINE
-            # the content area — if the Table bbox is tighter than our
-            # detected content bounds, it may indicate where the actual
-            # printed content is vs scanning artifacts.
-            if score >= 0.7:
-                for i, z in enumerate(new_zones):
-                    if z["type"] != "column":
-                        continue
-                    zx1, zy1, zx2, zy2 = z["bbox"]
-                    # If LP Table top is below our column top, the area
-                    # above might be blank/artifact — tighten the column
-                    if ly1 > zy1 + 20 and ly1 < zy1 + (zy2 - zy1) // 4:
-                        new_zones[i] = dict(z)
-                        new_zones[i]["bbox"] = (zx1, ly1, zx2, zy2)
-                    # Same for bottom
-                    if ly2 < zy2 - 20 and ly2 > zy2 - (zy2 - zy1) // 4:
-                        new_zones[i] = dict(z)
-                        b = new_zones[i]["bbox"]
-                        new_zones[i]["bbox"] = (b[0], b[1], b[2], ly2)
-
-        elif label in ("Text", "List"):
-            # Text/List confirms body content regions.  If an LP Text
-            # region extends beyond our detected columns (e.g., into a
-            # tattered edge), it confirms there IS content there.
-            # No zone added — this is confirmation, not a new zone.
-            pass
-
-    tprint(f"      LP merge: {len(new_zones) - len(zones)} zones "
-           f"added/modified from {len(lp_regions)} LP regions", level=4)
+    n_changed = len(new_zones) - len(zones)
+    tprint(f"      LP merge: {n_changed} zones added, "
+           f"{len(lp_regions)} LP regions processed", level=4)
     return new_zones
 
 
