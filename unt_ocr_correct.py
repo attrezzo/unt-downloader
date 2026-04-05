@@ -2582,8 +2582,24 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     all_disputes     = []
     engines_used     = set()
 
+    # Buffer: extend each column crop by ~2-3 characters on each side.
+    # Characters that straddle the gutter get cut off without this.
+    # At typical scan resolutions (~150px per column), a character is
+    # ~8-12px wide, so 20px catches 2-3 extra characters.  The alignment
+    # and arbitration steps naturally filter orphan characters that don't
+    # fit the text flow.
+    col_buffer = 20
+    h_img = enhanced.shape[0]
+    w_img = enhanced.shape[1]
+
     for col_idx, (cx1, cx2) in enumerate(final_cols, 1):
-        strip = enhanced[top:bot, cx1:cx2]
+        # Crop with buffer (clamped to image bounds)
+        buf_x1 = max(0, cx1 - col_buffer)
+        buf_x2 = min(w_img, cx2 + col_buffer)
+        strip = enhanced[top:bot, buf_x1:buf_x2]
+        # Offset from buffer start to actual column start (for coord mapping)
+        buf_offset = cx1 - buf_x1
+
         if strip.shape[1] < 50:
             tprint(f"      col {col_idx}: too narrow ({strip.shape[1]}px), skipping", level=4)
             continue
@@ -2628,9 +2644,11 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
                 tprint(f"          ... and {len(dis)-3} more disputes", level=5)
 
         for d in dis:
-            d["page_left"]   = d["left"]   + cx1
+            # Map from buffered-strip coords to page coords.
+            # buf_x1 is the left edge of the buffered strip in page coords.
+            d["page_left"]   = d["left"]   + buf_x1
             d["page_top"]    = d["top"]    + top
-            d["page_right"]  = d.get("right",  d["left"] + 30) + cx1
+            d["page_right"]  = d.get("right",  d["left"] + 30) + buf_x1
             d["page_bottom"] = d.get("bottom", d["top"]  + 20) + top
             d["column"]      = col_idx
 
