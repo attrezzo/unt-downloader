@@ -204,6 +204,8 @@ TESS_PSM_A = "--psm 6 --oem 1 --dpi 300"      # uniform text block
 TESS_PSM_B = "--psm 4 --oem 1 --dpi 300"      # single column
 TESS_LANG_PRIORITY = ["deu_frak+deu", "deu_frak", "deu", "eng"]
 CLAUDE_MODEL = "claude-sonnet-4-6"             # overridden by collection.json
+CROP_BUFFER_PX = 20                            # ±px overlap on column crops
+CALIBRATION_VERSION = 2                        # bump to invalidate stale cache
 
 # unt_translate.py
 BUDGET_EXCEEDED_PREFIX = "[BUDGET EXCEEDED: PAGE "
@@ -240,9 +242,10 @@ Every engine returns `list[dict]`. Alignment accepts any mix automatically.
 
 | Stage | Function(s) | What it does |
 |-------|-------------|-------------|
+| 0 Layout | `analyze_issue_layout()` → (n_cols, page_layouts) | **Runs once per issue.** Three-pass: (0) deskew from rule-line angles, (1) score N=3..8 column hypotheses via gutter-pattern profile (whitespace-rule-whitespace), cross-page consensus picks N, (2) cross-page median gutter positions, per-page horizontal border detection → 2D grid zones (masthead, column, ad, footer). Optional LayoutParser/Detectron2 deep-learning region detection when installed. |
 | 1 ABBYY | `parse_abbyy_page(xml, page_index)` → (tokens, blocks) | Parse legacy XML. Called in `process_issue()`, passed in. |
-| 2 Preprocess | `preprocess_image(img_gray)` → enhanced | CLAHE(2.5, 8×8) + medianBlur(3). Swap: deskew, Sauvola. |
-| 3 Layout | `detect_content_bounds()` → (l,t,r,b); `detect_columns_from_image()` → [(x1,x2),...] | Trim borders (thresh=60). Bottom-30% vertical projection, find_peaks. |
+| 2 Preprocess | `preprocess_image(img_gray)` → enhanced | CLAHE(2.5, 8×8) + medianBlur(3) + deskew if layout detected skew. |
+| 3 Layout | Uses pre-analyzed layout from Stage 0. Fallback: `detect_columns_from_image()`. | Column strips cropped with ±`CROP_BUFFER_PX` (20px ≈ 2-3 chars) overlap to catch boundary-straddling text. |
 | 4 Boundary | `compare_boundaries(opencv_cols, abbyy_gutters, snap_tolerance=20, expected_cols)` | 3-pass: snap→insert→prune. Only when ABBYY present. |
 | 5 Tesseract | `tesseract_tokens(col_img, lang, config, tag)` × 2 passes | PSM-6 + PSM-4. `image_to_data` for per-word conf+bbox. conf<10 → ILLEGIBLE. |
 | 6 Kraken | `kraken_tokens(col_img)` | Optional. Lazy-loads model. Returns [] on error. |
@@ -321,6 +324,7 @@ pip install requests pytesseract opencv-python-headless pillow scipy numpy repor
 apt-get install tesseract-ocr tesseract-ocr-deu
 # Better Fraktur: wget tessdata_best/deu.traineddata → /usr/share/tesseract-ocr/5/tessdata/
 # Optional: pip install kraken && kraken models download 10.0.0
+# Optional (GPU recommended): pip install layoutparser torchvision detectron2
 # ABBYY XML: request from ana.krahmer@unt.edu, place in {collection}/abbyy/
 ```
 

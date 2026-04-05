@@ -131,6 +131,13 @@ except ImportError:
     HAS_KRAKEN = False
 
 try:
+    import layoutparser as lp
+    HAS_LAYOUTPARSER = True
+    _LP_MODEL = None   # lazy-loaded on first use
+except ImportError:
+    HAS_LAYOUTPARSER = False
+
+try:
     from claude_rate_limiter import ClaudeRateLimiter, limiter_from_tier
 except ImportError:
     ClaudeRateLimiter = None
@@ -149,6 +156,11 @@ TESS_LANG_PRIORITY = ["deu_frak+deu", "deu_frak", "deu", "eng"]
 TESS_PSM_A = "--psm 6 --oem 1 --dpi 300"   # uniform text block
 TESS_PSM_B = "--psm 4 --oem 1 --dpi 300"   # single column of text
 TESS_CONF_MIN = 40    # below this = disputed regardless of agreement
+
+# Buffer added to each side of cropped regions (columns, ads, etc.)
+# before OCR.  ~2-3 characters of overlap catches text that straddles
+# zone boundaries.  The alignment/arbitration steps filter orphans.
+CROP_BUFFER_PX = 20
 
 # The single canonical unintelligible marker — used by every source
 ILLEGIBLE = "[unleserlich]"
@@ -387,6 +399,7 @@ ZONE_COLORS = {
     "column":    (100, 200, 100),   # green
     "ad":        (100, 100, 255),   # blue
     "footer":    (200, 100, 200),   # purple
+    "figure":    (255, 200, 0),     # orange
     "separator": (200, 200, 0),     # yellow
     "unknown":   (180, 180, 180),   # gray
 }
@@ -999,38 +1012,36 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
     ad_zones = []
     used = set()  # indices into all_borders
 
-    # Phase 1: partial borders paired with full-width border above
-    for i, b in enumerate(all_borders):
-        if b["full_width"] or b["y"] < body_top or b["y"] > footer_top:
-            continue
-        # Find nearest full-width border ABOVE
-        above_fw = None
-        for j in range(i - 1, -1, -1):
-            ab = all_borders[j]
-            if ab["full_width"] and ab["y"] >= top:
-                above_fw = ab
-                break
-        if above_fw is None and masthead:
-            above_fw = {"y": body_top, "full_width": True}
-        if above_fw:
-            gap = b["y"] - above_fw["y"]
-            # Only create an ad if:
-            # - spans fewer than all columns
-            # - the gap is moderate (not too large = normal column text
-            #   between section breaks; max ~35% of page height)
+    # Phase 1: partial borders paired with the masthead bottom.
+    # Catches ads that start immediately below the masthead (e.g.,
+    # "Der Deutsche Tag!" spanning cols 4-6 on page 1).
+    #
+    # Guard: the ad must NOT start at column 1.  A partial border
+    # starting at col 1 that pairs with the masthead would cover
+    # the entire left portion of the page — that's article text,
+    # not an ad.  Real masthead-adjacent ads start at interior columns.
+    if masthead:
+        for i, b in enumerate(all_borders):
+            if b["full_width"] or b["y"] <= body_top or b["y"] > footer_top:
+                continue
+            gap = b["y"] - body_top
             n_span = b["col_end"] - b["col_start"] + 1
-            if 30 < gap < ch * 35 // 100 and n_span < n_cols:
+            if (30 < gap < ch * 40 // 100
+                    and n_span < n_cols
+                    and b["col_start"] > 1):
                 cs, ce = b["col_start"], b["col_end"]
-                x1 = col_bounds[cs - 1]
-                x2 = col_bounds[ce]
+                x1, x2 = col_bounds[cs - 1], col_bounds[ce]
                 ad_zones.append({
                     "type": "ad",
-                    "bbox": (x1, above_fw["y"], x2, b["y"]),
+                    "bbox": (x1, body_top, x2, b["y"]),
                     "col_span": (cs, ce),
                 })
                 used.add(i)
 
-    # Phase 2: pair remaining partial borders with overlapping col spans
+    # Phase 2: pair remaining partial borders with MATCHING col spans.
+    # Require that the top and bottom borders span the same columns
+    # (within 1 column tolerance).  This prevents section-break rules
+    # (which span varying widths) from being paired as ad boxes.
     partial_idxs = [i for i, b in enumerate(all_borders)
                     if not b["full_width"] and i not in used
                     and body_top <= b["y"] <= footer_top]
@@ -1043,10 +1054,22 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
             if j in used:
                 continue
             b_bot = all_borders[j]
+            # Require exact matching span: both borders must cover the
+            # same columns.  Section-break rules have ragged detection
+            # that spans different column counts; real ad boxes have
+            # precise, consistent top and bottom borders.
+            start_match = b_top["col_start"] == b_bot["col_start"]
+            end_match = b_top["col_end"] == b_bot["col_end"]
             span_lo = max(b_top["col_start"], b_bot["col_start"])
             span_hi = min(b_top["col_end"], b_bot["col_end"])
             gap = b_bot["y"] - b_top["y"]
-            if span_lo <= span_hi and 15 < gap < ch // 2:
+            # Also reject if there's a full-width border between the
+            # top and bottom — that indicates a section break, meaning
+            # the two partial borders bound different content regions.
+            fw_between = any(fb["y"] > b_top["y"] and fb["y"] < b_bot["y"]
+                             for fb in fw_borders)
+            if (start_match and end_match and span_lo <= span_hi
+                    and 15 < gap < ch // 2 and not fw_between):
                 x1 = col_bounds[span_lo - 1]
                 x2 = col_bounds[span_hi]
                 ad_zones.append({
@@ -1057,6 +1080,12 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
                 used.add(i)
                 used.add(j)
                 break
+
+    # Filter: minimum ad height (5% of page height).  Tiny "ads"
+    # are usually just pairs of nearby section-break rules.
+    min_ad_h = max(40, ch * 5 // 100)
+    ad_zones = [a for a in ad_zones
+                if a["bbox"][3] - a["bbox"][1] >= min_ad_h]
 
     # Deduplicate overlapping ads: when multiple ads share the same
     # starting y and column span, keep only the tightest (smallest area).
@@ -1089,7 +1118,35 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
                 e["bbox"][3] <= ad["bbox"][3])]
             deduped.append(ad)
 
-    zones.extend(deduped)
+    # Merge adjacent ads: ads are typically butted against each other.
+    # If two ads in the same (or overlapping) columns are separated by
+    # a small gap (< 50px ≈ 1-10 lines of text), merge them into one.
+    # This also catches borders that were incorrectly detected within
+    # a single continuous ad.
+    merge_gap = max(50, ch * 4 // 100)
+    deduped.sort(key=lambda a: (a["col_span"], a["bbox"][1]))
+    merged_ads = []
+    for ad in deduped:
+        merged = False
+        for i, existing in enumerate(merged_ads):
+            # Same column span and small vertical gap?
+            if ad["col_span"] == existing["col_span"]:
+                eg = existing["bbox"]
+                ag = ad["bbox"]
+                gap = ag[1] - eg[3]  # top of new - bottom of existing
+                if 0 <= gap <= merge_gap:
+                    # Merge: extend existing ad downward
+                    merged_ads[i] = {
+                        "type": "ad",
+                        "bbox": (eg[0], eg[1], eg[2], ag[3]),
+                        "col_span": existing["col_span"],
+                    }
+                    merged = True
+                    break
+        if not merged:
+            merged_ads.append(ad)
+
+    zones.extend(merged_ads)
 
     # Column zones (body columns between masthead and footer)
     for ci in range(n_cols):
@@ -1170,6 +1227,14 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
     # Step 4: Build zones from the perpendicular grid
     masthead, body_top, footer_top, zones = _build_page_zones(
         content_bounds, gutter_xs, n_cols, h_borders)
+
+    # Step 5: Optional deep-learning layout detection (LayoutParser)
+    # Supplements geometric zones with semantic labels (Advertisement,
+    # Headline, Figure, etc.) when available.
+    if HAS_LAYOUTPARSER:
+        lp_regions = _layoutparser_detect(img_gray)
+        if lp_regions:
+            zones = _merge_lp_zones(zones, lp_regions, content_bounds)
 
     # Extract column zones for backward compat with OCR pipeline
     columns = [z for z in zones if z["type"] == "column"]
@@ -1257,6 +1322,157 @@ def render_layout_overlay(img_gray, layout: dict, page_num: int) -> bytes:
 
     _, png = cv2.imencode(".png", overlay)
     return png.tobytes()
+
+
+# ============================================================================
+# OPTIONAL: LayoutParser / Detectron2 deep-learning layout detection
+# ============================================================================
+# When installed (pip install layoutparser torchvision detectron2), provides
+# CNN-based region detection (Faster/Mask R-CNN trained on PubLayNet or
+# Newspaper Navigator) as an additional signal for zone classification.
+#
+# Integration philosophy: same as Kraken — try-import, lazy-load model,
+# return [] on error.  LayoutParser provides region-level boxes with labels
+# (Text, Title, Table, Figure, List) that SUPPLEMENT our geometric detection,
+# not replace it.  The geometric pipeline (gutters, h_borders, gutter-pattern)
+# is the primary structure; LayoutParser adds semantic labels.
+#
+# Setup:
+#   pip install layoutparser torchvision
+#   pip install 'git+https://github.com/facebookresearch/detectron2.git'
+#   # Or for Newspaper Navigator model:
+#   pip install layoutparser[detectron2]
+
+def _layoutparser_detect(img_gray) -> list:
+    """
+    Run LayoutParser detection on a page image.
+
+    Returns list of dicts:
+      {bbox: (x1, y1, x2, y2), label: str, score: float}
+
+    Labels depend on the model (PubLayNet: Text/Title/List/Table/Figure;
+    Newspaper Navigator: Headline/Advertisement/Illustration/...).
+
+    Returns [] if LayoutParser is not installed or detection fails.
+    """
+    global _LP_MODEL
+    if not HAS_LAYOUTPARSER:
+        return []
+    try:
+        if _LP_MODEL is None:
+            # Try Newspaper Navigator model first (better for newspapers),
+            # fall back to PubLayNet (more general)
+            for config in [
+                "lp://NewspaperNavigator/faster_rcnn_R_50_FPN_3x/config",
+                "lp://PubLayNet/mask_rcnn_R_50_FPN_3x/config",
+            ]:
+                try:
+                    label_map = {0: "Text", 1: "Title", 2: "List",
+                                 3: "Table", 4: "Figure"}
+                    if "NewspaperNavigator" in config:
+                        label_map = {
+                            0: "Photograph", 1: "Illustration",
+                            2: "Map", 3: "Comic", 4: "Editorial_Cartoon",
+                            5: "Headline", 6: "Advertisement",
+                        }
+                    _LP_MODEL = lp.Detectron2LayoutModel(
+                        config_path=config,
+                        label_map=label_map,
+                        extra_config=[
+                            "MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
+                    )
+                    tprint(f"  LayoutParser model loaded: {config}", level=1)
+                    break
+                except Exception:
+                    continue
+            if _LP_MODEL is None:
+                tprint("  ⚠ LayoutParser: no model could be loaded", level=1)
+                return []
+
+        # Convert grayscale to RGB (LayoutParser expects color)
+        if len(img_gray.shape) == 2:
+            img_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
+        else:
+            img_rgb = img_gray
+
+        layout = _LP_MODEL.detect(img_rgb)
+        results = []
+        for block in layout:
+            x1, y1, x2, y2 = map(int, block.coordinates)
+            results.append({
+                "bbox": (x1, y1, x2, y2),
+                "label": block.type,
+                "score": float(block.score),
+            })
+        tprint(f"      LayoutParser: {len(results)} regions detected", level=3)
+        return results
+    except Exception as e:
+        tprint(f"      ⚠ LayoutParser error: {e}", level=2)
+        return []
+
+
+def _merge_lp_zones(zones: list, lp_regions: list,
+                    content_bounds: tuple) -> list:
+    """
+    Merge LayoutParser detections into existing geometric zones.
+
+    Strategy:
+      - LP "Advertisement" regions → if they overlap a column zone,
+        split that column zone and insert an ad zone.
+      - LP "Headline"/"Title" regions → tag overlapping zones.
+      - LP "Figure"/"Photograph"/"Illustration" → add as image zones.
+
+    This is a soft merge: LP provides labels/confidence, geometric
+    detection provides precise boundaries.  When they agree, confidence
+    is high.  When they disagree, the geometric structure wins (LP
+    models may not be trained on this specific newspaper style).
+    """
+    if not lp_regions:
+        return zones
+
+    left, top, right, bot = content_bounds
+    new_zones = list(zones)
+
+    for lr in lp_regions:
+        lx1, ly1, lx2, ly2 = lr["bbox"]
+        label = lr["label"]
+        score = lr["score"]
+
+        if label in ("Advertisement",) and score >= 0.6:
+            # Check if this overlaps with any column zone
+            for i, z in enumerate(new_zones):
+                if z["type"] != "column":
+                    continue
+                zx1, zy1, zx2, zy2 = z["bbox"]
+                # Compute overlap
+                ox1 = max(lx1, zx1)
+                oy1 = max(ly1, zy1)
+                ox2 = min(lx2, zx2)
+                oy2 = min(ly2, zy2)
+                if ox1 < ox2 and oy1 < oy2:
+                    overlap_area = (ox2 - ox1) * (oy2 - oy1)
+                    lp_area = (lx2 - lx1) * (ly2 - ly1)
+                    if overlap_area > lp_area * 0.3:
+                        # Significant overlap — add as ad zone
+                        new_zones.append({
+                            "type": "ad",
+                            "bbox": (ox1, oy1, ox2, oy2),
+                            "col_span": (z.get("index", 1),
+                                         z.get("index", 1)),
+                            "lp_score": score,
+                        })
+
+        elif label in ("Figure", "Photograph", "Illustration",
+                        "Map", "Comic", "Editorial_Cartoon"):
+            if score >= 0.5:
+                new_zones.append({
+                    "type": "figure",
+                    "bbox": lr["bbox"],
+                    "lp_label": label,
+                    "lp_score": score,
+                })
+
+    return new_zones
 
 
 def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
@@ -1556,19 +1772,61 @@ def preprocess_image(img_gray):
 
 
 def detect_content_bounds(img_gray):
-    """Trim dark microfilm borders. Returns (left, top, right, bottom)."""
+    """
+    Trim dark microfilm borders and torn/tattered edges.
+    Returns (left, top, right, bottom).
+
+    Uses a sustained-brightness approach: the content edge is where
+    the column/row mean brightness first stays above threshold for
+    a run of consecutive pixels (not just the first bright pixel).
+    This avoids tattered edges where brightness fluctuates before
+    the actual printed content begins.
+    """
     if not HAS_CV2:
         h, w = img_gray.shape
         return int(w*.05), int(h*.02), int(w*.97), int(h*.98)
-    h, w  = img_gray.shape
+    h, w = img_gray.shape
     _, bw = cv2.threshold(img_gray, 60, 255, cv2.THRESH_BINARY)
-    cl    = np.mean(bw, axis=0)
-    rl    = np.mean(bw, axis=1)
-    left  = int(np.argmax(cl > 120)) + 5
-    right = int(w - np.argmax((cl > 120)[::-1])) - 5
-    top   = int(np.argmax(rl > 120)) + 5
-    bot   = int(h - np.argmax((rl > 120)[::-1])) - 5
-    return max(0,left), max(0,top), min(w,right), min(h,bot)
+
+    # Use the MIDDLE 50% of the page for column brightness (avoids
+    # masthead/footer regions that can mask torn edges).
+    mid_top = h * 25 // 100
+    mid_bot = h * 75 // 100
+    cl = np.mean(bw[mid_top:mid_bot, :], axis=0)
+
+    # Use the MIDDLE 50% for row brightness (avoids left/right edge)
+    mid_left = w * 15 // 100
+    mid_right = w * 85 // 100
+    rl = np.mean(bw[:, mid_left:mid_right], axis=1)
+
+    # Find where brightness sustains above threshold for ≥8 consecutive
+    # columns/rows.  On torn edges, brightness flickers in and out;
+    # real content has sustained brightness.
+    threshold = 140
+    run_needed = 8
+
+    def _find_sustained(profile, forward=True):
+        n = len(profile)
+        rng = range(n) if forward else range(n - 1, -1, -1)
+        run = 0
+        for i in rng:
+            if profile[i] > threshold:
+                run += 1
+                if run >= run_needed:
+                    return i - (run_needed - 1) if forward else i + (run_needed - 1)
+            else:
+                run = 0
+        # Fallback: first bright pixel
+        for i in rng:
+            if profile[i] > 120:
+                return i
+        return 0 if forward else n - 1
+
+    left  = _find_sustained(cl, forward=True) + 3
+    right = _find_sustained(cl, forward=False) - 3
+    top   = _find_sustained(rl, forward=True) + 3
+    bot   = _find_sustained(rl, forward=False) - 3
+    return max(0, left), max(0, top), min(w, right), min(h, bot)
 
 
 # ============================================================================
@@ -2496,8 +2754,19 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     all_disputes     = []
     engines_used     = set()
 
+    # Buffer: extend each column crop by ~2-3 characters on each side.
+    # Characters straddling gutter boundaries get caught; the alignment
+    # and arbitration steps naturally filter orphan characters.
+    h_img, w_img = enhanced.shape[:2]
+
     for col_idx, (cx1, cx2) in enumerate(final_cols, 1):
-        strip = enhanced[top:bot, cx1:cx2]
+        # Crop with buffer (clamped to image bounds)
+        buf_x1 = max(0, cx1 - CROP_BUFFER_PX)
+        buf_x2 = min(w_img, cx2 + CROP_BUFFER_PX)
+        strip = enhanced[top:bot, buf_x1:buf_x2]
+        # Offset from buffer start to actual column start (for coord mapping)
+        buf_offset = cx1 - buf_x1
+
         if strip.shape[1] < 50:
             tprint(f"      col {col_idx}: too narrow ({strip.shape[1]}px), skipping", level=4)
             continue
@@ -2542,9 +2811,11 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
                 tprint(f"          ... and {len(dis)-3} more disputes", level=5)
 
         for d in dis:
-            d["page_left"]   = d["left"]   + cx1
+            # Map from buffered-strip coords to page coords.
+            # buf_x1 is the left edge of the buffered strip in page coords.
+            d["page_left"]   = d["left"]   + buf_x1
             d["page_top"]    = d["top"]    + top
-            d["page_right"]  = d.get("right",  d["left"] + 30) + cx1
+            d["page_right"]  = d.get("right",  d["left"] + 30) + buf_x1
             d["page_bottom"] = d.get("bottom", d["top"]  + 20) + top
             d["column"]      = col_idx
 
@@ -3425,6 +3696,7 @@ def check_deps() -> str:
         else:
             lines.append("  Tesseract : ✗  apt-get install tesseract-ocr")
     lines.append(f"  Kraken    : {'✓' if HAS_KRAKEN else '✗  pip install kraken  (optional)'}")
+    lines.append(f"  LayoutParser: {'✓' if HAS_LAYOUTPARSER else '✗  pip install layoutparser  (optional, GPU recommended)'}")
     n_abbyy = len(list(ABBYY_DIR.glob("*.xml"))) if ABBYY_DIR and ABBYY_DIR.exists() else 0
     lines.append(f"  ABBYY XML : {n_abbyy} file(s) in abbyy/  "
                  f"{'(will use as one source)' if n_abbyy else '(optional — contact ana.krahmer@unt.edu)'}")
