@@ -434,6 +434,7 @@ ZONE_COLORS = {
     "ad":        (100, 100, 255),   # blue
     "footer":    (200, 100, 200),   # purple
     "figure":    (255, 200, 0),     # orange
+    "headline":  (0, 200, 255),     # cyan
     "separator": (200, 200, 0),     # yellow
     "unknown":   (180, 180, 180),   # gray
 }
@@ -1033,146 +1034,93 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
         })
 
     # Ad zones from horizontal borders.
-    # An ad is bounded by a top border and a bottom border that share
-    # column span (overlap).  Borders can be full-width or partial.
     #
-    # Two-phase strategy (order matters):
-    #   Phase 1: Pair partial borders with a full-width border above.
-    #            This catches ads that start at a section boundary
-    #            (masthead bottom, section break).  Run first because
-    #            these are higher-confidence pairings.
-    #   Phase 2: Pair remaining partial borders with overlapping col spans.
-    all_borders = sorted(fw_borders + partial_borders, key=lambda b: b["y"])
+    # Key insight: ads stack VERTICALLY within columns (or 1-2 column
+    # spans), butted against each other.  The column next to an ad
+    # column is typically body text.  Ads are bounded top and bottom by
+    # horizontal rule lines and sit within the column grid.
+    #
+    # Strategy: for each horizontal border, check if it spans a small
+    # number of columns (1-2) — these are ad boundaries.  Pair borders
+    # that share the same column span to form ad rectangles.  Then
+    # merge vertically adjacent ads (butted against each other).
+    #
+    # Also detect ads that start at the masthead bottom (like
+    # "Der Deutsche Tag!" on page 1).
     ad_zones = []
-    used = set()  # indices into all_borders
 
-    # Phase 1: partial borders paired with the masthead bottom.
-    # Catches ads that start immediately below the masthead (e.g.,
-    # "Der Deutsche Tag!" spanning cols 4-6 on page 1).
-    #
-    # Guard: the ad must NOT start at column 1.  A partial border
-    # starting at col 1 that pairs with the masthead would cover
-    # the entire left portion of the page — that's article text,
-    # not an ad.  Real masthead-adjacent ads start at interior columns.
+    # Phase 1: masthead-anchored ads (start at masthead bottom,
+    # end at a partial border).  Must not start at column 1.
     if masthead:
-        for i, b in enumerate(all_borders):
-            if b["full_width"] or b["y"] <= body_top or b["y"] > footer_top:
+        for b in partial_borders:
+            if b["y"] <= body_top or b["y"] > footer_top:
                 continue
             gap = b["y"] - body_top
             n_span = b["col_end"] - b["col_start"] + 1
             if (30 < gap < ch * 40 // 100
-                    and n_span < n_cols
-                    and b["col_start"] > 1):
+                    and n_span <= 3 and b["col_start"] > 1):
                 cs, ce = b["col_start"], b["col_end"]
-                x1, x2 = col_bounds[cs - 1], col_bounds[ce]
                 ad_zones.append({
                     "type": "ad",
-                    "bbox": (x1, body_top, x2, b["y"]),
+                    "bbox": (col_bounds[cs - 1], body_top,
+                             col_bounds[ce], b["y"]),
                     "col_span": (cs, ce),
                 })
-                used.add(i)
 
-    # Phase 2: pair remaining partial borders with MATCHING col spans.
-    # Require that the top and bottom borders span the same columns
-    # (within 1 column tolerance).  This prevents section-break rules
-    # (which span varying widths) from being paired as ad boxes.
-    partial_idxs = [i for i, b in enumerate(all_borders)
-                    if not b["full_width"] and i not in used
-                    and body_top <= b["y"] <= footer_top]
-    for pi, i in enumerate(partial_idxs):
+    # Phase 2: pair partial borders within the body that share the
+    # same column span (1-2 columns).  These are individual ad boxes.
+    body_partials = [b for b in partial_borders
+                     if body_top <= b["y"] <= footer_top
+                     and b["col_end"] - b["col_start"] + 1 <= 3]
+    used = set()
+    for i, bt in enumerate(body_partials):
         if i in used:
             continue
-        b_top = all_borders[i]
-        for pj in range(pi + 1, len(partial_idxs)):
-            j = partial_idxs[pj]
+        for j in range(i + 1, len(body_partials)):
             if j in used:
                 continue
-            b_bot = all_borders[j]
-            # Require exact matching span: both borders must cover the
-            # same columns.  Section-break rules have ragged detection
-            # that spans different column counts; real ad boxes have
-            # precise, consistent top and bottom borders.
-            start_match = b_top["col_start"] == b_bot["col_start"]
-            end_match = b_top["col_end"] == b_bot["col_end"]
-            span_lo = max(b_top["col_start"], b_bot["col_start"])
-            span_hi = min(b_top["col_end"], b_bot["col_end"])
-            gap = b_bot["y"] - b_top["y"]
-            # Also reject if there's a full-width border between the
-            # top and bottom — that indicates a section break, meaning
-            # the two partial borders bound different content regions.
-            fw_between = any(fb["y"] > b_top["y"] and fb["y"] < b_bot["y"]
-                             for fb in fw_borders)
-            if (start_match and end_match and span_lo <= span_hi
-                    and 15 < gap < ch // 2 and not fw_between):
-                x1 = col_bounds[span_lo - 1]
-                x2 = col_bounds[span_hi]
-                ad_zones.append({
-                    "type": "ad",
-                    "bbox": (x1, b_top["y"], x2, b_bot["y"]),
-                    "col_span": (span_lo, span_hi),
-                })
-                used.add(i)
-                used.add(j)
-                break
+            bb = body_partials[j]
+            # Exact same column span
+            if (bt["col_start"] == bb["col_start"]
+                    and bt["col_end"] == bb["col_end"]):
+                gap = bb["y"] - bt["y"]
+                # No full-width border between them
+                fw_between = any(fb["y"] > bt["y"] and fb["y"] < bb["y"]
+                                 for fb in fw_borders)
+                if 15 < gap < ch // 3 and not fw_between:
+                    cs, ce = bt["col_start"], bt["col_end"]
+                    ad_zones.append({
+                        "type": "ad",
+                        "bbox": (col_bounds[cs - 1], bt["y"],
+                                 col_bounds[ce], bb["y"]),
+                        "col_span": (cs, ce),
+                    })
+                    used.add(i)
+                    used.add(j)
+                    break
 
-    # Filter: minimum ad height (5% of page height).  Tiny "ads"
-    # are usually just pairs of nearby section-break rules.
+    # Filter: minimum ad height (5% of page height)
     min_ad_h = max(40, ch * 5 // 100)
     ad_zones = [a for a in ad_zones
                 if a["bbox"][3] - a["bbox"][1] >= min_ad_h]
 
-    # Deduplicate overlapping ads: when multiple ads share the same
-    # starting y and column span, keep only the tightest (smallest area).
-    # This happens when Phase 1 pairs multiple partial borders below
-    # the same full-width border.
-    deduped = []
-    ad_zones.sort(key=lambda a: (a["bbox"][1], a["col_span"],
-                                 a["bbox"][3] - a["bbox"][1]))
-    for ad in ad_zones:
-        # Check if this ad is contained within an existing one
-        contained = False
-        for existing in deduped:
-            eb = existing["bbox"]
-            ab = ad["bbox"]
-            # Same or overlapping start, one contains the other
-            if (ab[0] >= eb[0] and ab[2] <= eb[2] and
-                    ab[1] >= eb[1] and ab[3] <= eb[3]):
-                contained = True
-                break
-            # Same start, same cols, different height — keep smaller
-            if (ab[1] == eb[1] and ad["col_span"] == existing["col_span"]):
-                contained = True
-                break
-        if not contained:
-            # Also remove any existing ads that this one contains
-            deduped = [e for e in deduped if not (
-                e["bbox"][0] >= ad["bbox"][0] and
-                e["bbox"][2] <= ad["bbox"][2] and
-                e["bbox"][1] >= ad["bbox"][1] and
-                e["bbox"][3] <= ad["bbox"][3])]
-            deduped.append(ad)
-
-    # Merge adjacent ads: ads are typically butted against each other.
-    # If two ads in the same (or overlapping) columns are separated by
-    # a small gap (< 50px ≈ 1-10 lines of text), merge them into one.
-    # This also catches borders that were incorrectly detected within
-    # a single continuous ad.
+    # Merge vertically adjacent ads: ads butt against each other
+    # vertically within the same columns.  If two ads in the same
+    # column span are separated by < 50px, merge them.
     merge_gap = max(50, ch * 4 // 100)
-    deduped.sort(key=lambda a: (a["col_span"], a["bbox"][1]))
+    ad_zones.sort(key=lambda a: (a["col_span"], a["bbox"][1]))
     merged_ads = []
-    for ad in deduped:
+    for ad in ad_zones:
         merged = False
         for i, existing in enumerate(merged_ads):
-            # Same column span and small vertical gap?
             if ad["col_span"] == existing["col_span"]:
                 eg = existing["bbox"]
                 ag = ad["bbox"]
-                gap = ag[1] - eg[3]  # top of new - bottom of existing
-                if 0 <= gap <= merge_gap:
-                    # Merge: extend existing ad downward
+                gap = ag[1] - eg[3]
+                if -5 <= gap <= merge_gap:
                     merged_ads[i] = {
                         "type": "ad",
-                        "bbox": (eg[0], eg[1], eg[2], ag[3]),
+                        "bbox": (eg[0], eg[1], eg[2], max(eg[3], ag[3])),
                         "col_span": existing["col_span"],
                     }
                     merged = True
@@ -1262,9 +1210,11 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
     masthead, body_top, footer_top, zones = _build_page_zones(
         content_bounds, gutter_xs, n_cols, h_borders)
 
-    # Step 5: Optional deep-learning layout detection (LayoutParser)
-    # Supplements geometric zones with semantic labels (Advertisement,
-    # Headline, Figure, etc.) when available.
+    # Step 5: Deep-learning layout detection (LayoutParser / Detectron2)
+    # When available, LP is the PRIMARY authority for zone boundaries.
+    # Geometric detection (steps 1-4) provides structural hints —
+    # column grid, rule lines — but the trained model's bbox predictions
+    # are more likely correct for content boundaries.
     if HAS_LAYOUTPARSER:
         lp_regions = _layoutparser_detect(img_gray)
         if lp_regions:
@@ -1519,18 +1469,34 @@ def _layoutparser_detect(img_gray) -> list:
 def _merge_lp_zones(zones: list, lp_regions: list,
                     content_bounds: tuple) -> list:
     """
-    Merge LayoutParser detections into existing geometric zones.
+    Merge LayoutParser / Detectron2 detections into geometric zones.
 
-    Strategy:
-      - LP "Advertisement" regions → if they overlap a column zone,
-        split that column zone and insert an ad zone.
-      - LP "Headline"/"Title" regions → tag overlapping zones.
-      - LP "Figure"/"Photograph"/"Illustration" → add as image zones.
+    PHILOSOPHY: geometric detection (gutters, h_borders) provides
+    structural hints — column grid, rule lines.  The trained model
+    is the PRIMARY authority when available.  LP bbox predictions
+    OVERRIDE geometric boundaries because the model has learned what
+    real content regions look like, while geometry can be fooled by
+    artifacts, tattered edges, and noisy scans.
 
-    This is a soft merge: LP provides labels/confidence, geometric
-    detection provides precise boundaries.  When they agree, confidence
-    is high.  When they disagree, the geometric structure wins (LP
-    models may not be trained on this specific newspaper style).
+    How each LP label affects the layout:
+
+      Table  — PubLayNet sees newspaper column grids as "tables."
+               The Table bbox defines where actual printed content is.
+               ALL column zones are clipped to fit within it.
+               This is the highest-impact correction: it trims columns
+               that extend into artifact/tattered areas.
+
+      Text   — Confirms body content.  If LP Text extends BEYOND the
+               geometric columns, the columns are EXPANDED to include
+               the LP-detected content (LP found text that geometry missed).
+
+      Title/Headline — Added as headline zones.
+
+      List   — Treated like Text (classified/notice sections).
+
+      Figure/Photograph/Illustration — Added as figure zones.
+
+      Advertisement — Added as ad zones.
     """
     if not lp_regions:
         return zones
@@ -1538,45 +1504,103 @@ def _merge_lp_zones(zones: list, lp_regions: list,
     left, top, right, bot = content_bounds
     new_zones = list(zones)
 
-    for lr in lp_regions:
+    # Sort LP regions by score (highest first) so high-confidence
+    # detections take priority.
+    lp_sorted = sorted(lp_regions, key=lambda r: -r["score"])
+
+    for lr in lp_sorted:
         lx1, ly1, lx2, ly2 = lr["bbox"]
         label = lr["label"]
         score = lr["score"]
 
-        if label in ("Advertisement",) and score >= 0.6:
-            # Check if this overlaps with any column zone
-            for i, z in enumerate(new_zones):
-                if z["type"] != "column":
-                    continue
-                zx1, zy1, zx2, zy2 = z["bbox"]
-                # Compute overlap
-                ox1 = max(lx1, zx1)
-                oy1 = max(ly1, zy1)
-                ox2 = min(lx2, zx2)
-                oy2 = min(ly2, zy2)
-                if ox1 < ox2 and oy1 < oy2:
-                    overlap_area = (ox2 - ox1) * (oy2 - oy1)
-                    lp_area = (lx2 - lx1) * (ly2 - ly1)
-                    if overlap_area > lp_area * 0.3:
-                        # Significant overlap — add as ad zone
-                        new_zones.append({
-                            "type": "ad",
-                            "bbox": (ox1, oy1, ox2, oy2),
-                            "col_span": (z.get("index", 1),
-                                         z.get("index", 1)),
-                            "lp_score": score,
-                        })
+        if score < 0.4:
+            continue
+
+        if label in ("Table",):
+            # Table = the column grid.  LP's bbox is the authoritative
+            # content boundary.  Clip ALL column zones to fit within it.
+            if score >= 0.6:
+                for i, z in enumerate(new_zones):
+                    if z["type"] != "column":
+                        continue
+                    zx1, zy1, zx2, zy2 = z["bbox"]
+                    # Clip column vertically to Table bbox
+                    new_top = max(zy1, ly1)
+                    new_bot = min(zy2, ly2)
+                    if new_top < new_bot:
+                        new_zones[i] = dict(z)
+                        new_zones[i]["bbox"] = (zx1, new_top, zx2, new_bot)
+                # Also clip masthead: if Table starts below masthead
+                # bottom, masthead is confirmed.  If Table starts above
+                # masthead, masthead may be wrong — but we keep it.
+                tprint(f"      LP Table (score={score:.2f}): columns "
+                       f"clipped to y={ly1}→{ly2}", level=4)
+
+        elif label in ("Text", "List"):
+            # LP found text/list content.  If it extends beyond any
+            # column zone, EXPAND that column to include the LP content
+            # (LP detected real text that geometry missed).
+            if score >= 0.5:
+                for i, z in enumerate(new_zones):
+                    if z["type"] != "column":
+                        continue
+                    zx1, zy1, zx2, zy2 = z["bbox"]
+                    # Check horizontal overlap (same column?)
+                    if lx1 < zx2 and lx2 > zx1:
+                        # Expand vertically if LP extends beyond
+                        expanded = False
+                        new_y1 = min(zy1, ly1) if ly1 < zy1 else zy1
+                        new_y2 = max(zy2, ly2) if ly2 > zy2 else zy2
+                        if new_y1 != zy1 or new_y2 != zy2:
+                            new_zones[i] = dict(z)
+                            new_zones[i]["bbox"] = (zx1, new_y1,
+                                                     zx2, new_y2)
+
+        elif label in ("Title", "Headline"):
+            if score >= 0.5 and (ly2 - ly1) > 15:
+                is_masthead = any(
+                    z["type"] == "masthead"
+                    and ly1 >= z["bbox"][1] and ly2 <= z["bbox"][3]
+                    for z in new_zones)
+                if not is_masthead:
+                    new_zones.append({
+                        "type": "headline",
+                        "bbox": (lx1, ly1, lx2, ly2),
+                        "lp_score": score,
+                    })
+
+        elif label in ("Advertisement",):
+            if score >= 0.5:
+                # Find which columns this overlaps
+                col_indices = []
+                for z in new_zones:
+                    if z["type"] != "column":
+                        continue
+                    zx1, _, zx2, _ = z["bbox"]
+                    if lx1 < zx2 and lx2 > zx1:
+                        col_indices.append(z.get("index", 1))
+                if col_indices:
+                    new_zones.append({
+                        "type": "ad",
+                        "bbox": (lx1, ly1, lx2, ly2),
+                        "col_span": (min(col_indices),
+                                     max(col_indices)),
+                        "lp_score": score,
+                    })
 
         elif label in ("Figure", "Photograph", "Illustration",
                         "Map", "Comic", "Editorial_Cartoon"):
             if score >= 0.5:
                 new_zones.append({
                     "type": "figure",
-                    "bbox": lr["bbox"],
+                    "bbox": (lx1, ly1, lx2, ly2),
                     "lp_label": label,
                     "lp_score": score,
                 })
 
+    n_changed = len(new_zones) - len(zones)
+    tprint(f"      LP merge: {n_changed} zones added, "
+           f"{len(lp_regions)} LP regions processed", level=4)
     return new_zones
 
 
@@ -1896,59 +1920,59 @@ def preprocess_image(img_gray):
 
 def detect_content_bounds(img_gray):
     """
-    Trim dark microfilm borders and torn/tattered edges.
-    Returns (left, top, right, bottom).
+    Trim the solid black microfilm border.  Returns (left, top, right, bottom).
 
-    Uses a sustained-brightness approach: the content edge is where
-    the column/row mean brightness first stays above threshold for
-    a run of consecutive pixels (not just the first bright pixel).
-    This avoids tattered edges where brightness fluctuates before
-    the actual printed content begins.
+    The content boundary is where the microfilm frame ends — the first
+    column/row where mean brightness rises above the black border level.
+    Uses a low threshold (15 on raw grayscale) to include ALL content,
+    even degraded/tattered edges.  Those edges contain real text; the
+    OCR engines and alignment steps handle degraded input.
+
+    Cross-page median bounds (in analyze_issue_layout) further refine
+    these per-page bounds using the most inclusive edges across all pages.
     """
     if not HAS_CV2:
         h, w = img_gray.shape
         return int(w*.05), int(h*.02), int(w*.97), int(h*.98)
     h, w = img_gray.shape
-    _, bw = cv2.threshold(img_gray, 60, 255, cv2.THRESH_BINARY)
 
-    # Use the MIDDLE 50% of the page for column brightness (avoids
-    # masthead/footer regions that can mask torn edges).
+    # Use raw grayscale (not binarized) — tattered edges have low but
+    # non-zero brightness that binarization destroys.
+    # Sample the middle 50% vertically to avoid masthead/footer effects.
     mid_top = h * 25 // 100
     mid_bot = h * 75 // 100
-    cl = np.mean(bw[mid_top:mid_bot, :], axis=0)
+    cl = img_gray[mid_top:mid_bot, :].mean(axis=0).astype(float)
 
-    # Use the MIDDLE 50% for row brightness (avoids left/right edge)
     mid_left = w * 15 // 100
     mid_right = w * 85 // 100
-    rl = np.mean(bw[:, mid_left:mid_right], axis=1)
+    rl = img_gray[:, mid_left:mid_right].mean(axis=1).astype(float)
 
-    # Find where brightness sustains above threshold for ≥8 consecutive
-    # columns/rows.  On torn edges, brightness flickers in and out;
-    # real content has sustained brightness.
-    threshold = 140
-    run_needed = 8
+    # Threshold: just above pure black microfilm border.
+    # Microfilm frame is ~0-5 brightness; any content (even degraded) is >10.
+    threshold = 15
 
-    def _find_sustained(profile, forward=True):
+    def _find_edge(profile, forward=True):
+        """Find where brightness first sustains above threshold."""
         n = len(profile)
         rng = range(n) if forward else range(n - 1, -1, -1)
         run = 0
         for i in rng:
             if profile[i] > threshold:
                 run += 1
-                if run >= run_needed:
-                    return i - (run_needed - 1) if forward else i + (run_needed - 1)
+                if run >= 5:
+                    return (i - 4) if forward else (i + 4)
             else:
                 run = 0
-        # Fallback: first bright pixel
+        # Fallback
         for i in rng:
-            if profile[i] > 120:
+            if profile[i] > threshold:
                 return i
         return 0 if forward else n - 1
 
-    left  = _find_sustained(cl, forward=True) + 3
-    right = _find_sustained(cl, forward=False) - 3
-    top   = _find_sustained(rl, forward=True) + 3
-    bot   = _find_sustained(rl, forward=False) - 3
+    left  = _find_edge(cl, forward=True)
+    right = _find_edge(cl, forward=False)
+    top   = _find_edge(rl, forward=True)
+    bot   = _find_edge(rl, forward=False)
     return max(0, left), max(0, top), min(w, right), min(h, bot)
 
 
