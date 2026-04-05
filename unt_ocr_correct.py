@@ -1070,7 +1070,7 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
     # same column span (1-2 columns).  These are individual ad boxes.
     body_partials = [b for b in partial_borders
                      if body_top <= b["y"] <= footer_top
-                     and b["col_end"] - b["col_start"] + 1 <= 2]
+                     and b["col_end"] - b["col_start"] + 1 <= 3]
     used = set()
     for i, bt in enumerate(body_partials):
         if i in used:
