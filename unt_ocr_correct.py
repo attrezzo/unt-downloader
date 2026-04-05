@@ -1539,28 +1539,27 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
         tprint(f"  │  deskew: {skew_deg:+.2f}° (within tolerance, no rotation)",
                worker=worker_id, level=3)
 
-    # ── Cross-page median content bounds ────────────────────────────────
-    # All pages of the same issue are the same physical size on the same
-    # microfilm.  Tattered/torn edges on individual pages produce outlier
-    # content bounds.  The median across pages is the most reliable
-    # estimate — apply it to ALL pages directly.  A page with a tattered
-    # edge has its left bound too far right (e.g., 59 instead of 36);
-    # the median from clean pages corrects this.
+    # ── Cross-page content bounds: most inclusive ───────────────────────
+    # All pages of the same issue are the same physical page scanned on
+    # the same microfilm.  Tattered/torn edges may cause per-page
+    # detection to be too conservative (excluding content).  Use the
+    # MOST INCLUSIVE bounds across all pages: minimum left/top (to include
+    # content at torn edges) and maximum right/bottom.  Content at torn
+    # edges may be degraded but is still OCR-valuable.
     if len(page_images) >= 3:
         all_bounds = [b for _, b in page_images.values()]
-        med_left  = int(np.median([b[0] for b in all_bounds]))
-        med_top   = int(np.median([b[1] for b in all_bounds]))
-        med_right = int(np.median([b[2] for b in all_bounds]))
-        med_bot   = int(np.median([b[3] for b in all_bounds]))
+        best_left  = int(np.min([b[0] for b in all_bounds]))
+        best_top   = int(np.min([b[1] for b in all_bounds]))
+        best_right = int(np.max([b[2] for b in all_bounds]))
+        best_bot   = int(np.max([b[3] for b in all_bounds]))
         for pg in page_images:
             img_gray, old_bounds = page_images[pg]
             h, w = img_gray.shape
-            # Use median bounds directly, clamped to image dimensions
             new_bounds = (
-                max(0, min(med_left, w - 100)),
-                max(0, min(med_top,  h - 100)),
-                min(w, max(med_right, 100)),
-                min(h, max(med_bot,   100)),
+                max(0, best_left),
+                max(0, best_top),
+                min(w, best_right),
+                min(h, best_bot),
             )
             if new_bounds != old_bounds:
                 tprint(f"  │  p{pg:02d} bounds adjusted: "
