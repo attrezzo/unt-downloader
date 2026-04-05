@@ -1394,57 +1394,95 @@ def _layoutparser_detect(img_gray) -> list:
         return []
     try:
         if _LP_MODEL is None:
-            # Try Newspaper Navigator model first (better for newspapers),
-            # fall back to PubLayNet (more general).
-            # Each entry: (config_path, label_map)
-            model_configs = [
-                (
-                    "lp://NewspaperNavigator/faster_rcnn_R_50_FPN_3x/config",
-                    {0: "Photograph", 1: "Illustration", 2: "Map",
-                     3: "Comic", 4: "Editorial_Cartoon",
-                     5: "Headline", 6: "Advertisement"},
-                ),
-                (
-                    "lp://PubLayNet/mask_rcnn_R_50_FPN_3x/config",
-                    {0: "Text", 1: "Title", 2: "List",
-                     3: "Table", 4: "Figure"},
-                ),
-            ]
-            for config, label_map in model_configs:
-                try:
-                    _LP_MODEL = lp.Detectron2LayoutModel(
-                        config_path=config,
-                        label_map=label_map,
-                        extra_config=[
-                            "MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
-                    )
-                    tprint(f"  LayoutParser model loaded: {config}",
-                           level=1)
-                    break
-                except Exception as model_err:
-                    tprint(f"  LayoutParser model {config}: {model_err}",
-                           level=3)
-                    continue
+            # Try Detectron2 model zoo directly (Facebook CDN, reliable)
+            # then fall back to LayoutParser's Dropbox-hosted models.
+            try:
+                from detectron2 import model_zoo
+                from detectron2.config import get_cfg
+                from detectron2.engine import DefaultPredictor
+
+                cfg = get_cfg()
+                cfg.merge_from_file(model_zoo.get_config_file(
+                    "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"))
+                cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
+                cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
+                    "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
+                # Use GPU if available, CPU otherwise
+                import torch
+                cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() \
+                    else "cpu"
+                _LP_MODEL = DefaultPredictor(cfg)
+                _LP_MODEL._is_detectron2_direct = True
+                tprint(f"  Detectron2 model loaded: "
+                       f"faster_rcnn_R_50_FPN_3x ({cfg.MODEL.DEVICE})",
+                       level=1)
+            except Exception as d2_err:
+                tprint(f"  Detectron2 direct: {d2_err}", level=3)
+                # Fall back to LayoutParser model zoo (Dropbox)
+                lp_configs = [
+                    ("lp://PubLayNet/mask_rcnn_R_50_FPN_3x/config",
+                     {0: "Text", 1: "Title", 2: "List",
+                      3: "Table", 4: "Figure"}),
+                ]
+                for config, label_map in lp_configs:
+                    try:
+                        _LP_MODEL = lp.Detectron2LayoutModel(
+                            config_path=config,
+                            label_map=label_map,
+                            extra_config=[
+                                "MODEL.ROI_HEADS.SCORE_THRESH_TEST",
+                                0.5],
+                        )
+                        tprint(f"  LayoutParser model loaded: {config}",
+                               level=1)
+                        break
+                    except Exception as lp_err:
+                        tprint(f"  LayoutParser {config}: {lp_err}",
+                               level=3)
+                        continue
             if _LP_MODEL is None:
                 tprint("  ⚠ LayoutParser: no model could be loaded", level=1)
                 return []
 
-        # Convert grayscale to RGB (LayoutParser expects color)
+        # Convert grayscale to RGB (models expect color)
         if len(img_gray.shape) == 2:
             img_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         else:
             img_rgb = img_gray
 
-        layout = _LP_MODEL.detect(img_rgb)
         results = []
-        for block in layout:
-            x1, y1, x2, y2 = map(int, block.coordinates)
-            results.append({
-                "bbox": (x1, y1, x2, y2),
-                "label": block.type,
-                "score": float(block.score),
-            })
-        tprint(f"      LayoutParser: {len(results)} regions detected", level=3)
+
+        if getattr(_LP_MODEL, '_is_detectron2_direct', False):
+            # Detectron2 DefaultPredictor: returns instances
+            outputs = _LP_MODEL(img_rgb)
+            instances = outputs["instances"].to("cpu")
+            # COCO class names (we care about general region boxes)
+            for i in range(len(instances)):
+                box = instances.pred_boxes[i].tensor[0].numpy()
+                x1, y1, x2, y2 = map(int, box)
+                score = float(instances.scores[i])
+                cls_id = int(instances.pred_classes[i])
+                # Map COCO classes to layout labels
+                # Key classes: 0=person (skip), 73=book, 84=book (skip most)
+                # For document layout, treat all detections as generic regions
+                results.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "label": f"region_{cls_id}",
+                    "score": score,
+                })
+        else:
+            # LayoutParser Detectron2LayoutModel: has .detect()
+            layout = _LP_MODEL.detect(img_rgb)
+            for block in layout:
+                x1, y1, x2, y2 = map(int, block.coordinates)
+                results.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "label": block.type,
+                    "score": float(block.score),
+                })
+
+        tprint(f"      LayoutParser: {len(results)} regions detected",
+               level=3)
         return results
     except Exception as e:
         tprint(f"      ⚠ LayoutParser error: {e}", level=2)
