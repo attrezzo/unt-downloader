@@ -3611,7 +3611,8 @@ def parse_ocr_pages(text: str) -> tuple:
 
 def process_issue(issue, api_key, correction_prompt, delay,
                   resume, retry_failed, tess_lang,
-                  rate_limiter=None, worker_id=""):
+                  rate_limiter=None, worker_id="",
+                  serial=False):
     ark_id = issue["ark_id"]
     vol    = str(issue.get("volume","?")).zfill(2)
     num    = str(issue.get("number","?")).zfill(2)
@@ -3705,39 +3706,76 @@ def process_issue(issue, api_key, correction_prompt, delay,
     tprint(f"  ┌─ PASS 1: Local OCR (high-confidence extraction) ─────────",
            worker=worker_id, level=1)
     local_results = {}
+
+    # Build work items for pages that need processing
+    work_items = []
     for pg, needs_redo in pages_to_process:
         if not needs_redo:
             tprint(f"  │  p{pg:02d} KEEP (already corrected)", worker=worker_id, level=2)
             continue
+        work_items.append(pg)
 
+    def _run_local_ocr(pg):
+        """Process one page's local OCR (stages 1-7). Thread-safe."""
         unt_ocr = strip_ocr_html(ocr_pages.get(pg, ""))
         tprint(f"  │  p{pg:02d}/{actual_pages} running local OCR engines ...",
                worker=worker_id, level=1)
 
         abbyy_tokens, abbyy_blocks = [], []
         if has_abbyy:
-            tprint(f"  │    parsing ABBYY XML page {pg} ...", worker=worker_id, level=3)
-            abbyy_tokens, abbyy_blocks = parse_abbyy_page(axml, page_index=pg - 1)
-            tprint(f"  │    → {len(abbyy_tokens)} ABBYY tokens, "
-                   f"{len(abbyy_blocks)} blocks", worker=worker_id, level=3)
+            abbyy_tokens, abbyy_blocks = parse_abbyy_page(
+                axml, page_index=pg - 1)
 
-        try:
-            local = process_page_local(
-                ark_id, pg, actual_pages, unt_ocr, issue,
-                tess_lang=tess_lang,
-                abbyy_page_tokens=abbyy_tokens,
-                abbyy_blocks=abbyy_blocks,
-                expected_cols=expected_cols,
-                worker_id=worker_id,
-                page_layout=page_layouts.get(pg),
-            )
-            local_results[pg] = local
-            disputes = len(local.get("all_disputes", []))
-            tprint(f"  │  p{pg:02d} ✓ [{local['summary']}]",
-                   worker=worker_id, level=1)
-        except Exception as e:
-            tprint(f"  │  p{pg:02d} ✗ FAILED: {e}", worker=worker_id, level=1)
-            corrected_pages[pg] = f"[CORRECTION FAILED: {e}]\n\n{unt_ocr}"
+        local = process_page_local(
+            ark_id, pg, actual_pages, unt_ocr, issue,
+            tess_lang=tess_lang,
+            abbyy_page_tokens=abbyy_tokens,
+            abbyy_blocks=abbyy_blocks,
+            expected_cols=expected_cols,
+            worker_id=worker_id,
+            page_layout=page_layouts.get(pg),
+        )
+        return pg, local
+
+    # Parallelize across pages — Tesseract and Kraken release the GIL
+    # during their C-level processing, so threads give real speedup.
+    import os as _os
+    n_ocr_workers = max(1, min(len(work_items),
+                                _os.cpu_count() or 4))
+    if len(work_items) <= 1 or serial:
+        # Serial mode or single page
+        for pg in work_items:
+            try:
+                _, local = _run_local_ocr(pg)
+                local_results[pg] = local
+                tprint(f"  │  p{pg:02d} ✓ [{local['summary']}]",
+                       worker=worker_id, level=1)
+            except Exception as e:
+                tprint(f"  │  p{pg:02d} ✗ FAILED: {e}",
+                       worker=worker_id, level=1)
+                unt_ocr = strip_ocr_html(ocr_pages.get(pg, ""))
+                corrected_pages[pg] = (
+                    f"[CORRECTION FAILED: {e}]\n\n{unt_ocr}")
+    else:
+        tprint(f"  │  parallelizing {len(work_items)} pages across "
+               f"{n_ocr_workers} threads",
+               worker=worker_id, level=1)
+        with ThreadPoolExecutor(max_workers=n_ocr_workers) as pool:
+            futures = {pool.submit(_run_local_ocr, pg): pg
+                       for pg in work_items}
+            for future in as_completed(futures):
+                pg = futures[future]
+                try:
+                    _, local = future.result()
+                    local_results[pg] = local
+                    tprint(f"  │  p{pg:02d} ✓ [{local['summary']}]",
+                           worker=worker_id, level=1)
+                except Exception as e:
+                    tprint(f"  │  p{pg:02d} ✗ FAILED: {e}",
+                           worker=worker_id, level=1)
+                    unt_ocr = strip_ocr_html(ocr_pages.get(pg, ""))
+                    corrected_pages[pg] = (
+                        f"[CORRECTION FAILED: {e}]\n\n{unt_ocr}")
 
     # Summary of disputes across all pages
     total_disputes = sum(len(r.get("all_disputes", []))
@@ -4066,7 +4104,8 @@ def main():
             issue, api_key, correction_prompt,
             args.delay, args.resume, args.retry_failed,
             tess_lang=tess_lang,
-            rate_limiter=rate_limiter, worker_id=wid)
+            rate_limiter=rate_limiter, worker_id=wid,
+            serial=args.serial)
         with log_lock:
             log.append({"ark_id": ark_id, "status": status})
             (CORRECTED_DIR/"correction_log.json").write_text(
