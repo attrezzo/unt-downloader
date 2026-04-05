@@ -1431,7 +1431,8 @@ def _layoutparser_detect(img_gray) -> list:
                 cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() \
                     else "cpu"
                 # PubLayNet has 5 classes
-                cfg.MODEL.ROI_HEADS.NUM_CLASSES = 5
+                # NUM_CLASSES is set in the config file (6 for PubLayNet:
+                # 5 categories + background); don't override it here.
 
                 predictor = DefaultPredictor(cfg)
                 # Wrap in a compat object with .detect() method
