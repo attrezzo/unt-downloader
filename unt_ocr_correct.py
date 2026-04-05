@@ -1198,10 +1198,15 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
                     used.add(j)
                     break
 
-    # Filter: minimum ad height (5% of page height)
+    # Filter: ad size sanity checks
+    # - Minimum height: 5% of page
+    # - Maximum area: 30% of page (ads are never more than ~1/3 page)
     min_ad_h = max(40, ch * 5 // 100)
+    page_area = cw * ch
     ad_zones = [a for a in ad_zones
-                if a["bbox"][3] - a["bbox"][1] >= min_ad_h]
+                if a["bbox"][3] - a["bbox"][1] >= min_ad_h
+                and (a["bbox"][2] - a["bbox"][0]) *
+                    (a["bbox"][3] - a["bbox"][1]) <= page_area * 0.30]
 
     # Merge vertically adjacent ads: ads butt against each other
     # vertically within the same columns.  If two ads in the same
