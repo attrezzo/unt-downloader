@@ -1082,6 +1082,7 @@ def _build_page_zones(content_bounds, gutter_xs, n_cols, h_borders):
       zones: list of zone dicts
     """
     left, top, right, bot = content_bounds
+    cw = right - left
     ch = bot - top
 
     # Separate full-width borders from partial borders
