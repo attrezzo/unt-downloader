@@ -1449,7 +1449,7 @@ def save_calibration(collection_dir: Path, ark_id: str,
             skew_deg = layout["skew_deg"]
             break
     cal = {
-        "version": 1,
+        "version": CALIBRATION_VERSION,
         "calibrated_from": ark_id,
         "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "expected_cols": expected_cols,
@@ -1483,13 +1483,23 @@ def save_calibration(collection_dir: Path, ark_id: str,
     return cal_path
 
 
+CALIBRATION_VERSION = 2  # bump to invalidate stale calibration files
+
+
 def load_calibration(collection_dir: Path) -> dict | None:
-    """Load calibration.json if it exists. Returns None if not found."""
+    """Load calibration.json if it exists and version matches. Returns None
+    if not found or if the calibration was produced by an older algorithm
+    version (will be re-detected automatically)."""
     cal_path = collection_dir / "calibration.json"
     if not cal_path.exists():
         return None
     try:
         cal = json.loads(cal_path.read_text(encoding="utf-8"))
+        if cal.get("version", 0) < CALIBRATION_VERSION:
+            tprint(f"  Calibration v{cal.get('version', 0)} is outdated "
+                   f"(need v{CALIBRATION_VERSION}) — re-detecting layout",
+                   level=1)
+            return None
         tprint(f"  Calibration loaded from {cal_path} "
                f"(calibrated from {cal.get('calibrated_from', '?')})", level=1)
         return cal
