@@ -862,19 +862,155 @@ def _h_rule_score_strip(img_gray, x_lo, x_hi, y_lo, y_hi):
     return np.sqrt(d_norm * f_norm)
 
 
+def _find_vertical_rules(img_gray, approx_gutters, body_top, body_bot):
+    """
+    Find precise vertical rule line positions by searching for the
+    darkest continuous vertical line near each approximate gutter.
+
+    The pattern is whitespace | dark line (1-3px) | whitespace.
+    For each approximate gutter, search a window and pick the x with
+    the strongest whitespace-dark-whitespace contrast.
+
+    Returns list of precise x positions.
+    """
+    h, w = img_gray.shape
+    if not approx_gutters:
+        return []
+    # Auto-detect search width from gutter spacing
+    spacing = (approx_gutters[-1] - approx_gutters[0]) / max(1, len(approx_gutters) - 1)
+    search_w = max(15, int(spacing * 0.12))
+
+    rule_xs = []
+    for approx_x in approx_gutters:
+        lo = max(0, approx_x - search_w)
+        hi = min(w, approx_x + search_w)
+        strip = img_gray[body_top:body_bot, lo:hi].astype(float)
+        col_means = strip.mean(axis=0)
+        n = len(col_means)
+        # Find x with best whitespace-dark-whitespace contrast
+        best_x = lo + int(np.argmin(col_means))
+        best_score = 999.0
+        for i in range(3, n - 3):
+            left_b = float(col_means[max(0, i - 5):i - 1].mean())
+            right_b = float(col_means[i + 2:min(n, i + 6)].mean())
+            center = float(col_means[i])
+            score = center - min(left_b, right_b)
+            if score < best_score:
+                best_score = score
+                best_x = lo + i
+        rule_xs.append(int(best_x))
+    return rule_xs
+
+
+def _find_grid_from_intersections(img_gray, rule_xs, body_top, body_bot):
+    """
+    Find horizontal grid lines by detecting where vertical rule lines
+    are INTERRUPTED — these gaps are perpendicular intersection points
+    where horizontal borders nearly meet the vertical rules.
+
+    In printed newspapers the two border lines don't quite touch — they're
+    about 15-30px apart.  But if extended they would form right angles.
+
+    Strategy:
+      1. Scan each vertical rule line for gaps (bright interruptions
+         in the otherwise dark line)
+      2. Cluster gap midpoints across gutters at similar y
+      3. For each cluster with ≥2 gutter intersections, verify there's
+         a dark horizontal row connecting them
+      4. Return confirmed horizontal borders
+
+    Returns list of dicts:
+      {y, x_start, x_end, gutters: [x1,...], n_gutters, full_width}
+    """
+    h, w = img_gray.shape
+    gap_threshold = 130  # below = dark (rule line), above = gap
+
+    # Step 1: find gap midpoints on each vertical rule line
+    all_gaps = []  # (y_mid, gap_size, rule_x)
+    for rx in rule_xs:
+        if rx < 0 or rx >= w:
+            continue
+        line = img_gray[body_top:body_bot, rx].astype(float)
+        smoothed = uniform_filter1d(line, size=3)
+        is_dark = smoothed < gap_threshold
+
+        in_gap = False
+        gap_start = 0
+        for y in range(len(is_dark)):
+            if not is_dark[y] and not in_gap:
+                gap_start = y
+                in_gap = True
+            elif is_dark[y] and in_gap:
+                gap_end = y
+                gap_mid = (gap_start + gap_end) // 2 + body_top
+                gap_size = gap_end - gap_start
+                if 3 < gap_size < 300:
+                    all_gaps.append((gap_mid, gap_size, rx))
+                in_gap = False
+
+    if not all_gaps:
+        return []
+
+    # Step 2: cluster gaps at similar y across gutters
+    all_gaps.sort(key=lambda g: g[0])
+    clusters = []
+    current = [all_gaps[0]]
+    for gap in all_gaps[1:]:
+        if gap[0] - current[-1][0] < 25:
+            current.append(gap)
+        else:
+            clusters.append(current)
+            current = [gap]
+    clusters.append(current)
+
+    # Step 3: verify each cluster has a dark horizontal line
+    n_total_gutters = len(rule_xs)
+    h_lines = []
+    for cl in clusters:
+        y_avg = int(np.mean([g[0] for g in cl]))
+        gutters = sorted(set(g[2] for g in cl))
+
+        if len(gutters) < 2:
+            continue  # need ≥2 gutter intersections
+
+        # Search ±15px for the darkest horizontal row between gutters
+        x_lo = max(0, gutters[0] - 30)
+        x_hi = min(w, gutters[-1] + 30)
+        best_y = y_avg
+        best_dark = 255.0
+        for dy in range(-15, 16):
+            test_y = y_avg + dy
+            if body_top <= test_y < body_bot:
+                row = img_gray[test_y, x_lo:x_hi]
+                dark = float(row.mean())
+                if dark < best_dark:
+                    best_dark = dark
+                    best_y = test_y
+
+        if best_dark < 200:  # confirmed dark horizontal line
+            full = len(gutters) >= max(2, n_total_gutters - 1)
+            h_lines.append({
+                "y": best_y,
+                "x_start": gutters[0],
+                "x_end": gutters[-1],
+                "gutters": gutters,
+                "n_gutters": len(gutters),
+                "full_width": full,
+            })
+
+    return h_lines
+
+
 def _detect_h_borders(img_gray, content_bounds, gutter_xs, n_cols):
     """
-    Detect horizontal rule lines (borders) and determine which columns
-    each one spans.
+    Detect horizontal rule lines (borders) using perpendicular
+    intersection detection.
 
-    Newspapers use horizontal rules to delimit the masthead, section
-    breaks, ad boundaries, and footers.  An ad border starts and ends
-    on column boundaries (gutters) and need not span the full page width.
-
-    Strategy: compute the horizontal rule-line score independently for
-    each column strip, find peaks per column, then cluster peaks across
-    columns at the same y.  A border is confirmed when ≥2 adjacent
-    columns agree.
+    Strategy: scan each vertical column rule line for GAPS — these are
+    where horizontal rules cross (the two perpendicular lines are
+    15-30px apart but would form right angles if extended).  Cluster
+    gap midpoints across gutters at the same y, then verify there's a
+    dark horizontal row connecting them.
 
     Returns list of dicts:
       {y, col_start (1-based), col_end (1-based), full_width: bool}
@@ -887,74 +1023,37 @@ def _detect_h_borders(img_gray, content_bounds, gutter_xs, n_cols):
     if cw < 200 or ch < 200:
         return []
 
-    # Column boundaries (in page coords)
+    # Find precise vertical rule line positions
+    rule_xs = _find_vertical_rules(img_gray, list(gutter_xs), top, bot)
+    if not rule_xs:
+        return []
+
+    # Find horizontal lines from intersection gaps
+    h_lines = _find_grid_from_intersections(img_gray, rule_xs, top, bot)
+
+    # Convert to col_start/col_end format for _build_page_zones
     col_bounds = [left] + list(gutter_xs) + [right]
-
-    # Compute h-rule score per column
-    col_peaks = []
-    for ci in range(n_cols):
-        x_lo, x_hi = col_bounds[ci], col_bounds[ci + 1]
-        # Shrink strip slightly to avoid gutter rule interference
-        margin = max(3, (x_hi - x_lo) // 10)
-        score = _h_rule_score_strip(
-            img_gray, x_lo + margin, x_hi - margin, top, bot)
-        peaks, _ = find_peaks(score, height=0.25, prominence=0.12,
-                              distance=8)
-        col_peaks.append(set(int(p) for p in peaks))
-
-    # Cluster peaks across columns at the same y (±tolerance)
-    tol = 5
-    all_ys = sorted(set().union(*col_peaks))
-    visited = set()
-    raw_borders = []
-
-    for y in all_ys:
-        if y in visited:
-            continue
-        cols_with = []
-        for ci, peaks in enumerate(col_peaks):
-            for p in peaks:
-                if abs(p - y) <= tol:
-                    cols_with.append(ci + 1)  # 1-based
-                    visited.add(p)
-                    break
-        if len(cols_with) >= 2:
-            raw_borders.append((y + top, sorted(cols_with)))
-
-    # Merge borders within 12px
-    merged = []
-    for y, cols in raw_borders:
-        if merged and y - merged[-1][0] < 12:
-            combined = sorted(set(merged[-1][1] + cols))
-            merged[-1] = (y, combined)
-        else:
-            merged.append((y, cols))
-
-    # Filter: require ≥2 ADJACENT columns (not scattered coincidences).
-    # A real horizontal border spans a contiguous run of columns.
     borders = []
-    for y, cols in merged:
-        # Find longest contiguous run
-        best_start, best_end = cols[0], cols[0]
-        run_start = cols[0]
-        for i in range(1, len(cols)):
-            if cols[i] == cols[i - 1] + 1:
-                if cols[i] - run_start + 1 > best_end - best_start + 1:
-                    best_start, best_end = run_start, cols[i]
-            else:
-                run_start = cols[i]
-        contiguous_len = best_end - best_start + 1
-        if contiguous_len < 2:
-            continue
-        full = contiguous_len >= n_cols - 1
+    for hl in h_lines:
+        # Map x_start/x_end to column indices
+        col_start = 1
+        col_end = n_cols
+        for ci in range(n_cols):
+            if col_bounds[ci] <= hl["x_start"] < col_bounds[ci + 1]:
+                col_start = ci + 1
+                break
+        for ci in range(n_cols - 1, -1, -1):
+            if col_bounds[ci] < hl["x_end"] <= col_bounds[ci + 1]:
+                col_end = ci + 1
+                break
         borders.append({
-            "y": y,
-            "col_start": best_start,
-            "col_end": best_end,
-            "full_width": full,
+            "y": hl["y"],
+            "col_start": col_start,
+            "col_end": col_end,
+            "full_width": hl["full_width"],
         })
 
-    tprint(f"      h_borders: {len(borders)} detected "
+    tprint(f"      h_borders: {len(borders)} from intersections "
            f"({sum(1 for b in borders if b['full_width'])} full-width, "
            f"{sum(1 for b in borders if not b['full_width'])} partial)",
            level=4)
@@ -1202,6 +1301,15 @@ def analyze_page_layout(img_gray, page_num: int, content_bounds: tuple,
                 best_gutters = [x + left for x in snapped]
         gutter_xs = sorted(best_gutters)
         n_cols = best_n
+
+    # Step 2b: Refine gutter positions by finding the actual printed
+    # vertical rule lines (darkest continuous line near each gutter).
+    # Only accept refinements that are close to the input position
+    # (within 15px) — larger shifts are likely false matches.
+    refined = _find_vertical_rules(img_gray, gutter_xs, top, bot)
+    if len(refined) == len(gutter_xs):
+        gutter_xs = [r if abs(r - g) <= 15 else g
+                     for r, g in zip(refined, gutter_xs)]
 
     # Step 3: Detect horizontal borders (masthead, section, ad, footer)
     h_borders = _detect_h_borders(img_gray, content_bounds,
