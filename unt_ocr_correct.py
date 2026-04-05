@@ -131,6 +131,22 @@ except ImportError:
     HAS_KRAKEN = False
 
 try:
+    # iopath (used by LayoutParser/Detectron2) has a Windows bug where
+    # cached URLs contain '?' which is invalid in Windows filenames.
+    # Fix: monkey-patch iopath's _get_local_path to sanitize filenames.
+    if sys.platform == "win32":
+        try:
+            import iopath.common.file_io as _iopath_fio
+            _orig_http_get_local = _iopath_fio.HTTPURLHandler._get_local_path
+            def _patched_http_get_local(self, path, **kwargs):
+                # Sanitize the cached filename by replacing invalid chars
+                import urllib.parse
+                parsed = urllib.parse.urlparse(path)
+                clean = parsed._replace(query="", fragment="").geturl()
+                return _orig_http_get_local(self, clean, **kwargs)
+            _iopath_fio.HTTPURLHandler._get_local_path = _patched_http_get_local
+        except Exception:
+            pass
     import layoutparser as lp
     HAS_LAYOUTPARSER = True
     _LP_MODEL = None   # lazy-loaded on first use
@@ -1361,29 +1377,35 @@ def _layoutparser_detect(img_gray) -> list:
     try:
         if _LP_MODEL is None:
             # Try Newspaper Navigator model first (better for newspapers),
-            # fall back to PubLayNet (more general)
-            for config in [
-                "lp://NewspaperNavigator/faster_rcnn_R_50_FPN_3x/config",
-                "lp://PubLayNet/mask_rcnn_R_50_FPN_3x/config",
-            ]:
+            # fall back to PubLayNet (more general).
+            # Each entry: (config_path, label_map)
+            model_configs = [
+                (
+                    "lp://NewspaperNavigator/faster_rcnn_R_50_FPN_3x/config",
+                    {0: "Photograph", 1: "Illustration", 2: "Map",
+                     3: "Comic", 4: "Editorial_Cartoon",
+                     5: "Headline", 6: "Advertisement"},
+                ),
+                (
+                    "lp://PubLayNet/mask_rcnn_R_50_FPN_3x/config",
+                    {0: "Text", 1: "Title", 2: "List",
+                     3: "Table", 4: "Figure"},
+                ),
+            ]
+            for config, label_map in model_configs:
                 try:
-                    label_map = {0: "Text", 1: "Title", 2: "List",
-                                 3: "Table", 4: "Figure"}
-                    if "NewspaperNavigator" in config:
-                        label_map = {
-                            0: "Photograph", 1: "Illustration",
-                            2: "Map", 3: "Comic", 4: "Editorial_Cartoon",
-                            5: "Headline", 6: "Advertisement",
-                        }
                     _LP_MODEL = lp.Detectron2LayoutModel(
                         config_path=config,
                         label_map=label_map,
                         extra_config=[
                             "MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
                     )
-                    tprint(f"  LayoutParser model loaded: {config}", level=1)
+                    tprint(f"  LayoutParser model loaded: {config}",
+                           level=1)
                     break
-                except Exception:
+                except Exception as model_err:
+                    tprint(f"  LayoutParser model {config}: {model_err}",
+                           level=3)
                     continue
             if _LP_MODEL is None:
                 tprint("  ⚠ LayoutParser: no model could be loaded", level=1)
