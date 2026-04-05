@@ -493,11 +493,35 @@ def _detect_rule_lines(img_gray, content_bounds) -> dict:
     return {"vertical": vertical, "horizontal": horizontal}
 
 
+def _verify_gutter_local(img_gray, x_candidate, top, bot, left, right,
+                         tolerance=20):
+    """
+    Verify a predicted gutter position by checking if there's a brightness
+    peak (whitespace strip) near x_candidate in the middle 50% of the page.
+    Returns True if the candidate position is notably brighter than context.
+    """
+    ch = bot - top
+    scan_top = top + ch * 25 // 100
+    scan_bot = top + ch * 75 // 100
+    x_lo = max(left, x_candidate - tolerance)
+    x_hi = min(right, x_candidate + tolerance + 1)
+    if x_hi <= x_lo:
+        return False
+    region = img_gray[scan_top:scan_bot, x_lo:x_hi]
+    peak_brightness = float(region.mean(axis=0).max())
+    # Wider context for contrast comparison
+    ctx_lo = max(left, x_candidate - tolerance * 4)
+    ctx_hi = min(right, x_candidate + tolerance * 4 + 1)
+    ctx_mean = float(img_gray[scan_top:scan_bot, ctx_lo:ctx_hi].mean())
+    return peak_brightness > ctx_mean + 3
+
+
 def _detect_gutters_unconstrained(img_gray, content_bounds,
                                   rule_lines: dict = None) -> list:
     """
     Find column gutters. Primary signal: vertical rule lines detected by
-    _detect_rule_lines(). Fallback: cross-zone ink density projection.
+    _detect_rule_lines(). Fallback: multi-zone brightness peak detection
+    with clustering and regularity-based interpolation.
 
     Returns list of gutter x-coordinates (in page coords).
     """
@@ -523,69 +547,141 @@ def _detect_gutters_unconstrained(img_gray, content_bounds,
             return sorted(gutters)
         tprint(f"      rule lines found but all near edges — falling back to projection", level=4)
 
-    # ── Fallback: cross-zone ink density projection ──────────────────────
-    # Minimum column width: real newspaper columns are at least 100px wide
-    # at typical scan resolutions (1200-1500px wide page).
-    min_col_width = max(80, cw // 20)
+    # ── Fallback: multi-zone brightness-based gutter detection ───────────
+    # Sample 5 narrow horizontal bands across the page body. For each band,
+    # compute column-wise mean brightness; peaks = whitespace gutters.
+    # A gutter is confirmed if detected in ≥2 of 5 zones.
+    min_col_width = max(60, cw // 25)
+    snap_tol = max(20, cw // 70)  # ~1.4% of page width
 
-    def _find_valleys(region):
-        """Find vertical gaps (valleys in ink density) in a horizontal region."""
-        dark     = (region < 128).sum(axis=0).astype(float)
-        smoothed = uniform_filter1d(dark, size=15)
-        if smoothed.max() < 10:
-            return []
-        # Require strong valleys: prominence at least 15% of max density,
-        # and gutters at least min_col_width apart.
-        valleys, props = find_peaks(-smoothed, distance=min_col_width,
-                                    prominence=smoothed.max() * 0.15)
-        return list(valleys)
+    zone_specs = [
+        (20, 30),   # upper body
+        (33, 43),   # upper-mid
+        (47, 57),   # center
+        (62, 72),   # lower-mid
+        (78, 88),   # lower body
+    ]
 
-    # Scan two independent vertical zones and require agreement.
-    # Zone A: middle third (40%-65%) — avoids both masthead and footer
-    za_top = top + ch * 40 // 100
-    za_bot = top + ch * 65 // 100
-    # Zone B: bottom quarter (70%-90%)
-    zb_top = top + ch * 70 // 100
-    zb_bot = top + ch * 90 // 100
+    all_zone_valleys = []
+    for zi, (pct_start, pct_end) in enumerate(zone_specs):
+        zt = top + ch * pct_start // 100
+        zb = top + ch * pct_end // 100
+        region = img_gray[zt:zb, left:right]
 
-    valleys_a = _find_valleys(img_gray[za_top:za_bot, left:right])
-    valleys_b = _find_valleys(img_gray[zb_top:zb_bot, left:right])
+        # Mean brightness per column — gutters are bright vertical strips
+        brightness = region.mean(axis=0).astype(float)
+        smoothed = uniform_filter1d(brightness, size=7)
 
-    tprint(f"      gutter scan: zone A({za_top}-{za_bot}) found {len(valleys_a)}, "
-           f"zone B({zb_top}-{zb_bot}) found {len(valleys_b)}", level=4)
+        brange = smoothed.max() - smoothed.min()
+        if brange < 3:
+            all_zone_valleys.append([])
+            continue
 
-    if not valleys_a and not valleys_b:
+        # Find peaks in brightness (= whitespace gutters)
+        prom_threshold = max(2.0, brange * 0.06)
+        peaks, _ = find_peaks(smoothed, distance=min_col_width,
+                              prominence=prom_threshold)
+        zone_valleys = [int(p) for p in peaks]
+        all_zone_valleys.append(zone_valleys)
+        if LOG_LEVEL >= 5:
+            tprint(f"      zone {zi} ({pct_start}-{pct_end}%): "
+                   f"{len(zone_valleys)} candidates "
+                   f"at x={[v + left for v in zone_valleys]}", level=5)
+
+    # ── Cluster gutters across zones ─────────────────────────────────────
+    # Collect all candidates with zone labels, sort by x, cluster nearby
+    all_candidates = []
+    for zi, valleys in enumerate(all_zone_valleys):
+        for v in valleys:
+            all_candidates.append((v, zi))
+
+    if not all_candidates:
+        tprint(f"      gutter scan: 5 zones found no candidates", level=4)
         return []
 
-    # A gutter is confirmed only if both zones agree (within tolerance).
-    # This eliminates false positives from ads, illustrations, or headlines
-    # that create vertical gaps in only one part of the page.
-    snap_tol = max(15, cw // 100)  # ~1% of page width
-    confirmed = []
-
-    # Use the zone with more detections as anchor, match against the other
-    if len(valleys_a) >= len(valleys_b):
-        anchor, check = valleys_a, valleys_b
-    else:
-        anchor, check = valleys_b, valleys_a
-
-    for va in anchor:
-        for vb in check:
-            if abs(va - vb) < snap_tol:
-                # Average the two detections for better accuracy
-                confirmed.append(int((va + vb) / 2) + left)
-                break
+    all_candidates.sort(key=lambda x: x[0])
+    clusters = []
+    current_cluster = [all_candidates[0]]
+    for i in range(1, len(all_candidates)):
+        x, zi = all_candidates[i]
+        cluster_mean = sum(c[0] for c in current_cluster) / len(current_cluster)
+        if abs(x - cluster_mean) <= snap_tol:
+            current_cluster.append((x, zi))
         else:
-            # No match in the other zone — include only if prominently detected
-            # (single-zone gutters are often false positives)
-            pass
+            clusters.append(current_cluster)
+            current_cluster = [(x, zi)]
+    clusters.append(current_cluster)
 
-    # If cross-zone matching eliminated everything, fall back to the
-    # zone with stronger signal but require very high prominence
-    if not confirmed and (valleys_a or valleys_b):
-        best_zone = valleys_a if len(valleys_a) > len(valleys_b) else valleys_b
-        tprint(f"      ⚠ no cross-zone agreement, using single zone ({len(best_zone)} valleys)", level=4)
-        confirmed = [int(v) + left for v in best_zone]
+    # Confirm clusters with detections from ≥2 distinct zones
+    min_zones = 2
+    confirmed = []
+    for cluster in clusters:
+        zones_present = len(set(zi for _, zi in cluster))
+        mean_x = int(sum(x for x, _ in cluster) / len(cluster)) + left
+        if zones_present >= min_zones:
+            confirmed.append(mean_x)
+            tprint(f"      cluster x≈{mean_x}: {zones_present}/5 zones agree ✓",
+                   level=5)
+        else:
+            tprint(f"      cluster x≈{mean_x}: only {zones_present} zone — rejected",
+                   level=5)
+
+    zone_counts = [len(v) for v in all_zone_valleys]
+    tprint(f"      gutter scan: 5 zones found {zone_counts} → "
+           f"{len(confirmed)} confirmed", level=4)
+
+    # ── Regularity heuristic: fill missing gutters ───────────────────────
+    # If the confirmed gutters suggest a regular spacing pattern, look for
+    # missing gutters at predicted positions and verify with a local scan.
+    if len(confirmed) >= 2:
+        spacings = [confirmed[i+1] - confirmed[i]
+                    for i in range(len(confirmed) - 1)]
+        median_spacing = int(sorted(spacings)[len(spacings) // 2])
+
+        # Check if most spacings are close to the median (within 35%)
+        regular_count = sum(1 for s in spacings
+                            if 0.65 * median_spacing <= s <= 1.35 * median_spacing)
+        is_regular = regular_count >= len(spacings) * 0.6 and median_spacing > 0
+
+        if is_regular:
+            tprint(f"      regularity: median spacing={median_spacing}px, "
+                   f"{regular_count}/{len(spacings)} spacings regular", level=4)
+
+            # Extend left: add gutters at -median_spacing intervals
+            leftmost = confirmed[0]
+            edge_margin = cw // 15
+            while leftmost - median_spacing > left + edge_margin:
+                candidate = int(leftmost - median_spacing)
+                if _verify_gutter_local(img_gray, candidate, top, bot,
+                                        left, right, snap_tol):
+                    confirmed.insert(0, candidate)
+                    tprint(f"      regularity: +gutter x≈{candidate} "
+                           f"(left extension)", level=4)
+                leftmost -= median_spacing
+
+            # Extend right
+            rightmost = confirmed[-1]
+            while rightmost + median_spacing < right - edge_margin:
+                candidate = int(rightmost + median_spacing)
+                if _verify_gutter_local(img_gray, candidate, top, bot,
+                                        left, right, snap_tol):
+                    confirmed.append(candidate)
+                    tprint(f"      regularity: +gutter x≈{candidate} "
+                           f"(right extension)", level=4)
+                rightmost += median_spacing
+
+            # Fill interior gaps where spacing ≈ 2× median
+            i = 0
+            while i < len(confirmed) - 1:
+                gap = confirmed[i+1] - confirmed[i]
+                if 1.6 * median_spacing <= gap <= 2.5 * median_spacing:
+                    candidate = (confirmed[i] + confirmed[i+1]) // 2
+                    if _verify_gutter_local(img_gray, candidate, top, bot,
+                                            left, right, snap_tol):
+                        confirmed.insert(i + 1, candidate)
+                        tprint(f"      regularity: +gutter x≈{candidate} "
+                               f"(gap fill)", level=4)
+                i += 1
 
     # Remove gutters that are too close to the edges (probably border artifacts)
     edge_margin = cw // 15
