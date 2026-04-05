@@ -493,6 +493,169 @@ def _detect_rule_lines(img_gray, content_bounds) -> dict:
     return {"vertical": vertical, "horizontal": horizontal}
 
 
+def _gutter_profile_band(img_gray, left, right, y_start, y_end):
+    """
+    Build a gutter-pattern score for a single narrow horizontal band.
+    Same algorithm as _gutter_profile but for one band only.
+
+    Returns gutter_score in LOCAL coords (0 = left edge of content).
+    """
+    region = img_gray[y_start:y_end, left:right]
+    composite = region.mean(axis=0).astype(float)
+    n = len(composite)
+    local_bg = uniform_filter1d(composite, size=30)
+    darkness_dip = uniform_filter1d(local_bg - composite, size=3)
+    flank_score = np.zeros(n)
+    for x in range(5, n - 5):
+        fl = composite[x - 5 : x - 1].mean()
+        fr = composite[x + 2 : x + 6].mean()
+        flank_score[x] = min(fl, fr) - composite[x]
+    d_max, f_max = darkness_dip.max(), flank_score.max()
+    d_norm = np.clip(darkness_dip / d_max, 0, 1) if d_max > 0 else np.zeros(n)
+    f_norm = np.clip(flank_score / f_max, 0, 1) if f_max > 0 else np.zeros(n)
+    return np.sqrt(d_norm * f_norm)
+
+
+def _estimate_skew(img_gray, content_bounds, n_cols=6):
+    """
+    Estimate page skew by fitting straight lines through gutter-pattern
+    peaks at multiple heights.
+
+    Rule lines in printed newspapers are always perfectly straight.  On a
+    skewed scan they remain straight but tilted.  By measuring the gutter
+    pattern at 10 narrow bands and fitting a robust line (Theil-Sen) through
+    each gutter's positions, we recover the tilt angle.
+
+    Returns skew in degrees (positive = clockwise tilt).
+    Returns 0.0 if HAS_CV2 is False or the signal is too weak.
+    """
+    if not HAS_CV2:
+        return 0.0
+    import math as _math
+    left, top, right, bot = content_bounds
+    cw, ch = right - left, bot - top
+    if cw < 200 or ch < 200:
+        return 0.0
+
+    n_bands = 10
+    spacing = cw / n_cols
+    window = max(8, int(spacing * 0.15))
+
+    # Collect gutter peak positions at each band
+    band_ys = []
+    band_gutters = []   # list of lists: band_gutters[band][gutter_idx]
+    for bi in range(n_bands):
+        frac = 0.15 + 0.70 * bi / (n_bands - 1)
+        yt = top + int(ch * (frac - 0.04))
+        yb = top + int(ch * (frac + 0.04))
+        y_center = (yt + yb) // 2
+        band_ys.append(y_center)
+
+        gs = _gutter_profile_band(img_gray, left, right, yt, yb)
+        gutters = []
+        for k in range(1, n_cols):
+            gx = int(spacing * k)
+            lo = max(0, gx - window)
+            hi = min(len(gs), gx + window + 1)
+            snap_x = lo + int(np.argmax(gs[lo:hi]))
+            gutters.append(snap_x)
+        band_gutters.append(gutters)
+
+    # Fit a straight line per gutter using Theil-Sen (robust to outliers)
+    ys = np.array(band_ys, dtype=float)
+    slopes = []
+    for gi in range(n_cols - 1):
+        xs = np.array([bg[gi] for bg in band_gutters], dtype=float)
+        pairwise = []
+        for i in range(len(ys)):
+            for j in range(i + 1, len(ys)):
+                if ys[j] != ys[i]:
+                    pairwise.append((xs[j] - xs[i]) / (ys[j] - ys[i]))
+        if pairwise:
+            slopes.append(float(np.median(pairwise)))
+
+    if not slopes:
+        return 0.0
+
+    median_slope = float(np.median(slopes))
+    skew_deg = _math.degrees(_math.atan(median_slope))
+    return skew_deg
+
+
+def _deskew_image(img_gray, skew_deg):
+    """
+    Rotate the image to correct the given skew angle.
+    Returns the rotated image (same dimensions, black fill at borders).
+    """
+    if not HAS_CV2 or abs(skew_deg) < 0.05:
+        return img_gray
+    h, w = img_gray.shape
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, skew_deg, 1.0)
+    return cv2.warpAffine(img_gray, M, (w, h),
+                          flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+def _refine_gutters_multiband(img_gray, content_bounds, n_cols,
+                              initial_gutters):
+    """
+    Refine gutter x-positions using the straight-line constraint.
+
+    Rule lines are straight, so the gutter x-position at any y should lie
+    on a line x = slope*y + intercept.  We fit this line from 10 narrow
+    bands (Theil-Sen estimator, robust to ads/headlines that shift peaks)
+    and return the x-position at the page's vertical center.
+
+    Returns refined list of gutter x-coordinates.
+    """
+    if not HAS_CV2:
+        return initial_gutters
+    left, top, right, bot = content_bounds
+    cw, ch = right - left, bot - top
+    spacing = cw / n_cols
+    window = max(8, int(spacing * 0.15))
+
+    n_bands = 10
+    band_ys = []
+    band_peaks = []   # [band][gutter_idx] = x in page coords
+    for bi in range(n_bands):
+        frac = 0.15 + 0.70 * bi / (n_bands - 1)
+        yt = top + int(ch * (frac - 0.04))
+        yb = top + int(ch * (frac + 0.04))
+        band_ys.append((yt + yb) // 2)
+
+        gs = _gutter_profile_band(img_gray, left, right, yt, yb)
+        peaks = []
+        for gi, init_x in enumerate(initial_gutters):
+            # Search near the initial position, not equidistant
+            local_x = init_x - left
+            lo = max(0, local_x - window)
+            hi = min(len(gs), local_x + window + 1)
+            snap_x = lo + int(np.argmax(gs[lo:hi])) + left
+            peaks.append(snap_x)
+        band_peaks.append(peaks)
+
+    # Theil-Sen fit per gutter → x at page center
+    ys = np.array(band_ys, dtype=float)
+    y_center = float(top + ch // 2)
+    refined = []
+    for gi in range(len(initial_gutters)):
+        xs = np.array([bp[gi] for bp in band_peaks], dtype=float)
+        pairwise = []
+        for i in range(len(ys)):
+            for j in range(i + 1, len(ys)):
+                if ys[j] != ys[i]:
+                    pairwise.append((xs[j] - xs[i]) / (ys[j] - ys[i]))
+        if pairwise:
+            slope = float(np.median(pairwise))
+            intercept = float(np.median(xs - slope * ys))
+            refined.append(int(round(slope * y_center + intercept)))
+        else:
+            refined.append(initial_gutters[gi])
+    return refined
+
+
 def _gutter_profile(img_gray, content_bounds):
     """
     Build a composite gutter-detection profile that captures the printed
@@ -609,6 +772,10 @@ def _detect_gutters_equidistant(img_gray, content_bounds, n_cols,
                f"{n_cols - 1} — using gutter profile", level=4)
 
     # ── Equidistant placement snapped to gutter-pattern peaks ────────────
+    # After deskew, rule lines are vertical so a single x-position per
+    # gutter is correct.  The equidistant hypothesis constrains the search
+    # to the right neighborhood; the gutter-pattern profile finds the
+    # exact rule line center within that neighborhood.
     gscore, _ = _gutter_profile(img_gray, content_bounds)
     _, _, snapped_local = _score_equidistant(gscore, cw, n_cols)
     gutters = sorted(x + left for x in snapped_local)
@@ -852,13 +1019,19 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
     """
     Stage 0: Analyze layout of all pages in an issue.
 
-    Two-pass approach:
+    Three-pass approach:
+      Pass 0 — Load all page images.  Estimate skew from vertical rule
+               lines (Theil-Sen fit across 10 narrow bands).  Deskew all
+               pages if the tilt exceeds 0.2°.  Rule lines in printed
+               newspapers are always straight and perpendicular to the
+               horizontal borders — any deviation is scan skew.
       Pass 1 — Score column-count hypotheses (N=3..8) across all pages.
                For each N, places equidistant gutters and measures the
                whitespace-rule_line-whitespace gutter pattern signal.
                Picks the N with the highest cross-page consensus.
       Pass 2 — Re-analyze every page with the winning N, snapping
-               equidistant gutters to actual rule-line positions.
+               equidistant gutters to actual rule-line positions, then
+               refining via multi-band straight-line fitting.
                Also detects mastheads and produces debug overlays.
 
     Returns:
@@ -870,9 +1043,8 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
     tprint(f"  ┌─ Stage 0: Layout analysis ───────────────────────────────",
            worker=worker_id, level=1)
 
-    # ── Pass 1: load images and score column-count hypotheses ────────────
+    # ── Pass 0: load images and deskew if needed ─────────────────────────
     page_images = {}   # pg → (img_gray, bounds)
-    cross_scores = {}  # N → list of (total_contrast, min_contrast) per page
 
     for pg in pages_to_analyze:
         img_bytes, _ = fetch_page_image(ark_id, pg)
@@ -884,6 +1056,33 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
         bounds   = detect_content_bounds(img_gray)
         page_images[pg] = (img_gray, bounds)
 
+    # Estimate skew from the first few pages with a preliminary N=6 guess.
+    # Rule lines are always perfectly straight — any measured tilt is scan
+    # skew.  Median across pages is robust to front-page oddities.
+    skew_estimates = []
+    for pg in list(page_images)[:min(4, len(page_images))]:
+        img_gray, bounds = page_images[pg]
+        skew = _estimate_skew(img_gray, bounds, n_cols=6)
+        skew_estimates.append(skew)
+
+    skew_deg = float(np.median(skew_estimates)) if skew_estimates else 0.0
+    if abs(skew_deg) >= 0.2:
+        tprint(f"  │  deskew: {skew_deg:+.2f}° detected, rotating all pages",
+               worker=worker_id, level=1)
+        for pg in page_images:
+            img_gray, _ = page_images[pg]
+            img_gray = _deskew_image(img_gray, skew_deg)
+            bounds = detect_content_bounds(img_gray)
+            page_images[pg] = (img_gray, bounds)
+    else:
+        tprint(f"  │  deskew: {skew_deg:+.2f}° (within tolerance, no rotation)",
+               worker=worker_id, level=3)
+
+    # ── Pass 1: score column-count hypotheses ────────────────────────────
+    cross_scores = {}  # N → list of (total_contrast, min_contrast) per page
+
+    for pg in page_images:
+        img_gray, bounds = page_images[pg]
         gscore, _ = _gutter_profile(img_gray, bounds)
         cw = bounds[2] - bounds[0]
         for N in range(3, 9):
@@ -922,6 +1121,7 @@ def analyze_issue_layout(ark_id: str, pages_to_analyze: list,
 
         layout = analyze_page_layout(img_gray, pg, bounds,
                                      n_cols=expected_cols)
+        layout["skew_deg"] = skew_deg
         page_layouts[pg] = layout
 
         mast_str = ""
@@ -961,11 +1161,18 @@ def save_calibration(collection_dir: Path, ark_id: str,
     Save auto-detected layout as calibration.json for user review/correction.
     The user can edit this file manually or use the GUI tool to adjust.
     """
+    # Get skew from first layout that has it
+    skew_deg = 0.0
+    for layout in page_layouts.values():
+        if "skew_deg" in layout:
+            skew_deg = layout["skew_deg"]
+            break
     cal = {
         "version": 1,
         "calibrated_from": ark_id,
         "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "expected_cols": expected_cols,
+        "skew_deg": skew_deg,
         "tuning_params": {
             "rule_line_threshold": 0.55,
             "rule_line_contrast": 0.12,
@@ -1011,7 +1218,8 @@ def load_calibration(collection_dir: Path) -> dict | None:
 
 
 def _layout_from_calibration(cal_page: dict, page_num: int,
-                              content_bounds: tuple) -> dict:
+                              content_bounds: tuple,
+                              skew_deg: float = 0.0) -> dict:
     """Convert a calibration.json page entry back to a page_layout dict."""
     left, top, right, bot = content_bounds
     masthead = tuple(cal_page["masthead"]) if cal_page.get("masthead") else None
@@ -1035,6 +1243,7 @@ def _layout_from_calibration(cal_page: dict, page_num: int,
         },
         "gutter_xs": cal_page.get("gutter_xs", []),
         "n_cols": cal_page.get("n_cols", len(columns)),
+        "skew_deg": skew_deg,
         "masthead": masthead,
         "body_top": body_top,
         "columns": columns,
@@ -1930,6 +2139,12 @@ def process_page_local(ark_id: str, page_num: int, total_pages: int,
     h, w = img_gray.shape
     tprint(f"      image loaded: {w}x{h}px ({len(img_bytes)//1024}KB)", level=3)
 
+    # Deskew if layout analysis detected skew
+    skew = page_layout.get("skew_deg", 0.0) if page_layout else 0.0
+    if abs(skew) >= 0.2:
+        img_gray = _deskew_image(img_gray, skew)
+        tprint(f"      deskewed {skew:+.2f}°", level=3)
+
     # Stage 2: Preprocess
     tprint(f"      preprocessing (CLAHE + median blur) ...", level=3)
     enhanced = preprocess_image(img_gray)
@@ -2647,7 +2862,8 @@ def process_issue(issue, api_key, correction_prompt, delay,
                         np.frombuffer(fetch_page_image(ark_id, pg)[0], np.uint8),
                         cv2.IMREAD_GRAYSCALE))
                 page_layouts[pg] = _layout_from_calibration(
-                    cal["page_layouts"][pg_str], pg, bounds)
+                    cal["page_layouts"][pg_str], pg, bounds,
+                    skew_deg=cal.get("skew_deg", 0.0))
             # Pages not in calibration will get auto-detected in process_page_local
         tprint(f"  Using calibration: {expected_cols} cols, "
                f"{len(page_layouts)} page layouts loaded",
