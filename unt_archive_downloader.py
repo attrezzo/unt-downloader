@@ -211,7 +211,7 @@ def configure_global(existing: dict = None) -> dict:
         # Auto-detect skill directory
         candidates = [
             Path(__file__).parent / "initial-ocr skill",
-            Path(__file__).parent / "fraktur-ocr-skill",
+            Path(__file__).parent / "initial-ocr-skill",
         ]
         for c in candidates:
             if c.exists() and (c / "SKILL.md").exists():
@@ -1521,7 +1521,7 @@ def run_update_skill(global_config: dict, args):
     if not skill_path:
         candidates = [
             Path(__file__).parent / "initial-ocr skill",
-            Path(__file__).parent / "fraktur-ocr-skill",
+            Path(__file__).parent / "initial-ocr-skill",
         ]
         for c in candidates:
             if c.exists() and (c / "SKILL.md").exists():
