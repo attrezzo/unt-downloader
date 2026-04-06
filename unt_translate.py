@@ -516,29 +516,19 @@ def _extract_text_from_ai_ocr(md_text: str) -> str:
     Strips the header (above ---), gap tags, and Column/Ad markers,
     returning clean text suitable for translation.
     """
-    # Extract body: everything between first section delimiter and STATS:
-    # Try new delimiter first, fall back to --- for old files
+    # Extract body: everything between ~~<<-->>~~ delimiters and STATS:
     DELIM = "~~<<-->>~~"
     delim_str = f"\n{DELIM}\n"
     first_delim = md_text.find(delim_str)
-    if first_delim >= 0:
-        body_start = first_delim + len(delim_str)
+    if first_delim < 0:
+        text = md_text
     else:
-        first_delim = md_text.find("\n---\n")
-        if first_delim >= 0:
-            body_start = first_delim + 5
-        else:
-            text = md_text
-            body_start = None
-
-    if body_start is not None:
+        body_start = first_delim + len(delim_str)
         stats_idx = md_text.find("\nSTATS:", body_start)
         if stats_idx > 0:
             text = md_text[body_start:stats_idx]
-            for d in [DELIM, "---"]:
-                if text.rstrip().endswith(d):
-                    text = text.rstrip()[:-len(d)]
-                    break
+            if text.rstrip().endswith(DELIM):
+                text = text.rstrip()[:-len(DELIM)]
         else:
             text = md_text[body_start:]
         text = text.strip()

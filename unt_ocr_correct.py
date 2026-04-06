@@ -1428,9 +1428,8 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 
 
 def _extract_body(raw_response: str) -> str:
-    """Extract body text between section delimiters.
+    """Extract body text between ~~<<-->>~~ section delimiters.
 
-    Tries SECTION_DELIM first, falls back to --- for old-format files.
     Takes everything from after the FIRST delimiter to before STATS:.
     """
     # Find LAYOUT: start
@@ -1438,27 +1437,19 @@ def _extract_body(raw_response: str) -> str:
     if layout_idx > 0:
         raw_response = raw_response[layout_idx:]
 
-    # Try new delimiter first, fall back to ---
     delim = f"\n{SECTION_DELIM}\n"
     first_delim = raw_response.find(delim)
-    if first_delim >= 0:
-        body_start = first_delim + len(delim)
-    else:
-        # Fallback: old --- format
-        first_delim = raw_response.find("\n---\n")
-        if first_delim < 0:
-            return raw_response
-        body_start = first_delim + 5
+    if first_delim < 0:
+        return raw_response
+
+    body_start = first_delim + len(delim)
 
     # Find STATS: section (the end marker)
     stats_idx = raw_response.find("\nSTATS:", body_start)
     if stats_idx > 0:
         body = raw_response[body_start:stats_idx]
-        # Strip trailing delimiter
-        for d in [SECTION_DELIM, "---"]:
-            if body.rstrip().endswith(d):
-                body = body.rstrip()[:-len(d)]
-                break
+        if body.rstrip().endswith(SECTION_DELIM):
+            body = body.rstrip()[:-len(SECTION_DELIM)]
     else:
         body = raw_response[body_start:]
 
