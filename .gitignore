@@ -10,8 +10,9 @@ __pycache__/
 */logs/
 # Legacy flat layout (pre-restructure)
 */metadata/
-*/images/
 */ocr/
+*/ocr_html_backup/
+*/images/
 */abbyy/
 */corrected/
 */articles/

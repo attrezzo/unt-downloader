@@ -48,7 +48,7 @@ REQUIREMENTS:
   Anthropic API key for steps 5-6 (set ANTHROPIC_API_KEY or use --api-key)
 """
 
-import sys, os, json, time, re, argparse, subprocess, textwrap, threading
+import sys, os, json, time, re, argparse, subprocess, textwrap, threading, html
 import requests
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -951,15 +951,66 @@ def discover_issues(config: dict) -> list:
 # ---------------------------------------------------------------------------
 # OCR download
 # ---------------------------------------------------------------------------
+
+def extract_ocr_from_html(raw_html: str) -> str:
+    """
+    Extract plain OCR text from a UNT portal HTML page.
+
+    The portal /ocr/ endpoint returns a full HTML page (~15-25 KB) where the
+    actual OCR text lives inside:
+        <div id="ocr-text" ...><p>TEXT WITH <br> LINE BREAKS</p></div>
+
+    This function extracts just that text, converting <br> to newlines and
+    decoding HTML entities. Returns clean plain text suitable for sending to
+    Claude without wasting tokens on navigation, CSS, JavaScript, etc.
+
+    Handles both old (full HTML) and new (already-clean) formats gracefully.
+    """
+    # Already clean text — no HTML to strip
+    if '<' not in raw_html:
+        return raw_html
+
+    # Look for the ocr-text div specifically
+    m = re.search(
+        r'id=["\']ocr-text["\'][^>]*>(.*?)</(?:div|section)',
+        raw_html, re.S | re.I
+    )
+    inner = m.group(1) if m else None
+
+    if inner is None:
+        # No ocr-text div found — might be a bare <p> or already partially
+        # stripped. Try extracting from <p> tags as fallback.
+        p_match = re.search(r'<p[^>]*>(.*?)</p>', raw_html, re.S | re.I)
+        if p_match:
+            inner = p_match.group(1)
+        else:
+            # Last resort: strip all tags from whatever we have
+            inner = raw_html
+
+    # Convert <br> to newlines
+    inner = re.sub(r'<br\s*/?>', '\n', inner, flags=re.I)
+
+    # Remove any remaining HTML tags
+    inner = re.sub(r'<[^>]{0,500}>', '', inner)
+
+    # Decode all HTML entities (&#x27; → ', &amp; → &, etc.)
+    inner = html.unescape(inner)
+
+    # Normalize whitespace: collapse runs of spaces/tabs, limit blank lines
+    inner = re.sub(r'[ \t]{2,}', ' ', inner)
+    inner = re.sub(r'\n{3,}', '\n\n', inner)
+
+    return inner.strip()
+
+
 def _fetch_one_ocr_page(ark_id: str, page: int, pages: int) -> tuple:
     """
     Fetch OCR text for a single page. Returns (page, total_pages, text).
 
-    The UNT portal /ocr/ endpoint returns a full HTML page containing the OCR
-    text inside <div id="ocr-text">. We store the COMPLETE HTML response on
-    disk so it is available for future uses (layout analysis, formatting
-    reconstruction, etc.). HTML stripping happens later in the correction step
-    (unt_ocr_correct.py) before any text is submitted to Claude.
+    The UNT portal /ocr/ endpoint returns a full HTML page (~15-25 KB) with
+    the OCR text inside <div id="ocr-text">. We extract just the plain OCR
+    text at download time via extract_ocr_from_html() so the stored files are
+    clean text (~1-3 KB per page) — no wasted tokens when sent to Claude.
 
     Each call uses its own session so threads don't share connections.
     """
@@ -968,7 +1019,10 @@ def _fetch_one_ocr_page(ark_id: str, page: int, pages: int) -> tuple:
         s = requests.Session()
         s.headers.update(SESSION.headers)
         r = s.get(url, timeout=30)
-        text = r.text.strip() if r.status_code == 200 else ""
+        if r.status_code == 200:
+            text = extract_ocr_from_html(r.text)
+        else:
+            text = ""
     except Exception as e:
         text = f"[error: {e}]"
     return page, pages, text
@@ -1143,6 +1197,86 @@ def download_all_ocr(config: dict, resume: bool = True, workers: int = 8,
     if err_count:
         print(f"  Errors     : {err_count}")
     print(f"  Output     : {OCR_DIR}")
+
+
+def clean_existing_ocr():
+    """
+    Strip HTML from previously-downloaded OCR files.
+
+    Backs up original HTML files to a sibling directory (ocr_html_backup/)
+    before overwriting the clean versions. Already-clean files are skipped.
+
+    Converts old-format files (full HTML per page, ~100-200 KB each) to
+    clean text (~5-20 KB each). Preserves the header and page markers.
+    """
+    if not OCR_DIR or not OCR_DIR.exists():
+        print("No OCR directory found. Run --download-ocr first.")
+        return
+
+    files = sorted(OCR_DIR.glob("*.txt"))
+    if not files:
+        print("No OCR files found.")
+        return
+
+    # Backup directory: sibling to OCR_DIR
+    backup_dir = OCR_DIR.parent / "ocr_html_backup"
+
+    cleaned = 0
+    skipped = 0
+    for fpath in files:
+        raw = fpath.read_text(encoding="utf-8", errors="replace")
+        # Quick check: if file contains typical HTML chrome, it needs cleaning
+        if '<html' not in raw.lower() and '<div' not in raw.lower():
+            skipped += 1
+            continue
+
+        # Back up original before overwriting
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / fpath.name
+        if not backup_path.exists():
+            backup_path.write_text(raw, encoding="utf-8")
+
+        old_kb = fpath.stat().st_size // 1024
+
+        # Parse into header + pages, clean each page, reassemble
+        lines = raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+        hlines, blines, in_h = [], [], True
+        for line in lines:
+            if in_h:
+                hlines.append(line)
+                if line.startswith('=' * 10):
+                    in_h = False
+            else:
+                blines.append(line)
+
+        # Re-parse body into pages
+        body = '\n'.join(blines)
+        page_pattern = re.compile(r'^--- Page (\d+) of (\d+) ---$', re.M)
+        matches = list(page_pattern.finditer(body))
+
+        if not matches:
+            # Single blob — just strip the whole body
+            cleaned_body = extract_ocr_from_html(body)
+            out_lines = hlines + ['', cleaned_body, '']
+        else:
+            out_lines = list(hlines) + ['']
+            for i, m in enumerate(matches):
+                pg_num = m.group(1)
+                total  = m.group(2)
+                start  = m.end()
+                end    = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+                page_html = body[start:end].strip()
+                page_text = extract_ocr_from_html(page_html)
+                out_lines += [f"--- Page {pg_num} of {total} ---", page_text, '']
+
+        fpath.write_text('\n'.join(out_lines), encoding="utf-8")
+        new_kb = fpath.stat().st_size // 1024
+        cleaned += 1
+        print(f"  Cleaned: {fpath.name}  ({old_kb} KB → {new_kb} KB)")
+
+    print(f"\n✓ OCR clean complete: {cleaned} files cleaned, {skipped} already clean.")
+    if cleaned:
+        print(f"  Originals backed up to: {backup_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -1698,6 +1832,8 @@ def main():
                    help="Download raw OCR text (skips already-cached files by default)")
     p.add_argument("--force-ocr",      action="store_true",
                    help="Re-download OCR even if already cached locally")
+    p.add_argument("--clean-ocr",     action="store_true",
+                   help="Strip HTML from existing OCR files in-place (no re-download)")
     p.add_argument("--download-pdf",   action="store_true",
                    help="Download full-issue image PDFs (large)")
     p.add_argument("--preload-images", action="store_true",
@@ -1782,8 +1918,8 @@ def main():
         args.download_ocr = True
 
     if not any([args.configure, args.update_skill, args.discover, args.download_ocr,
-                args.download_pdf, args.preload_images, args.correct, args.compile,
-                args.refine_text, args.refine_image,
+                args.clean_ocr, args.download_pdf, args.preload_images, args.correct,
+                args.compile, args.refine_text, args.refine_image,
                 args.translate, args.status, args.render_pdf]):
         p.print_help()
         return
@@ -1873,6 +2009,9 @@ def main():
     if args.download_ocr:
         download_all_ocr(config, resume=not args.force_ocr, workers=args.workers,
                          ark=args.ark, date_from=args.date_from, date_to=args.date_to)
+
+    if getattr(args, 'clean_ocr', False):
+        clean_existing_ocr()
 
     if args.download_pdf:
         download_all_pdfs(resume=args.resume)
