@@ -205,21 +205,37 @@ class WorkerDashboard:
         self._do_render()
 
     def update(self, worker_id: str, msg: str, status: str = "info"):
-        """Update a worker's current state. Only renders on ok/error."""
+        """Update a worker's current state."""
         with self._lock:
             if worker_id not in self._workers:
                 self._workers[worker_id] = {
-                    "current": "", "t_start": time.monotonic(),
-                    "history": []}
+                    "task": "",        # e.g. "p03 pass 1-2"
+                    "status": "",      # e.g. "generating ~1200 tok"
+                    "t_start": time.monotonic(),
+                    "done_pages": []}  # e.g. ["p01", "p03"]
             w = self._workers[worker_id]
-            w["current"] = msg
-            w["t_start"] = time.monotonic()
+
+            # Detect task assignment vs status update
+            # Task assignments look like "p03 pass 1-2" or "p03 pass 3"
+            if re.match(r'p\d+ pass', msg):
+                w["task"] = msg
+                w["status"] = ""
+                w["t_start"] = time.monotonic()
+            else:
+                w["status"] = msg
+                if not w["task"]:
+                    w["t_start"] = time.monotonic()
+
             if status == "ok":
                 self._pages_done += 1
-                w["history"].append(msg)
+                # Extract page from task
+                m = re.match(r'(p\d+)', w.get("task", ""))
+                if m:
+                    pg = m.group(1)
+                    if pg not in w["done_pages"]:
+                        w["done_pages"].append(pg)
             elif status == "error":
                 self._errors += 1
-                w["history"].append(f"ERR {msg}")
 
     def render_throttled(self):
         """Render if >5s since last render. For worker state changes."""
@@ -248,7 +264,7 @@ class WorkerDashboard:
     def _build_lines(self, now):
         lines = [""]  # blank line separator
 
-        # ── Status bar ────────────────────────────────────────────
+        # ── Progress bar ──────────────────────────────────────────
         elapsed = now - self._start_time
         total = max(self._total_steps, 1)
         done = min(self._steps_done, total)
@@ -262,12 +278,22 @@ class WorkerDashboard:
         else:
             eta_str = self._fmt_time(elapsed)
 
-        ct = self._cost_tracker
-        cost_str = f"  ${ct.total_cost:.2f}" if ct else ""
-
         lines.append(
             f"  [{bar}] {self._pages_done}/{self._total_pages} pages "
-            f"({pct:.0f}%){cost_str}  {eta_str}")
+            f"({pct:.0f}%)  {eta_str}")
+
+        # ── Cost + tokens ─────────────────────────────────────────
+        ct = self._cost_tracker
+        if ct:
+            cost_str = f"${ct.total_cost:.2f}"
+            if ct.budget:
+                cost_str += f" / ${ct.budget:.2f}"
+            avg_str = (f"  ${ct.total_cost / ct.pages_processed:.3f}/pg"
+                       if ct.pages_processed > 0 else "")
+            lines.append(
+                f"  Cost: {cost_str}  "
+                f"Tok: {ct.total_input_tokens:,}in "
+                f"+ {ct.total_output_tokens:,}out{avg_str}")
 
         # ── Workers ───────────────────────────────────────────────
         for wid in sorted(self._workers.keys()):
@@ -275,17 +301,24 @@ class WorkerDashboard:
             age = now - w["t_start"]
             age_str = f"{age:.0f}s" if age >= 2 else ""
 
-            # Short history: completed pages for this worker
-            done_pages = []
-            for h in w["history"]:
-                # Extract page number from history entries like "p03 done 1234 chars"
-                m = re.match(r'p(\d+)', h)
-                if m:
-                    done_pages.append(f"p{int(m.group(1)):02d}")
-            hist_str = f"  ({' '.join(done_pages)})" if done_pages else ""
+            # Build worker line: "w1  p03 pass 1-2  generating ~1200 tok  25s  (p01 p02)"
+            task = w.get("task", "")
+            status = w.get("status", "")
+            # Combine task + status
+            if task and status:
+                display = f"{task}  {status}"
+            elif task:
+                display = task
+            elif status:
+                display = status
+            else:
+                display = "idle"
+
+            hist = w.get("done_pages", [])
+            hist_str = f"  ({' '.join(hist)})" if hist else ""
 
             lines.append(
-                f"  {wid:<4} {w['current']:<45} {age_str:>4}{hist_str}")
+                f"  {wid:<4} {display:<50} {age_str:>4}{hist_str}")
 
         return lines
 
@@ -763,7 +796,10 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
                         msg = (f"generating ~{out_tokens} tok  "
                                f"{elapsed:.0f}s")
                         if _dashboard and wid:
-                            _dashboard.update(wid, msg, "info")
+                            # Update status only — don't overwrite task
+                            with _dashboard._lock:
+                                if wid in _dashboard._workers:
+                                    _dashboard._workers[wid]["status"] = msg
                         else:
                             print(f"    {label} {msg}", flush=True)
                         last_report = now
@@ -876,7 +912,7 @@ def claude_api_call(payload: dict, api_key: str,
                 cost_tracker.record(in_tok, out_tok)
             if label:
                 log_event(f"{label} done  {in_tok:,}in+{out_tok:,}out  "
-                          f"{elapsed:.1f}s", "ok")
+                          f"{elapsed:.1f}s", worker=wid)
             log_debug(f"API response: {in_tok}in+{out_tok}out "
                       f"{elapsed:.1f}s model={model}", level=3)
             return text, usage
