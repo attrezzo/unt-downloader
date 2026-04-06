@@ -1481,7 +1481,10 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 def _extract_body(raw_response: str) -> str:
     """Extract body text between ~~<<-->>~~ section delimiters.
 
-    Takes everything from after the FIRST delimiter to before STATS:.
+    Expected format:  LAYOUT: ... \\n~~<<-->>~~\\n [body] \\n~~<<-->>~~\\n STATS: ...
+    Takes everything from after the FIRST delimiter to before the LAST STATS:
+    that follows a closing delimiter.  Using rfind prevents premature truncation
+    when the model emits per-column stats or the newspaper text contains "STATS:".
     """
     # Find LAYOUT: start
     layout_idx = raw_response.find("LAYOUT:")
@@ -1491,18 +1494,31 @@ def _extract_body(raw_response: str) -> str:
     delim = f"\n{SECTION_DELIM}\n"
     first_delim = raw_response.find(delim)
     if first_delim < 0:
+        log_event("_extract_body: no section delimiter found in response "
+                  f"({len(raw_response)} chars)", "warn")
         return raw_response
 
     body_start = first_delim + len(delim)
 
-    # Find STATS: section (the end marker)
-    stats_idx = raw_response.find("\nSTATS:", body_start)
-    if stats_idx > 0:
-        body = raw_response[body_start:stats_idx]
-        if body.rstrip().endswith(SECTION_DELIM):
-            body = body.rstrip()[:-len(SECTION_DELIM)]
+    # Look for the CLOSING delimiter first — it's more reliable than bare STATS:
+    second_delim = raw_response.find(delim, body_start)
+    if second_delim > 0:
+        body = raw_response[body_start:second_delim]
     else:
-        body = raw_response[body_start:]
+        # No closing delimiter — fall back to LAST \nSTATS: (rfind, not find)
+        stats_idx = raw_response.rfind("\nSTATS:", body_start)
+        if stats_idx > 0:
+            body = raw_response[body_start:stats_idx]
+        else:
+            body = raw_response[body_start:]
+
+    # Strip trailing delimiter remnant if present
+    if body.rstrip().endswith(SECTION_DELIM):
+        body = body.rstrip()[:-len(SECTION_DELIM)]
+
+    log_event(f"_extract_body: raw={len(raw_response)} chars, "
+              f"body_start={body_start}, body={len(body.strip())} chars",
+              "debug")
 
     return body.strip()
 
