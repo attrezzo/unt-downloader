@@ -630,7 +630,13 @@ def claude_api_call(payload: dict, api_key: str,
     req_mb = len(req_data) / 1_048_576
 
     if rate_limiter:
+        t_wait = time.monotonic()
+        if label:
+            log_event(f"{label} waiting for rate limiter...")
         rate_limiter.acquire(estimated_tokens=est_tokens)
+        waited = time.monotonic() - t_wait
+        if waited > 1.0 and label:
+            log_event(f"{label} rate limiter wait: {waited:.0f}s")
 
     for attempt in range(1, 4):
         t0 = time.monotonic()
@@ -951,7 +957,11 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     if not has_image and not abbyy_text and not portal_ocr:
         return {"text": "", "markdown": "", "stats": {}, "status": "no_image"}
 
-    est = EST_INPUT_TOKENS_PASS12 if has_image else 5_000
+    # For rate limiter: use output token estimate, not full input.
+    # Image tokens dominate input but don't consume the TPM rate window
+    # the same way text generation does. Using full input (66k) with
+    # default tier (40k TPM) would block 60+ seconds per page.
+    est = EST_OUTPUT_TOKENS_PASS12 + 2000 if has_image else 5_000
 
     p_label = f"p{page_num:02d} pass1-2"
     try:
@@ -2888,6 +2898,11 @@ def main():
     pass3_prompt = build_pass3_prompt(config)
     rate_limiter = (limiter_from_tier(args.tier)
                     if ClaudeRateLimiter else None)
+    if args.tier == "default":
+        print("  Note: using 'default' rate tier (40k TPM). If you have"
+              " Build tier access,\n"
+              "  use --tier build for faster processing (80k TPM).",
+              flush=True)
     cost_tracker = CostTracker(MODEL_RESOLVE, budget=args.budget)
 
     log = []
