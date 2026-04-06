@@ -181,14 +181,14 @@ class TestOcrCorrectPureFunctions:
         from unt_ocr_correct import parse_gaps
         text = (
             'Before {{ gap | est=10 | imgbbox="100,200,50,30" '
-            '| cnf="0.45" | fragments="Ver...ung" '
+            '| cnf="0.45" | fragments="Ver~~~ung" '
             '| region_ocr="Bcrfamm" [Versammlung] }} after.'
         )
         gaps = parse_gaps(text)
         assert len(gaps) == 1
         assert gaps[0]["est"] == 10
         assert gaps[0]["cnf"] == 0.45
-        assert gaps[0]["fragments"] == "Ver...ung"
+        assert gaps[0]["fragments"] == "Ver~~~ung"
         assert gaps[0]["region_ocr"] == "Bcrfamm"
         assert gaps[0]["guess"] == "Versammlung"
 

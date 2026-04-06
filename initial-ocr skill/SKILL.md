@@ -86,14 +86,14 @@ Review your Pass 1 output. For each `{{ gap }}` marker, re-examine the image at 
 3. Do NOT guess at meaning — just record the raw letterforms
 4. Use `...` for characters you cannot make out at all
 
-The `fragments` field is a **character-level reading** — what the individual letters look like independent of meaning. Not a description, not a guess, not context. Just the raw characters as you see them, including garbled or wrong ones.
+The `fragments` field is a **character-level reading** — what the individual letters look like independent of meaning. Not a description, not a guess, not context. Just the raw characters as you see them, including garbled or wrong ones. Use `~` (tilde) for each unreadable character — not `.` which appears in real text.
 
 **Good fragments:**
-- `fragments="Ber...lung"` — visible B, e, r, gap, l, u, n, g
+- `fragments="Ber~~~lung"` — visible B, e, r, 3 unreadable chars, l, u, n, g
 - `fragments="(i 77l"` — literally what the characters look like (maybe "little")
 - `fragments="Bcrfamm"` — garbled but character-accurate (maybe "Versamml")
 - `fragments="nid)t"` — broken ch ligature visible
-- `fragments="$ouft..."` — $ for Fraktur H, partial word
+- `fragments="$ouft~~b"` — $ for Fraktur H, 2 unreadable, then b
 
 **Bad fragments (do NOT do this):**
 - `fragments="visible capitals suggest story beginning"` — this is a description
@@ -107,9 +107,9 @@ Update each gap with fragments:
 
 Example:
 ```
-{{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" }}
-{{ gap | est=15 | imgbbox="100,400,200,30" | fragments="$ouft...b" }}
-{{ gap | est=8 | imgbbox="300,800,120,25" | fragments="nid)..." }}
+{{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber~~~lung" }}
+{{ gap | est=15 | imgbbox="100,400,200,30" | fragments="$ouft~~b" }}
+{{ gap | est=8 | imgbbox="300,800,120,25" | fragments="nid)~~~" }}
 ```
 
 ---
@@ -134,7 +134,7 @@ This is where guessing happens. For every gap, produce a best guess and assign a
 
    **If cnf 0.80–0.94 — auto-resolved gap.** Keep the gap tag with `status=auto-resolved`. Future refinement passes skip these by default:
    ```
-   {{ gap | est=12 | imgbbox="450,1200,280,45" | cnf="0.85" | status=auto-resolved | fragments="Verfa...ung" | region_ocr="Bcrfaffung" [Verfassung] }}
+   {{ gap | est=12 | imgbbox="450,1200,280,45" | cnf="0.85" | status=auto-resolved | fragments="Verfa~~~ung" | region_ocr="Bcrfaffung" [Verfassung] }}
    ```
 
    **If cnf < 0.80 — open gap.** Needs future review:

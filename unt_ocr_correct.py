@@ -1007,7 +1007,8 @@ Record the raw characters you can see, character by character.
 Use ... for characters you cannot make out. The fragments field is
 a character-level reading — what the letters literally look like,
 even if garbled. Not a description, not a guess.
-Good: fragments="Ber...lung"  fragments="$ouft...b"  fragments="nid)t"
+Use ~ for each unreadable character (not . which appears in text).
+Good: fragments="Ber~~~lung"  fragments="$ouft~~~b"  fragments="nid)t"
 Bad:  fragments="visible capitals"  fragments="likely a noun"
    {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="raw_chars" }}}}
 
