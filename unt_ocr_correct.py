@@ -187,6 +187,7 @@ class WorkerDashboard:
         self._start_time = time.monotonic()
         self._cost_tracker = None
         self._last_render = 0
+        self._render_lines = 0
 
     def set_context(self, total_pages=0, cost_tracker=None,
                     rate_limiter=None, issue_label="",
@@ -237,7 +238,7 @@ class WorkerDashboard:
                 self._errors += 1
 
     def render_throttled(self):
-        """Render if >5s since last render. For worker state changes."""
+        """Render in-place if >5s since last render."""
         now = time.monotonic()
         if now - self._last_render < 5.0:
             return
@@ -252,7 +253,15 @@ class WorkerDashboard:
         self._last_render = time.monotonic()
         with self._lock:
             lines = self._build_lines(time.monotonic())
-        print("\n".join(lines), flush=True)
+        output = "\n".join(lines)
+
+        # Move cursor up to overwrite previous render
+        if self._render_lines > 0:
+            sys.stdout.write(f"\033[{self._render_lines}A\033[J")
+
+        sys.stdout.write(output + "\n")
+        sys.stdout.flush()
+        self._render_lines = len(lines)
 
     def _fmt_time(self, secs):
         if secs < 60:
@@ -325,7 +334,10 @@ class WorkerDashboard:
         return lines
 
     def final_summary(self):
-        """Print final summary."""
+        """Print final summary. Clears the dashboard first."""
+        if self._render_lines > 0:
+            sys.stdout.write(f"\033[{self._render_lines}A\033[J")
+            self._render_lines = 0
         elapsed = time.monotonic() - self._start_time
         ct = self._cost_tracker
         cost_str = f"  Cost: ${ct.total_cost:.2f}" if ct else ""
@@ -375,7 +387,8 @@ def log_event(msg: str, status: str = "info", worker: str = ""):
         _dashboard.update(worker, msg, status)
         _dashboard.render_throttled()
     elif _dashboard:
-        # No worker specified — just print directly
+        # No worker specified — print directly, reset cursor tracking
+        _dashboard._render_lines = 0
         icon = {"ok": "+", "error": "X", "skip": "-"}.get(status, " ")
         print(f"  {icon} {msg}", flush=True)
     if _file_logger:
