@@ -46,8 +46,8 @@ ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL  = "claude-sonnet-4-6"
 ILLEGIBLE     = "[unleserlich]"  # deprecated — kept only for parsing legacy files
 
-# Token estimates (calibrated: ~56k image + ~5k prompt + ~1k reference OCR)
-EST_INPUT_TOKENS_PER_PAGE  = 62_000
+# Token estimates (calibrated: ~56k image + ~7k prompt + ~5k reference OCR)
+EST_INPUT_TOKENS_PER_PAGE  = 68_000
 EST_OUTPUT_TOKENS_PER_PAGE = 5_000
 MAX_OUTPUT_TOKENS          = 16_000
 
@@ -263,14 +263,29 @@ def get_abbyy_page_text(issue_fname: str, page_num: int):
 
 
 def get_portal_ocr_text(issue_fname: str, page_num: int):
+    """Get portal OCR text for a specific page, stripping HTML."""
     ocr_path = OCR_DIR / issue_fname
     if not ocr_path.exists():
         return None
     raw = ocr_path.read_text(encoding="utf-8", errors="replace")
+
+    # Try structured format first (has --- Page N of M --- markers)
     _, pages = parse_ocr_pages(raw)
-    page_text = pages.get(page_num, "")
-    if page_text:
-        return strip_ocr_html(page_text)
+    if pages:
+        page_text = pages.get(page_num, "")
+        if page_text:
+            return strip_ocr_html(page_text)
+        return None
+
+    # Fallback: raw HTML without page markers (single-page OCR dump).
+    # Strip HTML and return the whole thing for page 1, or None for others.
+    stripped = strip_ocr_html(raw)
+    if stripped and page_num == 1:
+        return stripped
+    # For multi-page raw HTML with no markers, return the full text
+    # for any page — better than nothing, Claude can cross-reference.
+    if stripped:
+        return stripped
     return None
 
 
@@ -577,22 +592,29 @@ def build_page_prompt(ark_id: str, page_num: int, total_pages: int,
             "WARNING: Page image unavailable. Work from reference OCR only.")
         text_parts.append("")
 
+    # Reference OCR cap: a dense newspaper page can be 15-25k chars.
+    # 30k chars ≈ 7500 tokens — worth sending for cross-referencing.
+    OCR_TEXT_CAP = 30_000
+
     if abbyy_text:
         text_parts.append(
             "ABBYY OCR TEXT (raw, may contain errors - use for cross-referencing):")
         text_parts.append("```")
-        if len(abbyy_text) > 8000:
-            text_parts.append(abbyy_text[:8000] + "\n[... truncated ...]")
+        if len(abbyy_text) > OCR_TEXT_CAP:
+            text_parts.append(
+                abbyy_text[:OCR_TEXT_CAP] + "\n[... truncated ...]")
         else:
             text_parts.append(abbyy_text)
         text_parts.append("```")
         text_parts.append("")
     elif portal_ocr:
         text_parts.append(
-            "PORTAL OCR TEXT (raw UNT portal text, may contain errors):")
+            "PORTAL OCR TEXT (stripped from UNT portal HTML, may contain "
+            "errors - use for cross-referencing):")
         text_parts.append("```")
-        if len(portal_ocr) > 8000:
-            text_parts.append(portal_ocr[:8000] + "\n[... truncated ...]")
+        if len(portal_ocr) > OCR_TEXT_CAP:
+            text_parts.append(
+                portal_ocr[:OCR_TEXT_CAP] + "\n[... truncated ...]")
         else:
             text_parts.append(portal_ocr)
         text_parts.append("```")
