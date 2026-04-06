@@ -213,16 +213,24 @@ class WorkerDashboard:
                 self._skipped += 1
 
     def render(self, force=False):
-        """Redraw the dashboard. Throttled to every 0.5s unless forced."""
+        """Redraw the dashboard. Only renders on force=True (page complete).
+        Streaming updates go to worker state but don't trigger display."""
+        if not force:
+            return
         now = time.monotonic()
-        if not force and (now - self._last_render) < 0.5:
+        # Minimum 2s between renders to avoid spam
+        if not force and (now - self._last_render) < 2.0:
             return
         with self._lock:
             self._last_render = now
             lines = self._build_lines(now)
 
+        # Try ANSI overwrite (works on modern terminals, not old PowerShell)
         if self._render_lines > 0:
-            sys.stdout.write(f"\033[{self._render_lines}A\033[J")
+            try:
+                sys.stdout.write(f"\033[{self._render_lines}A\033[J")
+            except Exception:
+                pass  # ANSI not supported, just print below
 
         output = "\n".join(lines)
         sys.stdout.write(output + "\n")
@@ -238,11 +246,6 @@ class WorkerDashboard:
     def _build_lines(self, now):
         lines = []
         elapsed = now - self._start_time
-
-        # ── Issue header ──────────────────────────────────────────
-        if self._issue_label:
-            lines.append(f"  {self._issue_label}")
-            lines.append("")
 
         # ── Progress bar + stats ──────────────────────────────────
         done = self._completed + self._errors + self._skipped
