@@ -618,14 +618,98 @@ class CostTracker:
 # CLAUDE API
 # ============================================================================
 
+def _claude_call_standard(req_data, api_key, timeout=300):
+    """Standard (non-streaming) API call. Returns parsed JSON dict."""
+    req = urllib.request.Request(
+        ANTHROPIC_API, data=req_data,
+        headers={"Content-Type": "application/json",
+                 "x-api-key": api_key,
+                 "anthropic-version": "2023-06-01"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def _claude_call_streaming(req_data, api_key, label, timeout=300):
+    """Streaming API call. Reads SSE events, prints token progress,
+    returns (text, usage) matching standard call interface."""
+    # Add stream:true to the payload
+    payload = json.loads(req_data)
+    payload["stream"] = True
+    stream_data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        ANTHROPIC_API, data=stream_data,
+        headers={"Content-Type": "application/json",
+                 "x-api-key": api_key,
+                 "anthropic-version": "2023-06-01"},
+        method="POST")
+    resp = urllib.request.urlopen(req, timeout=timeout)
+
+    text_parts = []
+    usage = {}
+    out_tokens = 0
+    last_report = time.monotonic()
+
+    try:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]  # strip "data: " prefix
+            if data_str == "[DONE]":
+                break
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type", "")
+
+            if etype == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    chunk = delta.get("text", "")
+                    text_parts.append(chunk)
+                    out_tokens += len(chunk) // 4 + 1  # rough estimate
+
+                    # Print progress every 2 seconds
+                    now = time.monotonic()
+                    if now - last_report >= 2.0:
+                        log_debug(f"{label} streaming... "
+                                  f"~{out_tokens} tok", level=5)
+                        print(f"    {label} streaming... "
+                              f"~{out_tokens} tok", flush=True)
+                        last_report = now
+
+            elif etype == "message_start":
+                msg = event.get("message", {})
+                u = msg.get("usage", {})
+                if u:
+                    usage["input_tokens"] = u.get("input_tokens", 0)
+
+            elif etype == "message_delta":
+                u = event.get("usage", {})
+                if u:
+                    usage["output_tokens"] = u.get("output_tokens", 0)
+
+    finally:
+        resp.close()
+
+    text = "".join(text_parts).strip()
+    return text, usage
+
+
 def claude_api_call(payload: dict, api_key: str,
                     rate_limiter=None, est_tokens: int = 8000,
                     cost_tracker=None, label: str = ""):
     """Make a Claude API call with retry/rate-limit. Returns (text, usage).
-    label: short identifier for stdout progress (e.g. 'p01 pass1-2')."""
+    Uses streaming when LOG_LEVEL >= 5 for real-time token progress."""
     model = payload.get("model", "?")
+    use_streaming = LOG_LEVEL >= 5
     log_debug(f"API call: model={model} max_tokens={payload.get('max_tokens')} "
-              f"est={est_tokens} label={label}", level=3)
+              f"est={est_tokens} stream={use_streaming} label={label}",
+              level=3)
     req_data = json.dumps(payload).encode("utf-8")
     req_mb = len(req_data) / 1_048_576
 
@@ -641,22 +725,27 @@ def claude_api_call(payload: dict, api_key: str,
     for attempt in range(1, 4):
         t0 = time.monotonic()
         if label:
-            log_event(f"{label} sending {req_mb:.1f}MB to {model}...")
+            mode = " (streaming)" if use_streaming else ""
+            log_event(f"{label} sending {req_mb:.1f}MB to {model}{mode}...")
         try:
-            req = urllib.request.Request(
-                ANTHROPIC_API, data=req_data,
-                headers={"Content-Type": "application/json",
-                         "x-api-key": api_key,
-                         "anthropic-version": "2023-06-01"},
-                method="POST")
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                result = json.loads(resp.read())
+            if use_streaming:
+                text, usage = _claude_call_streaming(
+                    req_data, api_key, label)
+            else:
+                result = _claude_call_standard(req_data, api_key)
+                usage = result.get("usage", {})
+                text = ""
+                for block in result.get("content", []):
+                    if block.get("type") == "text":
+                        text = block["text"].strip()
+                        break
+
             elapsed = time.monotonic() - t0
-            usage = result.get("usage", {})
             in_tok = usage.get("input_tokens", 0)
             out_tok = usage.get("output_tokens", 0)
             if rate_limiter:
-                rate_limiter.record_usage(input_tokens=in_tok, output_tokens=out_tok)
+                rate_limiter.record_usage(
+                    input_tokens=in_tok, output_tokens=out_tok)
             if cost_tracker:
                 cost_tracker.record(in_tok, out_tok)
             if label:
@@ -664,11 +753,6 @@ def claude_api_call(payload: dict, api_key: str,
                           f"{elapsed:.1f}s", "ok")
             log_debug(f"API response: {in_tok}in+{out_tok}out "
                       f"{elapsed:.1f}s model={model}", level=3)
-            text = ""
-            for block in result.get("content", []):
-                if block.get("type") == "text":
-                    text = block["text"].strip()
-                    break
             return text, usage
         except urllib.error.HTTPError as e:
             elapsed = time.monotonic() - t0
