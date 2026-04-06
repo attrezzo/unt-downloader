@@ -204,6 +204,11 @@ class WorkerDashboard:
             self._steps_done += 1
         self._do_render()
 
+    def page_done(self):
+        """Record one page fully completed."""
+        with self._lock:
+            self._pages_done += 1
+
     def update(self, worker_id: str, msg: str, status: str = "info"):
         """Update a worker's current state."""
         with self._lock:
@@ -226,15 +231,7 @@ class WorkerDashboard:
                 if not w["task"]:
                     w["t_start"] = time.monotonic()
 
-            if status == "ok":
-                self._pages_done += 1
-                # Extract page from task
-                m = re.match(r'(p\d+)', w.get("task", ""))
-                if m:
-                    pg = m.group(1)
-                    if pg not in w["done_pages"]:
-                        w["done_pages"].append(pg)
-            elif status == "error":
+            if status == "error":
                 self._errors += 1
 
     def render_throttled(self):
@@ -299,26 +296,29 @@ class WorkerDashboard:
         for wid in sorted(self._workers.keys()):
             w = self._workers[wid]
             age = now - w["t_start"]
-            age_str = f"{age:.0f}s" if age >= 2 else ""
+            age_str = self._fmt_time(age) if age >= 2 else ""
 
-            # Build worker line: "w1  p03 pass 1-2  generating ~1200 tok  25s  (p01 p02)"
             task = w.get("task", "")
             status = w.get("status", "")
-            # Combine task + status
-            if task and status:
-                display = f"{task}  {status}"
-            elif task:
-                display = task
-            elif status:
-                display = status
-            else:
-                display = "idle"
-
             hist = w.get("done_pages", [])
-            hist_str = f"  ({' '.join(hist)})" if hist else ""
+            hist_str = f"  done: {' '.join(hist)}" if hist else ""
 
-            lines.append(
-                f"  {wid:<4} {display:<50} {age_str:>4}{hist_str}")
+            # Parse task into page + pass
+            task_m = re.match(r'(p\d+)\s+(pass\s+\S+)', task)
+            if task_m:
+                page = task_m.group(1)
+                pass_name = task_m.group(2)
+                lines.append(
+                    f"  {wid} | {page} | {pass_name} | {age_str}{hist_str}")
+            elif task:
+                lines.append(
+                    f"  {wid} | {task} | {age_str}{hist_str}")
+            else:
+                lines.append(
+                    f"  {wid} | idle{hist_str}")
+
+            if status:
+                lines.append(f"    * {status}")
 
         return lines
 
@@ -1848,9 +1848,9 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
         def _correct_one(pg):
             """Correct a single page (runs in thread pool)."""
             if _interrupted:
-                return pg, {"status": "interrupted", "text": ""}
+                return pg, {"status": "interrupted", "text": ""}, ""
             if cost_tracker and cost_tracker.would_exceed_budget():
-                return pg, {"status": "budget", "text": ""}
+                return pg, {"status": "budget", "text": ""}, ""
             with _slot_lock:
                 slot = _free_slots.pop() if _free_slots else pg
             wid = f"w{slot}"
@@ -1862,7 +1862,7 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
             finally:
                 with _slot_lock:
                     _free_slots.append(slot)
-            return pg, result
+            return pg, result, wid
 
         pages_done = 0
         # Process results AS each page completes (not batched at the end).
@@ -1883,7 +1883,7 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                 for fut in done_batch:
                     pg = futures.pop(fut)
                     try:
-                        _, res = fut.result(timeout=0)
+                        _, res, wid = fut.result(timeout=0)
                     except Exception as e:
                         log_event(f"p{pg:02d} FAILED: {e}", "error")
                         continue
@@ -1893,16 +1893,30 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                     if res["status"] == "ok":
                         page_md_path.write_text(
                             res["markdown"], encoding="utf-8")
+                        if _dashboard:
+                            _dashboard.page_done()
+                            # Track completed page in worker history
+                            with _dashboard._lock:
+                                if wid in _dashboard._workers:
+                                    w = _dashboard._workers[wid]
+                                    pg_str = f"p{pg:02d}"
+                                    if pg_str not in w["done_pages"]:
+                                        w["done_pages"].append(pg_str)
+                                    w["task"] = ""
+                                    w["status"] = f"p{pg:02d} done  {len(res['text'])} chars"
                         log_event(f"p{pg:02d} done  "
-                                  f"{len(res['text'])} chars", "ok")
+                                  f"{len(res['text'])} chars",
+                                  worker=wid)
                     elif res["status"] == "no_image":
-                        log_event(f"p{pg:02d} no image", "skip")
+                        log_event(f"p{pg:02d} no image", "skip",
+                                  worker=wid)
                     elif res["status"] in ("budget", "interrupted"):
-                        log_event(f"p{pg:02d} {res['status']}", "skip")
+                        log_event(f"p{pg:02d} {res['status']}", "skip",
+                                  worker=wid)
                     else:
                         log_event(
                             f"p{pg:02d} {res.get('error', 'unknown')}",
-                            "error")
+                            "error", worker=wid)
 
                     print_status(cost_tracker,
                                  step_name="AI OCR Correction",
