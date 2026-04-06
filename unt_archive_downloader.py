@@ -69,7 +69,7 @@ OUTPUT_DIR    = None
 METADATA_DIR  = None
 OCR_DIR       = None
 PDF_DIR       = None
-CORRECTED_DIR = None
+AI_OCR_DIR    = None
 TRANSLATED_DIR= None
 IMAGES_DIR    = None
 CONFIG_PATH   = None
@@ -77,14 +77,14 @@ CONFIG_PATH   = None
 def init_paths(collection_dir: Path):
     """Set all path globals from the collection root directory."""
     global OUTPUT_DIR, METADATA_DIR, OCR_DIR, PDF_DIR
-    global CORRECTED_DIR, TRANSLATED_DIR, IMAGES_DIR, CONFIG_PATH
+    global AI_OCR_DIR, TRANSLATED_DIR, IMAGES_DIR, CONFIG_PATH
     OUTPUT_DIR     = collection_dir
     # sources/
     METADATA_DIR   = collection_dir / "sources" / "metadata"
     OCR_DIR        = collection_dir / "sources" / "portal_ocr"
     IMAGES_DIR     = collection_dir / "sources" / "images"
     # output/
-    CORRECTED_DIR  = collection_dir / "output" / "corrected"
+    AI_OCR_DIR     = collection_dir / "output" / "ai_ocr"
     TRANSLATED_DIR = collection_dir / "output" / "translated"
     PDF_DIR        = collection_dir / "output" / "pdf"
     CONFIG_PATH    = collection_dir / "collection.json"
@@ -1366,8 +1366,8 @@ def show_status(config: dict):
         ("Raw OCR",       OCR_DIR),
         ("Images cached", IMAGES_DIR),
         ("ABBYY XML",     OUTPUT_DIR / "sources" / "abbyy"),
-        ("Corrected OCR", CORRECTED_DIR),
-        ("Articles",      OUTPUT_DIR / "output" / "articles"),
+        ("AI OCR",        AI_OCR_DIR),
+        ("Snippets",      OUTPUT_DIR / "output" / "snippets"),
         ("Translated",    TRANSLATED_DIR),
         ("PDFs",          OUTPUT_DIR / "output" / "pdf"),
     ]
@@ -1420,14 +1420,11 @@ def show_status(config: dict):
     total_pages = sum(int(i.get("pages", 8)) for i in issues)
     if img_count < total_pages:
         steps.append(f"  python {script} --preload-images")
-    if not any(CORRECTED_DIR.glob("*.txt") if CORRECTED_DIR.exists() else []):
+    ai_ocr_done = sum(1 for d in AI_OCR_DIR.iterdir()
+                       if d.is_dir() and any(d.glob("page_*.md"))) \
+                   if AI_OCR_DIR and AI_OCR_DIR.exists() else 0
+    if ai_ocr_done < len(issues):
         steps.append(f"  python {script} --correct --resume")
-    articles_dir = OUTPUT_DIR / "output" / "articles"
-    articles_done = sum(1 for d in articles_dir.iterdir()
-                        if d.is_dir() and any(d.glob("*_art*.txt"))) \
-                    if articles_dir.exists() else 0
-    if articles_done < len(issues):
-        steps.append(f"  python {script} --correct --resume  # also generates articles/")
     if not any(TRANSLATED_DIR.glob("*.txt") if TRANSLATED_DIR.exists() else []):
         steps.append(f"  python {script} --translate --resume")
     pdf_dir = OUTPUT_DIR / "output" / "pdf"

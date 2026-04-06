@@ -87,14 +87,14 @@ def tprint(*args, worker: str = "", **kwargs):
 
 METADATA_DIR  = None
 OCR_DIR       = None
-CORRECTED_DIR = None
+AI_OCR_DIR    = None
 TRANSLATED_DIR= None
 
 def init_paths(collection_dir: Path):
-    global METADATA_DIR, OCR_DIR, CORRECTED_DIR, TRANSLATED_DIR
+    global METADATA_DIR, OCR_DIR, AI_OCR_DIR, TRANSLATED_DIR
     METADATA_DIR   = collection_dir / "sources" / "metadata"
     OCR_DIR        = collection_dir / "sources" / "portal_ocr"
-    CORRECTED_DIR  = collection_dir / "output" / "corrected"
+    AI_OCR_DIR     = collection_dir / "output" / "ai_ocr"
     TRANSLATED_DIR = collection_dir / "output" / "translated"
 
 
@@ -510,12 +510,50 @@ def _parse_response(response: str, pages_sent: list, total_pages: int,
 # ---------------------------------------------------------------------------
 # Get best available source text for a page
 # ---------------------------------------------------------------------------
+def _extract_text_from_ai_ocr(md_text: str) -> str:
+    """Extract plain text from an ai_ocr page markdown file.
+
+    Strips the header (above ---), gap tags, and Column/Ad markers,
+    returning clean text suitable for translation.
+    """
+    # Text body is after the first --- separator
+    parts = md_text.split("\n---\n")
+    body = parts[1] if len(parts) >= 2 else md_text
+
+    # Strip LAYOUT/COLUMNS/DAMAGE header lines
+    lines = body.strip().split('\n')
+    clean = []
+    skip_header = True
+    for line in lines:
+        if skip_header:
+            if line.startswith(('LAYOUT:', 'COLUMNS:', 'DAMAGE:')):
+                continue
+            if line.strip() == '' and not clean:
+                continue
+            skip_header = False
+        if line.startswith('STATS:'):
+            break
+        clean.append(line)
+
+    text = '\n'.join(clean).strip()
+
+    # Strip gap tags → replace with best guess
+    text = re.sub(r'\{\{\s*gap\s*\|[^}]*\[([^\]]*)\]\s*\}\}', r'\1', text)
+    # Strip Column/Ad markers
+    text = re.sub(r'\{\{\s*/?(?:Column|Ad)\d*\s*\}\}', '', text)
+    # Strip Img markers
+    text = re.sub(r'\{\{\s*Img\s*\|[^}]*\}\}', '', text)
+    # Collapse blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def get_source_pages(issue: dict, pages_needed: list) -> tuple[dict, bool]:
     """
-    Return (source_pages_dict, using_corrected) for the given page numbers.
+    Return (source_pages_dict, using_ai_ocr) for the given page numbers.
 
-    Priority: corrected/ file → strip HTML from ocr/ file → empty string.
-    Source text is always returned as plain text (HTML stripped).
+    Priority: ai_ocr/ per-page .md files → strip HTML from ocr/ file → empty.
+    Source text is always returned as plain text.
     """
     ark_id = issue['ark_id']
     vol    = str(issue.get('volume', '?')).zfill(2)
@@ -523,19 +561,22 @@ def get_source_pages(issue: dict, pages_needed: list) -> tuple[dict, bool]:
     date   = re.sub(r'[^\w\-]', '-', issue.get('date', 'unknown'))
     fname  = f'{ark_id}_vol{vol}_no{num}_{date}.txt'
 
-    corr_path = CORRECTED_DIR / fname
-    ocr_path  = OCR_DIR       / fname
-
-    # Try corrected first
-    if corr_path.exists() and corr_path.stat().st_size > 200:
-        _, corr_pages = parse_pages(corr_path.read_text(encoding='utf-8', errors='replace'))
-        # Clean any residual HTML
-        source = {pg: strip_html(corr_pages.get(pg, '')) for pg in pages_needed}
-        # Check they're actually non-empty
+    # Try ai_ocr/ per-page markdown files first
+    ai_dir = AI_OCR_DIR / ark_id if AI_OCR_DIR else None
+    if ai_dir and ai_dir.exists():
+        source = {}
+        for pg in pages_needed:
+            md_path = ai_dir / f"page_{pg:02d}.md"
+            if md_path.exists():
+                source[pg] = _extract_text_from_ai_ocr(
+                    md_path.read_text(encoding='utf-8', errors='replace'))
+            else:
+                source[pg] = ''
         if any(v.strip() for v in source.values()):
             return source, True
 
-    # Fall back to raw OCR
+    # Fall back to raw portal OCR
+    ocr_path = OCR_DIR / fname
     if ocr_path.exists():
         _, ocr_pages = parse_pages(ocr_path.read_text(encoding='utf-8', errors='replace'))
         source = {pg: strip_html(ocr_pages.get(pg, '')) for pg in pages_needed}
@@ -555,7 +596,7 @@ def get_issue_header(issue: dict) -> str:
     date   = re.sub(r'[^\w\-]', '-', issue.get('date', 'unknown'))
     fname  = f'{ark_id}_vol{vol}_no{num}_{date}.txt'
 
-    for path in [CORRECTED_DIR / fname, OCR_DIR / fname]:
+    for path in [OCR_DIR / fname]:
         if path and path.exists():
             header, _ = parse_pages(path.read_text(encoding='utf-8', errors='replace'))
             if header.strip():
@@ -752,12 +793,13 @@ def main():
         return TRANSLATED_DIR / f'{ark}_vol{v}_no{n}_{d}.txt'
 
     corr_count = sum(1 for i in issues
-                     if (CORRECTED_DIR / _trans_path(i).name).exists())
+                     if (AI_OCR_DIR / i['ark_id']).exists()
+                     and any((AI_OCR_DIR / i['ark_id']).glob("page_*.md")))
 
     # Print collection summary immediately — before any network calls
     print(f'Collection       : {config["title_name"]}', flush=True)
     print(f'Issues           : {len(issues)}', flush=True)
-    print(f'Corrected OCR    : {corr_count}/{len(issues)}', flush=True)
+    print(f'AI OCR           : {corr_count}/{len(issues)}', flush=True)
     print(f'Max output tokens: {args.max_output_tokens}', flush=True)
     print(f'Model            : {CLAUDE_MODEL}', flush=True)
     print(f'Output           : {TRANSLATED_DIR}', flush=True)

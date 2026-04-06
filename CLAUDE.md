@@ -46,7 +46,7 @@ selective re-OCR of only the unreadable regions.
 ```
 unt_archive_downloader.py   Orchestrator. Config, discovery, download, subprocess dispatch.
 unt_ocr_correct.py          Multi-engine OCR + article segmentation. Primary extension point.
-unt_translate.py            Translates corrected/ → English. Smart --resume.
+unt_translate.py            Translates ai_ocr/ → English. Smart --resume.
 unt_render_pdf.py           Renders translated/ as PDFs. ReportLab only, no API calls.
 unt_cost_estimate.py        Model selector + cost confirmation before API use.
 claude_rate_limiter.py      Thread-safe dual token-bucket rate limiter.
@@ -74,9 +74,8 @@ sources/                                     Downloaded input data
     abbyy/{ark}_vol{v}_no{n}_{date}.xml     Optional ABBYY FineReader XML
 output/                                      Generated pipeline output
     ai_ocr/{ark_id}/page_01.md ... page_NN.md  Per-page markup with gap tags
-    corrected/{ark}_vol{v}_no{n}_{date}.txt  Best OCR in source language
-    articles/{ark_id}/{ark_id}_{date}_art{NNN}.txt  Segmented articles
-    articles/{ark_id}/manifest.json
+    snippets/{ark_id}/{ark_id}_{date}_art{NNN}.txt  Segmented articles (refinement)
+    snippets/{ark_id}/manifest.json
     translated/{ark}_vol{v}_no{n}_{date}.txt English translations
     readable/{ark}_vol{v}_no{n}_{date}.md    Compiled human-readable markdown
     pdf/{ark}_vol{v}_no{n}_{date}.pdf
@@ -91,7 +90,7 @@ Example: `metapth1478562_vol01_no01_1891-09-17.txt`
 
 ## Shared text file format
 
-**Every file in ocr/, corrected/, translated/ uses this exact format.** Never change it.
+**Every file in ocr/, translated/ uses this exact format.** Never change it.
 
 ```
 === COLLECTION TITLE ===
@@ -254,11 +253,11 @@ Every engine returns `list[dict]`. Alignment accepts any mix automatically.
 - `proofread_page()` — Stage 9. Claude reviews each corrected page for residual
   spelling errors and OCR artifacts (Fraktur-specific: ſ/s, broken compounds,
   hyphenated line breaks). Validates [unleserlich] markers preserved. Runs before
-  corrected/ file is written, so the file contains proofread text.
-- `segment_page()` — Stage 10a. Claude segments corrected text into articles/ads.
+  ai_ocr/ page is written, so the file contains proofread text.
+- `segment_page()` — Stage 10a. Claude segments text into articles/ads. (refinement step, not correction)
 - `stitch_all_pages()` — Stage 10b. Sequential cross-page stitching. Do not parallelize.
   Multi-page articles merged into single items with `page_span` updated.
-- `write_article_files()` — Stage 11. ONLY writer to `articles/`.
+- `write_article_files()` — Stage 11. ONLY writer to `snippets/`. (refinement step)
   Files named `{ark_id}_{date}_art{NNN}.txt`. Each stitched multi-page article
   is a single file.
 
@@ -282,7 +281,7 @@ Update all three together.
   (all pages in one call for cross-page consistency) → merge → `write_translated_file()`.
 - `call_claude()` handles max_tokens: writes BUDGET_EXCEEDED with embedded OCR for retry.
 - `write_translated_file()` is THE ONLY writer to `translated/`. Always full merged dict.
-- `get_source_pages()`: priority corrected/ → stripped ocr/ → empty. Never raw HTML.
+- `get_source_pages()`: priority ai_ocr/ → stripped ocr/ → empty. Never raw HTML.
 
 ---
 
@@ -336,7 +335,7 @@ apt-get install tesseract-ocr tesseract-ocr-deu
 
 **ocr/ stores raw portal HTML.** Strip only at read time via `strip_ocr_html()`.
 
-**corrected/ is the only translation input.** `get_source_pages()` enforces this.
+**ai_ocr/ is the primary translation input.** `get_source_pages()` extracts clean text from per-page .md files.
 
 **Translated files are patched.** `write_translated_file()` is sole writer, receives full merged dict.
 

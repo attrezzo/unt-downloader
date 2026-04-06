@@ -143,9 +143,8 @@ PORTAL_OCR_DIR = None
 IMAGES_DIR    = None
 ABBYY_DIR     = None
 # output/
-CORRECTED_DIR = None
 AI_OCR_DIR    = None
-ARTICLES_DIR  = None
+SNIPPETS_DIR  = None
 READABLE_DIR  = None
 
 
@@ -392,19 +391,17 @@ def print_status(cost_tracker=None, step_name="OCR Correction",
 
 def init_paths(collection_dir: Path):
     global METADATA_DIR, PORTAL_OCR_DIR, IMAGES_DIR, ABBYY_DIR
-    global CORRECTED_DIR, AI_OCR_DIR, ARTICLES_DIR, READABLE_DIR
+    global AI_OCR_DIR, SNIPPETS_DIR, READABLE_DIR
     # sources/
     METADATA_DIR   = collection_dir / "sources" / "metadata"
     PORTAL_OCR_DIR = collection_dir / "sources" / "portal_ocr"
     IMAGES_DIR     = collection_dir / "sources" / "images"
     ABBYY_DIR      = collection_dir / "sources" / "abbyy"
     # output/
-    CORRECTED_DIR  = collection_dir / "output" / "corrected"
     AI_OCR_DIR     = collection_dir / "output" / "ai_ocr"
-    ARTICLES_DIR   = collection_dir / "output" / "articles"
+    SNIPPETS_DIR   = collection_dir / "output" / "snippets"
     READABLE_DIR   = collection_dir / "output" / "readable"
-    for d in [CORRECTED_DIR, AI_OCR_DIR, ARTICLES_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
+    AI_OCR_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================================
@@ -1779,13 +1776,12 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     newspaper = issue.get("full_title", issue.get("title", ""))
 
     ocr_path   = PORTAL_OCR_DIR / fname
-    corr_path  = CORRECTED_DIR / fname
-    ark_dir    = ARTICLES_DIR / ark_id
     ai_ocr_dir = AI_OCR_DIR / ark_id
 
-    # Resume check
-    if resume and not force and corr_path.exists() and corr_path.stat().st_size > 500:
-        if ark_dir.exists() and any(ark_dir.glob("*_art*.txt")):
+    # Resume check — skip if ai_ocr/ dir has all pages
+    if resume and not force and ai_ocr_dir.exists():
+        existing_md = set(ai_ocr_dir.glob("page_*.md"))
+        if len(existing_md) >= int(issue.get("pages", 8)):
             tprint(f"  SKIP {fname} (already complete)",
                    worker=worker_id, level=1)
             return "skipped"
@@ -1814,22 +1810,14 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
 
     tprint(f"  {actual_pages}pp  AI OCR correction", worker=worker_id, level=1)
 
-    # Existing corrected pages for partial resume
-    existing_corrected = {}
-    if resume and not force and corr_path.exists():
-        _, existing_corrected = parse_ocr_pages(
-            corr_path.read_text(encoding="utf-8", errors="replace"))
-
     ai_ocr_dir.mkdir(parents=True, exist_ok=True)
-    corrected_pages = dict(existing_corrected)
 
-    # Build list of pages that need processing
+    # Build list of pages that need processing (skip existing ai_ocr pages)
     pages_todo = []
     for pg in range(1, actual_pages + 1):
         page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
-        if (not force and pg in existing_corrected
-                and existing_corrected[pg].strip()
-                and page_md_path.exists()):
+        if (not force and page_md_path.exists()
+                and page_md_path.stat().st_size > 100):
             tprint(f"  p{pg:02d} SKIP (exists)", worker=worker_id, level=2)
             continue
         pages_todo.append(pg)
@@ -1883,14 +1871,11 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                         _, res = fut.result(timeout=0)
                     except Exception as e:
                         log_event(f"p{pg:02d} FAILED: {e}", "error")
-                        corrected_pages[pg] = (
-                            f"[CORRECTION FAILED: {e}]")
                         continue
 
                     pages_done += 1
                     page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
                     if res["status"] == "ok":
-                        corrected_pages[pg] = res["text"]
                         page_md_path.write_text(
                             res["markdown"], encoding="utf-8")
                         log_event(f"p{pg:02d} done  "
@@ -1903,9 +1888,6 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                         log_event(
                             f"p{pg:02d} {res.get('error', 'unknown')}",
                             "error")
-                        corrected_pages[pg] = (
-                            f"[CORRECTION FAILED: "
-                            f"{res.get('error', 'unknown')}]")
 
                     print_status(cost_tracker,
                                  step_name="AI OCR Correction",
@@ -1922,38 +1904,8 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                   f"pages completed.", flush=True)
         ex.shutdown(wait=False)
 
-    # Write corrected/ file
-    out_lines = [header, ""]
-    for pg in sorted(corrected_pages.keys()):
-        out_lines.append(f"--- Page {pg} of {actual_pages} ---")
-        out_lines.append(corrected_pages[pg])
-        out_lines.append("")
-    corr_path.write_text('\n'.join(out_lines), encoding="utf-8")
-    tprint(f"  -> corrected/{fname}  ({corr_path.stat().st_size // 1024}KB)",
-           worker=worker_id, level=1)
-
-    # Article segmentation
-    tprint(f"  Article segmentation ...", worker=worker_id, level=1)
-    all_items = []
-    for pg in sorted(corrected_pages.keys()):
-        text = corrected_pages[pg]
-        if not text.strip() or text.startswith("[CORRECTION FAILED"):
-            continue
-        items = segment_page(pg, text, api_key, rate_limiter, cost_tracker)
-        all_items.extend(items)
-        tprint(f"    p{pg:02d} -> {len(items)} item(s)",
-               worker=worker_id, level=2)
-
-    # Cross-page stitching
-    if len(corrected_pages) > 1 and all_items:
-        tprint(f"  Stitching across page boundaries ...",
-               worker=worker_id, level=1)
-        all_items = stitch_all_pages(
-            all_items, api_key, rate_limiter, cost_tracker, worker_id)
-
-    # Write article files
-    n = write_article_files(issue, all_items, ark_dir)
-    tprint(f"  -> articles/{ark_id}/  ({n} files)",
+    total_md = len(list(ai_ocr_dir.glob("page_*.md")))
+    tprint(f"  -> ai_ocr/{ark_id}/  ({total_md} pages)",
            worker=worker_id, level=1)
 
     return "ok"
@@ -2431,56 +2383,6 @@ def refine_image(issues, config, collection_dir, api_key,
     return total_promoted + total_updated
 
 
-def regenerate_corrected(issues, config, collection_dir):
-    """Regenerate corrected/ and readable/ from updated ai_ocr/ files."""
-    corrected_dir = CORRECTED_DIR
-    corrected_dir.mkdir(exist_ok=True)
-
-    for issue in issues:
-        ark_id = issue["ark_id"]
-        vol = str(issue.get("volume", "?")).zfill(2)
-        num = str(issue.get("number", "?")).zfill(2)
-        date = re.sub(r"[^\w\-]", "-", issue.get("date", "unknown"))
-        fname = f"{ark_id}_vol{vol}_no{num}_{date}.txt"
-        ai_dir = AI_OCR_DIR / ark_id
-
-        if not ai_dir.exists():
-            continue
-
-        page_files = sorted(ai_dir.glob("page_*.md"))
-        if not page_files:
-            continue
-
-        # Build header
-        title_line = issue.get("full_title", config.get("title_name", ""))
-        header = (
-            f"=== {title_line} ===\n"
-            f"ARK:    {ark_id}\n"
-            f"URL:    https://texashistory.unt.edu/ark:/67531/{ark_id}/\n"
-            f"Date:   {issue.get('date', 'unknown')}\n"
-            f"Volume: {issue.get('volume', '?')}   "
-            f"Number: {issue.get('number', '?')}\n"
-            f"Title:  {title_line}\n"
-            f"{'=' * 60}")
-
-        total_pages = len(page_files)
-        out_lines = [header, ""]
-        for pf in page_files:
-            pg_match = re.search(r'page_(\d+)', pf.stem)
-            pg_num = int(pg_match.group(1)) if pg_match else 0
-            raw = pf.read_text(encoding="utf-8")
-            clean = extract_clean_text(raw)
-            out_lines.append(f"--- Page {pg_num} of {total_pages} ---")
-            out_lines.append(clean)
-            out_lines.append("")
-
-        corr_path = corrected_dir / fname
-        corr_path.write_text("\n".join(out_lines), encoding="utf-8")
-
-    # Also regenerate readable/ if it exists
-    readable_dir = READABLE_DIR
-    if readable_dir.exists():
-        compile_all(issues, config, collection_dir, resume=False)
 # COMPILE — READABLE MARKDOWN OUTPUT
 # ============================================================================
 
@@ -3191,9 +3093,10 @@ def main():
                                  api_workers=effective_workers)
                     print(f"  {cost_tracker.summary()}")
 
-        # Regenerate corrected/ and readable/ from updated ai_ocr/
-        print("\nRegenerating corrected/ and readable/ ...", flush=True)
-        regenerate_corrected(issues, config, collection_dir)
+        # Regenerate readable/ from updated ai_ocr/
+        if READABLE_DIR and READABLE_DIR.exists():
+            print("\nRegenerating readable/ ...", flush=True)
+            compile_all(issues, config, collection_dir, resume=False)
         return
 
     # Count pages to process (respecting --resume/--force)
@@ -3204,13 +3107,11 @@ def main():
         num = str(issue.get("number", "?")).zfill(2)
         date = re.sub(r"[^\w\-]", "-", issue.get("date", "unknown"))
         fname = f"{ark_id}_vol{vol}_no{num}_{date}.txt"
-        corr_path = CORRECTED_DIR / fname
-        ark_dir = ARTICLES_DIR / ark_id
+        ai_dir = AI_OCR_DIR / ark_id
 
-        if (args.resume and not args.force
-                and corr_path.exists()
-                and corr_path.stat().st_size > 500):
-            if ark_dir.exists() and any(ark_dir.glob("*_art*.txt")):
+        if args.resume and not args.force and ai_dir.exists():
+            existing_md = set(ai_dir.glob("page_*.md"))
+            if len(existing_md) >= int(issue.get("pages", 8)):
                 continue
         pages_to_process += int(issue.get("pages", 8))
 
@@ -3294,7 +3195,7 @@ def main():
 
         with log_lock:
             log.append({"ark_id": ark_id, "status": status})
-            (CORRECTED_DIR / "correction_log.json").write_text(
+            (AI_OCR_DIR / "correction_log.json").write_text(
                 json.dumps(log, indent=2), encoding="utf-8")
 
         if status == "ok":
@@ -3321,9 +3222,7 @@ def main():
     # Final summary — clear dashboard and print static results
     if _dashboard:
         _dashboard.final_summary()
-    print(f"  Corrected: {CORRECTED_DIR}")
     print(f"  AI OCR:    {AI_OCR_DIR}")
-    print(f"  Articles:  {ARTICLES_DIR}")
     print(flush=True)
 
 
