@@ -300,7 +300,9 @@ def get_portal_ocr_text(issue_fname: str, page_num: int):
 # ============================================================================
 
 class CostTracker:
-    """Track actual API costs during a batch run."""
+    """Track actual API costs during a batch run. Thread-safe."""
+
+    REVISE_AFTER_PAGES = 5  # show revised estimate after this many pages
 
     def __init__(self, model: str, budget=None):
         self._lock = threading.Lock()
@@ -312,6 +314,8 @@ class CostTracker:
         self.pages_processed = 0
         self.input_price = 0.0   # $/MTok
         self.output_price = 0.0  # $/MTok
+        self._revised_shown = False
+        self._budget_abort = False  # set True if estimate > budget
 
         if load_pricing:
             pricing = load_pricing()
@@ -344,8 +348,11 @@ class CostTracker:
             ) / 1_000_000
 
     def would_exceed_budget(self) -> bool:
+        """Check if processing one more page would likely exceed budget."""
         if self.budget is None:
             return False
+        if self._budget_abort:
+            return True
         with self._lock:
             if self.pages_processed == 0:
                 avg_cost = (
@@ -366,6 +373,15 @@ class CostTracker:
                     (EST_OUTPUT_TOKENS_PASS12 + EST_OUTPUT_TOKENS_PASS3) *
                     self.output_price) / 1_000_000
             return self.total_cost / self.pages_processed
+
+    def should_show_revised(self) -> bool:
+        """Returns True once, after REVISE_AFTER_PAGES pages processed."""
+        with self._lock:
+            if (not self._revised_shown
+                    and self.pages_processed >= self.REVISE_AFTER_PAGES):
+                self._revised_shown = True
+                return True
+            return False
 
     def summary(self) -> str:
         with self._lock:
@@ -1585,6 +1601,8 @@ def apply_refinement_results(page_text: str, gaps: list,
 def _refine_text_page(page_file, cnf_min, cnf_max, include_resolved,
                       model, prompt, api_key, rate_limiter, cost_tracker):
     """Refine one page's gaps (text-only). Returns (updated, promoted, unchanged)."""
+    if cost_tracker and cost_tracker.would_exceed_budget():
+        return 0, 0, 0
     text = page_file.read_text(encoding="utf-8")
     gaps = parse_gaps(text)
 
@@ -1682,6 +1700,8 @@ def _refine_image_page(page_file, ark_id, cnf_min, cnf_max,
                        api_key, rate_limiter, cost_tracker):
     """Refine one page's gaps with image cropping. Returns (updated, promoted).
     Groups within a page are processed sequentially (they modify same text)."""
+    if cost_tracker and cost_tracker.would_exceed_budget():
+        return 0, 0
     text = page_file.read_text(encoding="utf-8")
     gaps = parse_gaps(text)
 
@@ -2035,18 +2055,46 @@ def compile_all(issues: list, config: dict, collection_dir: Path,
 # COST ESTIMATION DISPLAY
 # ============================================================================
 
-def show_cost_estimate(pages_to_process, budget):
-    """Display pre-batch cost estimate for tiered models. Returns est cost."""
+def _model_price(model):
+    """Get (input_$/MTok, output_$/MTok) for a model from pricing.json."""
     pricing = load_pricing() if load_pricing else {}
+    mp = pricing.get(model, {})
+    return mp.get("input", 3.0), mp.get("output", 15.0)
 
-    def _price(model):
-        mp = pricing.get(model, {})
-        return mp.get("input", 3.0), mp.get("output", 15.0)
 
-    p12_in, p12_out = _price(MODEL_INITIAL)
-    p3_in, p3_out = _price(MODEL_RESOLVE)
+def show_cost_estimate(step_name, units, unit_label,
+                       est_input_tok, est_output_tok, model, budget):
+    """Display pre-batch cost estimate. Returns (est_cost, per_unit_cost)."""
+    in_price, out_price = _model_price(model)
+    per_unit = (est_input_tok * in_price +
+                est_output_tok * out_price) / 1_000_000
+    est_cost = units * per_unit
+    est_high = est_cost * 1.2
 
-    # Per-page cost: Call 1 (image) + Call 2 (text-only)
+    print()
+    print("=" * 60)
+    print(f"  {step_name} -- COST ESTIMATE")
+    print("=" * 60)
+    print(f"  Model            : {model} "
+          f"(${in_price:.2f}/${out_price:.2f} per MTok)")
+    print(f"  {unit_label:<18} : {units:,}")
+    print(f"  Est. cost/unit   : ${per_unit:.4f}")
+    print(f"  Est. total cost  : ${est_cost:.2f} - ${est_high:.2f}")
+    if budget is not None:
+        print(f"  Budget limit     : ${budget:.2f}")
+        if est_high > budget:
+            affordable = int(budget / per_unit) if per_unit > 0 else 0
+            print(f"  Budget covers    : ~{affordable} of {units} {unit_label}")
+    print("=" * 60)
+    print()
+    return est_cost, per_unit
+
+
+def show_correction_estimate(pages_to_process, budget):
+    """Cost estimate for tiered --correct (Haiku + Sonnet)."""
+    p12_in, p12_out = _model_price(MODEL_INITIAL)
+    p3_in, p3_out = _model_price(MODEL_RESOLVE)
+
     cost_p12 = (EST_INPUT_TOKENS_PASS12 * p12_in +
                 EST_OUTPUT_TOKENS_PASS12 * p12_out) / 1_000_000
     cost_p3 = (EST_INPUT_TOKENS_PASS3 * p3_in +
@@ -2075,22 +2123,22 @@ def show_cost_estimate(pages_to_process, budget):
                   f"{pages_to_process} pages")
     print("=" * 60)
     print()
-    return est_cost
+    return est_cost, per_page
 
 
-def show_revised_estimate(cost_tracker, pages_remaining, total_pages):
-    """Show revised cost estimate after first issue."""
-    est_remaining = cost_tracker.estimate_remaining(pages_remaining)
+def show_revised_estimate(cost_tracker, units_remaining, unit_label="pages"):
+    """Show revised cost estimate based on actual usage so far."""
+    est_remaining = cost_tracker.estimate_remaining(units_remaining)
     avg = cost_tracker.avg_cost_per_page()
 
     print()
     print("-" * 60)
-    print("  REVISED COST ESTIMATE (based on actual usage)")
+    print(f"  REVISED ESTIMATE (after {cost_tracker.pages_processed} "
+          f"{unit_label})")
     print("-" * 60)
-    print(f"  Pages processed  : {cost_tracker.pages_processed}")
-    print(f"  Actual cost/page : ${avg:.4f}")
+    print(f"  Actual cost/unit : ${avg:.4f}")
     print(f"  Spent so far     : ${cost_tracker.total_cost:.2f}")
-    print(f"  Pages remaining  : {pages_remaining}")
+    print(f"  Remaining units  : {units_remaining}")
     print(f"  Est. remaining   : ${est_remaining:.2f}")
     print(f"  Est. total       : "
           f"${cost_tracker.total_cost + est_remaining:.2f}")
@@ -2099,9 +2147,72 @@ def show_revised_estimate(cost_tracker, pages_remaining, total_pages):
         print(f"  Budget remaining : ${remaining_budget:.2f}")
         if est_remaining > remaining_budget:
             affordable = int(remaining_budget / max(avg, 0.001))
-            print(f"  Budget covers    : ~{affordable} more pages")
+            print(f"  Budget covers    : ~{affordable} more {unit_label}")
     print("-" * 60)
     print()
+
+
+def confirm_or_abort(prompt_msg, skip=False):
+    """Prompt user for y/N confirmation. Returns True to proceed."""
+    if skip:
+        return True
+    confirm = input(f"{prompt_msg} [y/N]: ").strip().lower()
+    return confirm in ("y", "yes")
+
+
+def check_revised_and_budget(cost_tracker, total_units, unit_label,
+                             skip_estimate=False):
+    """After REVISE_AFTER_PAGES, show revised estimate. If revised estimate
+    exceeds budget, set abort flag and return False. Returns True to continue."""
+    if not cost_tracker.should_show_revised():
+        return True
+
+    units_remaining = total_units - cost_tracker.pages_processed
+    if units_remaining <= 0:
+        return True
+
+    show_revised_estimate(cost_tracker, units_remaining, unit_label)
+
+    if cost_tracker.budget is not None:
+        est_rem = cost_tracker.estimate_remaining(units_remaining)
+        bud_rem = cost_tracker.budget - cost_tracker.total_cost
+        if est_rem > bud_rem:
+            avg = cost_tracker.avg_cost_per_page()
+            affordable = int(bud_rem / max(avg, 0.001))
+            print(f"  WARNING: Revised estimate ${est_rem:.2f} exceeds "
+                  f"remaining budget ${bud_rem:.2f}.")
+            print(f"  ~{affordable} more {unit_label} affordable.")
+            if not confirm_or_abort("Continue?", skip=skip_estimate):
+                cost_tracker._budget_abort = True
+                return False
+    return True
+
+
+def count_refinement_gaps(issues, collection_dir, cnf_min, cnf_max,
+                          include_resolved, require_evidence=False):
+    """Count eligible gaps across all issues for pre-batch estimation."""
+    total_gaps = 0
+    total_pages_with_gaps = 0
+    for issue in issues:
+        ai_dir = collection_dir / "ai_ocr" / issue["ark_id"]
+        if not ai_dir.exists():
+            continue
+        for pf in ai_dir.glob("page_*.md"):
+            text = pf.read_text(encoding="utf-8")
+            gaps = parse_gaps(text)
+            eligible = 0
+            for g in gaps:
+                if g["cnf"] < cnf_min or g["cnf"] > cnf_max:
+                    continue
+                if g["status"] == "auto-resolved" and not include_resolved:
+                    continue
+                if require_evidence and not g["fragments"] and not g["region_ocr"]:
+                    continue
+                eligible += 1
+            if eligible:
+                total_gaps += eligible
+                total_pages_with_gaps += 1
+    return total_gaps, total_pages_with_gaps
 
 
 # ============================================================================
@@ -2164,6 +2275,9 @@ def main():
                    help="Shorthand for --logging 5")
     p.add_argument("--yes",            action="store_true",
                    help="Skip cost confirmation prompt")
+    p.add_argument("--skip-estimate",  action="store_true",
+                   help="Skip cost estimates and revised estimates "
+                        "(budget checks still apply)")
     # Accept but ignore these (passed by orchestrator)
     p.add_argument("--issue-delay",    type=float, default=None)
     p.add_argument("--max-output-tokens", type=int, default=None)
@@ -2270,38 +2384,91 @@ def main():
         effective_workers = 1 if args.serial else args.api_workers
         rate_limiter = (limiter_from_tier(args.tier)
                         if ClaudeRateLimiter else None)
-        cost_tracker = CostTracker(MODEL_RESOLVE, budget=args.budget)
 
         if args.refine_text:
             cnf_min = args.cnf_min if args.cnf_min is not None else 0.0
             cnf_max = args.cnf_max if args.cnf_max is not None else 0.79
-            print(f"\nText refinement: cnf {cnf_min:.2f}-{cnf_max:.2f} "
-                  f"using {args.model_resolve or MODEL_RESOLVE}", flush=True)
-            refine_text(issues, config, collection_dir, api_key,
-                        cnf_min=cnf_min, cnf_max=cnf_max,
-                        include_resolved=args.include_resolved,
-                        rate_limiter=rate_limiter,
-                        cost_tracker=cost_tracker,
-                        model=args.model_resolve,
-                        api_workers=effective_workers)
+            model = args.model_resolve or MODEL_RESOLVE
+
+            # Count eligible gaps and estimate cost
+            total_gaps, pages_with_gaps = count_refinement_gaps(
+                issues, collection_dir, cnf_min, cnf_max,
+                args.include_resolved, require_evidence=True)
+            print(f"\nText refinement: {total_gaps} gaps across "
+                  f"{pages_with_gaps} pages (cnf {cnf_min:.2f}-{cnf_max:.2f},"
+                  f" model: {model})")
+
+            if total_gaps == 0:
+                print("  No eligible gaps found.")
+            else:
+                # ~2k tokens per page batch (gaps + context)
+                if not args.skip_estimate:
+                    est, _ = show_cost_estimate(
+                        "TEXT REFINEMENT", pages_with_gaps, "pages",
+                        2000, 1000, model, args.budget)
+                    if args.budget and est > args.budget:
+                        if not confirm_or_abort(
+                                "Estimate exceeds budget. Proceed?",
+                                skip=args.yes):
+                            print("Cancelled.")
+                            return
+
+                if confirm_or_abort(
+                        f"Proceed with text refinement?",
+                        skip=args.yes):
+                    cost_tracker = CostTracker(model, budget=args.budget)
+                    refine_text(issues, config, collection_dir, api_key,
+                                cnf_min=cnf_min, cnf_max=cnf_max,
+                                include_resolved=args.include_resolved,
+                                rate_limiter=rate_limiter,
+                                cost_tracker=cost_tracker,
+                                model=model,
+                                api_workers=effective_workers)
+                    print(f"  {cost_tracker.summary()}")
 
         if args.refine_image:
             cnf_min = args.cnf_min if args.cnf_min is not None else 0.01
             cnf_max = args.cnf_max if args.cnf_max is not None else 0.60
-            print(f"\nImage refinement: cnf {cnf_min:.2f}-{cnf_max:.2f} "
-                  f"using {args.model_refine or MODEL_REFINE}", flush=True)
-            refine_image(issues, config, collection_dir, api_key,
-                         cnf_min=cnf_min, cnf_max=cnf_max,
-                         include_resolved=args.include_resolved,
-                         rate_limiter=rate_limiter,
-                         cost_tracker=cost_tracker,
-                         model=args.model_refine,
-                         api_workers=effective_workers)
+            model = args.model_refine or MODEL_REFINE
+
+            total_gaps, pages_with_gaps = count_refinement_gaps(
+                issues, collection_dir, cnf_min, cnf_max,
+                args.include_resolved, require_evidence=False)
+            print(f"\nImage refinement: {total_gaps} gaps across "
+                  f"{pages_with_gaps} pages (cnf {cnf_min:.2f}-{cnf_max:.2f},"
+                  f" model: {model})")
+
+            if total_gaps == 0:
+                print("  No eligible gaps found.")
+            else:
+                # ~5k tokens per batch (cropped image + context)
+                if not args.skip_estimate:
+                    est, _ = show_cost_estimate(
+                        "IMAGE REFINEMENT", total_gaps, "gap batches",
+                        5000, 500, model, args.budget)
+                    if args.budget and est > args.budget:
+                        if not confirm_or_abort(
+                                "Estimate exceeds budget. Proceed?",
+                                skip=args.yes):
+                            print("Cancelled.")
+                            return
+
+                if confirm_or_abort(
+                        f"Proceed with image refinement?",
+                        skip=args.yes):
+                    cost_tracker = CostTracker(model, budget=args.budget)
+                    refine_image(issues, config, collection_dir, api_key,
+                                 cnf_min=cnf_min, cnf_max=cnf_max,
+                                 include_resolved=args.include_resolved,
+                                 rate_limiter=rate_limiter,
+                                 cost_tracker=cost_tracker,
+                                 model=model,
+                                 api_workers=effective_workers)
+                    print(f"  {cost_tracker.summary()}")
 
         # Regenerate corrected/ and readable/ from updated ai_ocr/
         print("\nRegenerating corrected/ and readable/ ...", flush=True)
         regenerate_corrected(issues, config, collection_dir)
-        print(f"Cost: {cost_tracker.summary()}")
         return
 
     # Count pages to process (respecting --resume/--force)
@@ -2326,16 +2493,23 @@ def main():
         print("\nNothing to process -- all files already complete.")
         return
 
-    # Cost estimate and confirmation
-    show_cost_estimate(pages_to_process, args.budget)
+    # Cost estimate
+    if not args.skip_estimate:
+        est_cost, per_page = show_correction_estimate(
+            pages_to_process, args.budget)
+        # Abort if initial estimate exceeds budget
+        if args.budget is not None and est_cost > args.budget:
+            print(f"  Initial estimate ${est_cost:.2f} exceeds budget "
+                  f"${args.budget:.2f}.")
+            if not confirm_or_abort("Proceed anyway?", skip=args.yes):
+                print("Cancelled.")
+                return
 
-    if not args.yes:
-        confirm = input(
-            f"Proceed with AI OCR correction? "
-            f"({pages_to_process} pages) [y/N]: ").strip().lower()
-        if confirm not in ("y", "yes"):
-            print("Cancelled.")
-            return
+    if not confirm_or_abort(
+            f"Proceed with AI OCR correction? ({pages_to_process} pages)",
+            skip=args.yes):
+        print("Cancelled.")
+        return
 
     # Initialize tracking
     pass12_prompt = build_pass12_prompt(config)
@@ -2347,8 +2521,7 @@ def main():
     log = []
     log_lock = threading.Lock()
     ctr = {"ok": 0, "skipped": 0, "err": 0}
-
-    first_issue_done = False
+    effective_workers = 1 if args.serial else args.api_workers
 
     for idx, issue in enumerate(issues):
         ark_id = issue["ark_id"]
@@ -2364,7 +2537,6 @@ def main():
                    level=1)
             break
 
-        effective_workers = 1 if args.serial else args.api_workers
         status = process_issue(
             issue, api_key, pass12_prompt, pass3_prompt,
             args.delay, args.resume, args.force,
@@ -2385,33 +2557,13 @@ def main():
         else:
             ctr["err"] += 1
 
-        # After first completed issue: show revised estimate
-        if (not first_issue_done and status == "ok"
-                and cost_tracker.pages_processed > 0):
-            first_issue_done = True
-            pages_done = cost_tracker.pages_processed
-            pages_remaining = pages_to_process - pages_done
-            if pages_remaining > 0:
-                show_revised_estimate(
-                    cost_tracker, pages_remaining, pages_to_process)
-
-                # Warn if budget insufficient
-                if cost_tracker.budget is not None:
-                    est_rem = cost_tracker.estimate_remaining(pages_remaining)
-                    bud_rem = (cost_tracker.budget
-                               - cost_tracker.total_cost)
-                    if est_rem > bud_rem * 1.1:
-                        avg = cost_tracker.avg_cost_per_page()
-                        affordable = int(bud_rem / max(avg, 0.001))
-                        print(f"  WARNING: Budget may not cover all "
-                              f"remaining pages. ~{affordable} more "
-                              f"pages affordable.")
-                        if not args.yes:
-                            confirm = input(
-                                "Continue? [y/N]: ").strip().lower()
-                            if confirm not in ("y", "yes"):
-                                print("Stopped by user.")
-                                break
+        # Revised estimate after 5 pages, budget abort if exceeded
+        if not args.skip_estimate:
+            if not check_revised_and_budget(
+                    cost_tracker, pages_to_process, "pages",
+                    skip_estimate=args.yes):
+                print("Stopped: revised estimate exceeds budget.")
+                break
 
     # Final summary
     if rate_limiter:

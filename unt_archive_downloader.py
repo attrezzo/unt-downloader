@@ -1708,6 +1708,8 @@ def main():
                    help="Max cnf for refinement filtering")
     p.add_argument("--include-resolved", action="store_true",
                    help="Include auto-resolved gaps in refinement")
+    p.add_argument("--skip-estimate",  action="store_true",
+                   help="Skip cost estimates (budget checks still apply)")
     p.add_argument("--translate",      action="store_true",
                    help="Translate to English using Claude vision API")
     p.add_argument("--render-pdf",     action="store_true",
@@ -1881,6 +1883,8 @@ def main():
             correct_args.append("--force")
         if args.budget is not None:
             correct_args += ["--budget", str(args.budget)]
+        if hasattr(args, 'skip_estimate') and args.skip_estimate:
+            correct_args.append("--skip-estimate")
         run_worker("unt_ocr_correct.py", correct_args)
 
     if args.compile:
@@ -1910,6 +1914,8 @@ def main():
             refine_args += ["--budget", str(args.budget)]
         if args.tier:
             refine_args += ["--tier", args.tier]
+        if hasattr(args, 'skip_estimate') and args.skip_estimate:
+            refine_args.append("--skip-estimate")
         run_worker("unt_ocr_correct.py", refine_args)
 
     if args.translate:
