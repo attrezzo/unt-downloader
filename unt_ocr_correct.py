@@ -633,6 +633,7 @@ class CostTracker:
         self.total_output_tokens = 0
         self.total_cost = 0.0
         self.pages_processed = 0
+        self._api_calls = 0
         self.input_price = 0.0   # $/MTok
         self.output_price = 0.0  # $/MTok
         self._revised_shown = False
@@ -651,6 +652,11 @@ class CostTracker:
             cost = (input_tokens * self.input_price +
                     output_tokens * self.output_price) / 1_000_000
             self.total_cost += cost
+            self._api_calls += 1
+
+    def record_page(self):
+        """Record one page fully completed (all passes)."""
+        with self._lock:
             self.pages_processed += 1
 
     def estimate_remaining(self, pages_left: int) -> float:
@@ -1908,6 +1914,8 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                             "error", worker=wid)
 
                     # Update dashboard page counter and worker history
+                    if cost_tracker:
+                        cost_tracker.record_page()
                     if _dashboard:
                         _dashboard.page_done()
                         with _dashboard._lock:
