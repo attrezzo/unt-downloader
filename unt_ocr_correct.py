@@ -20,7 +20,7 @@ USAGE:
   python unt_ocr_correct.py --config-path collection.json --budget 50.00
 """
 
-import os, sys, json, time, re, base64, argparse, threading
+import os, sys, json, time, re, base64, argparse, threading, html as _html_mod
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -188,18 +188,16 @@ def fetch_page_image(ark_id: str, page: int) -> tuple:
 # ============================================================================
 
 def strip_ocr_html(text: str) -> str:
+    """Strip HTML from OCR text. Handles both old (full HTML) and new (clean text) formats."""
     if '<' not in text:
         return text
+    # Try to find the ocr-text div (old full-HTML format)
     m = re.search(r'id=["\']ocr-text["\'][^>]*>(.*?)</(?:div|section)',
                   text, re.S | re.I)
     inner = m.group(1) if m else text
     inner = re.sub(r'<br\s*/?>', '\n', inner, flags=re.I)
-    inner = re.sub(r'<[^>]{0,500}>', ' ', inner)
-    for e, r in [('&amp;', '&'), ('&lt;', ''), ('&gt;', ''),
-                 ('&quot;', '"'), ('&nbsp;', ' '), ('&#x27;', "'")]:
-        inner = inner.replace(e, r)
-    inner = re.sub(r'&#[xX][0-9a-fA-F]{1,6};', '', inner)
-    inner = re.sub(r'&#\d{1,6};', '', inner)
+    inner = re.sub(r'<[^>]{0,500}>', '', inner)
+    inner = _html_mod.unescape(inner)
     inner = re.sub(r'[ \t]{2,}', ' ', inner)
     inner = re.sub(r'\n{3,}', '\n\n', inner)
     return inner.strip()
