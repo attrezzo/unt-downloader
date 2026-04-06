@@ -39,27 +39,33 @@ Read the uploaded page image directly. Work section by section (masthead, then c
 1. Identify the page layout: masthead, column count, any center-page features (advertisements, program announcements)
 2. Read each section in Fraktur, writing the text in standard Latin characters
 3. Where text is **confidently readable**, write it directly — no tags needed
-4. Where text is **illegible or uncertain**, insert a gap marker with your best guess of the missing text:
+4. Where text is **illegible or uncertain**, insert a gap marker with your best guess and an approximate bounding box:
    ```
-   {{ gap | est=NN [best guess] }}
+   {{ gap | est=NN | imgbbox="x,y,w,h" [best guess] }}
    ```
-   where `NN` is your best estimate of the character count and `[best guess]` is your prediction of what the text says based on context. Always guess — even a speculative guess is valuable for future refinement.
-5. Wrap each discrete article/news item/notice in a numbered Column tag:
+   - `NN` = estimated character count
+   - `imgbbox` = approximate pixel region in the source image (x,y = top-left, w,h = size). Be generous — overestimate to ensure the text is fully contained. This allows future refinement passes to crop just this region instead of resending the full page.
+   - `[best guess]` = your prediction based on context. Always guess.
+5. Mark any images, illustrations, or engravings on the page:
+   ```
+   {{ Img | bbox="x,y,w,h" | desc="brief description" }}
+   ```
+6. Wrap each discrete article/news item/notice in a numbered Column tag:
    ```
    {{ Column001 }}
    ## Headline
    **Dateline,** Date. Article body...
    {{ /Column }}
    ```
-6. Wrap each advertisement in a numbered Ad tag:
+7. Wrap each advertisement in a numbered Ad tag:
    ```
    {{ Ad001 }}
    Business name. Products/services. Address.
    {{ /Ad }}
    ```
-7. Number Column and Ad tags sequentially per page (001, 002, 003...)
-8. Mark article headlines with `##` and subheads with `###`
-9. Preserve any visible datelines (city, date) at the start of news items in **bold**
+8. Number Column and Ad tags sequentially per page (001, 002, 003...)
+9. Mark article headlines with `##` and subheads with `###`
+10. Preserve any visible datelines (city, date) at the start of news items in **bold**
 
 **Before reading**, consult `references/fraktur-errors.md` to prime yourself on systematic Fraktur OCR failure modes. Apply these corrections as you read — e.g., when you see what looks like "b" but context demands "d", use "d".
 
@@ -89,15 +95,15 @@ Review your Pass 1 output. For each `{{ gap }}` marker:
 3. Note what partial letterforms or fragments you can see
 4. Refine your best guess based on fragments
 
-**Output this pass as an update** — replace each basic gap with an enriched marker:
+**Output this pass as an update** — replace each basic gap with an enriched marker (refine the imgbbox if needed):
 
 ```
-{{ gap | est=NN | fragments="partial_text" [refined guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" [refined guess] }}
 ```
 
 For example:
 ```
-{{ gap | est=25 | fragments="Ber...lung" [Versammlung] }}
+{{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" [Versammlung] }}
 ```
 
 ---
@@ -116,10 +122,10 @@ This pass requires the existing ABBYY OCR (or other traditional OCR) if availabl
 
 2. Apply the Fraktur error correction table from `references/fraktur-errors.md` to decode the ABBYY fragments
 
-3. If you can assign a confidence level, promote the gap to an **infill tag**:
+3. If you can assign a confidence level, promote the gap to an **infill tag** (preserve the imgbbox from the gap):
 
 ```
-[reconstructed text]^CONFIDENCE^ <!-- {{ infill | est=NN | confidence=LEVEL | region_ocr="raw_abbyy_text" | guess="your reconstruction" }} -->
+[reconstructed text]^CONFIDENCE^ <!-- {{ infill | est=NN | imgbbox="x,y,w,h" | confidence=LEVEL | region_ocr="raw_abbyy_text" | guess="your reconstruction" }} -->
 ```
 
 **Confidence levels:**
@@ -131,7 +137,7 @@ This pass requires the existing ABBYY OCR (or other traditional OCR) if availabl
 4. If you cannot confidently assign a level, leave as a gap with `status=unresolved` and your best guess:
 
 ```
-{{ gap | est=25 | fragments="Ber...lung" | status=unresolved [Versammlung] }}
+{{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" | status=unresolved [Versammlung] }}
 ```
 
 The output is **human-readable** (guesses in brackets read naturally in context) AND **machine-parseable** (tags carry metadata for future passes).

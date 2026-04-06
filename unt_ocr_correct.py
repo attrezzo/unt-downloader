@@ -489,26 +489,29 @@ PASS 1 - DIRECT FRAKTUR OCR:
    - Tier 2 with context checking (capital letter confusions)
    - Tiers 3-5 case by case (ligature breaks, number/letter, hyphenation)
 5. Where text is confidently readable, write it directly with no tags
-6. Where text is illegible or uncertain, insert a gap with your best guess:
-   {{{{ gap | est=NN [best guess of missing text] }}}}
-   ALWAYS include a guess. Use context, sentence structure, article topic,
-   and 1890s German knowledge. Even a speculative guess is valuable.
-7. Wrap each article/news item/notice in a numbered Column tag:
+6. Where text is illegible or uncertain, insert a gap with your best guess
+   and an approximate bounding box showing where in the image this text is:
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" [best guess of missing text] }}}}
+   imgbbox = approximate pixel region (x,y=top-left, w,h=size). Be generous.
+   ALWAYS include a guess and a bounding box.
+7. Mark images/illustrations/engravings on the page:
+   {{{{ Img | bbox="x,y,w,h" | desc="brief description" }}}}
+8. Wrap each article/news item/notice in a numbered Column tag:
    {{{{ Column001 }}}} article text {{{{ /Column }}}}
-8. Wrap each advertisement in a numbered Ad tag:
+9. Wrap each advertisement in a numbered Ad tag:
    {{{{ Ad001 }}}} ad text {{{{ /Ad }}}}
-9. Number Column and Ad tags sequentially per page (001, 002, 003...)
-10. Do NOT correct Texas German dialect words or pre-1901 spellings
-11. Do NOT translate English loanwords to German
-12. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
+10. Number Column and Ad tags sequentially per page (001, 002, 003...)
+11. Do NOT correct Texas German dialect words or pre-1901 spellings
+12. Do NOT translate English loanwords to German
+13. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
 
 PASS 2 - GAP INVENTORY:
 For each {{{{ gap }}}} from Pass 1:
 1. Re-examine the image at that location
 2. Note partial letterforms, ascenders, descenders, dots, fragments
-3. Refine the character count estimate and your best guess
+3. Refine the character count estimate, bounding box, and your best guess
 4. Replace with enriched marker:
-   {{{{ gap | est=NN | fragments="visible_fragments" [refined guess] }}}}
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="visible_fragments" [refined guess] }}}}
 
 PASS 3 - CROSS-REFERENCE AND INFILL:
 For each enriched gap:
@@ -516,13 +519,13 @@ For each enriched gap:
 2. Apply the Fraktur error correction table to decode the raw OCR fragment
 3. Cross-reference: your reading + OCR fragment + 1890s German +
    article topic (international news = more Hochdeutsch, local = more dialect)
-4. If you can assign a confidence level, promote to infill:
+4. If you can assign a confidence level, promote to infill (preserve imgbbox):
    [reconstructed text]^CONFIDENCE^
-   <!-- {{{{ infill | est=NN | confidence=LEVEL | region_ocr="raw_ocr_text" | guess="clean_text" | notes="reasoning" }}}} -->
+   <!-- {{{{ infill | est=NN | imgbbox="x,y,w,h" | confidence=LEVEL | region_ocr="raw_ocr_text" | guess="clean_text" | notes="reasoning" }}}} -->
    Confidence: HIGH, MED, LOW, VLOW
    The region_ocr field MUST contain the exact raw OCR text, uncorrected.
 5. If still uncertain, keep as gap with status=unresolved and your best guess:
-   {{{{ gap | est=NN | fragments="..." | status=unresolved [best guess] }}}}
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="..." | status=unresolved [best guess] }}}}
 6. For non-gap corrections where the fix is ambiguous or changes meaning:
    corrected_word <!-- {{{{ corrected | original="ocr_reading" | rule="rule_name" }}}} -->
 
@@ -730,7 +733,11 @@ def extract_clean_text(raw_response: str) -> str:
     text = re.sub(r'\{\{\s*(?:Column|Ad)\d{3}\s*\}\}', '', text)
     text = re.sub(r'\{\{\s*/(?:Column|Ad)\s*\}\}', '', text)
 
-    # Extract best guess from gap markers: {{ gap | est=NN ... [guess] }} -> guess
+    # Strip image markers: {{ Img | bbox="..." | desc="..." }}
+    text = re.sub(r'\{\{\s*Img\s*\|[^}]*\}\}', '', text)
+
+    # Extract best guess from gap markers (may contain imgbbox and other fields):
+    # {{ gap | est=NN | imgbbox="..." | ... [guess] }} -> guess
     text = re.sub(
         r'\{\{\s*gap\s*\|[^[]*\[([^\]]*)\]\s*\}\}',
         r'\1', text)

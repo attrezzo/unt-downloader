@@ -26,32 +26,33 @@ The guess appears in square brackets inside the tag so the text reads naturally 
 
 **Basic gap (Pass 1):**
 ```
-{{ gap | est=NN [best guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" [best guess] }}
 ```
 
 **Enriched gap (after Pass 2, with visible fragments):**
 ```
-{{ gap | est=NN | fragments="partial_text" [best guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" [best guess] }}
 ```
 
 **Unresolved gap (after Pass 3, cross-referenced but still uncertain):**
 ```
-{{ gap | est=NN | fragments="partial_text" | status=unresolved [best guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" | status=unresolved [best guess] }}
 ```
 
 **Fields:**
 - `est` (required): Estimated character count of missing text
+- `imgbbox` (required): Approximate bounding box in the source image as `"x,y,w,h"` in pixels. x,y = top-left corner, w,h = width and height. Be generous — overestimate the region to ensure the text is fully contained. This allows future refinement passes to crop just this region instead of resending the full page image.
 - `fragments` (optional): Any partial letterforms visible, as best-guess Latin characters
 - `status` (optional): `unresolved` marks gaps that survived all three passes
 - `[best guess]` (required): Always present. The current best prediction of what the text says, in square brackets. Use context, fragments, article topic, and 1890s German knowledge to produce this. Even a wild guess is better than nothing — future passes can improve it.
 
 **Examples:**
 ```
-Die {{ gap | est=12 | fragments="Verfa...ung" [Verfassung] }} wurde gestern abgehalten.
+Die {{ gap | est=12 | imgbbox="450,1200,280,45" | fragments="Verfa...ung" [Verfassung] }} wurde gestern abgehalten.
 
-Der Bürgermeister {{ gap | est=22 | fragments="Ber...lung" | status=unresolved [Versammlung] }} erklärte seine Absicht.
+Der Bürgermeister {{ gap | est=22 | imgbbox="820,2100,400,50" | fragments="Ber...lung" | status=unresolved [Versammlung] }} erklärte seine Absicht.
 
-Im {{ gap | est=8 [Gasthof] }} an der Hauptstraße fand die Sitzung statt.
+Im {{ gap | est=8 | imgbbox="100,950,180,40" [Gasthof] }} an der Hauptstraße fand die Sitzung statt.
 ```
 
 **IMPORTANT:** `[unleserlich]` is deprecated. Never use it. Every gap gets a best guess, no matter how speculative. If you truly have zero fragments and zero context, guess based on the article topic, surrounding sentence structure, and common 1890s German newspaper phrases. Mark such guesses with `status=unresolved` so future passes know to revisit.
@@ -69,11 +70,12 @@ Replaces a gap marker after cross-referencing with ABBYY OCR and context. Used w
 
 **Full metadata (HTML comment, immediately follows the inline display):**
 ```
-<!-- {{ infill | est=NN | confidence=LEVEL | region_ocr="raw_text" | guess="clean_text" | notes="free_text" }} -->
+<!-- {{ infill | est=NN | imgbbox="x,y,w,h" | confidence=LEVEL | region_ocr="raw_text" | guess="clean_text" | notes="free_text" }} -->
 ```
 
 **Fields:**
 - `est` (required): Character count estimate
+- `imgbbox` (required): Approximate bounding box in the source image as `"x,y,w,h"` in pixels. Be generous with the region.
 - `confidence` (required): `HIGH`, `MED`, `LOW`, or `VLOW`
 - `region_ocr` (required): The raw ABBYY OCR text for this region, exactly as it appears in the source — garbled and all. This is the most critical field for future refinement.
 - `guess` (required): The clean reconstructed text (same as what appears in brackets)
@@ -90,7 +92,7 @@ Replaces a gap marker after cross-referencing with ABBYY OCR and context. Used w
 
 **Example:**
 ```
-Die [Versammlung]^MED^ <!-- {{ infill | est=18 | confidence=MED | region_ocr="Bcrfamm" | guess="Versammlung" | notes="ABBYY has Bcr=Ver, famm=samml" }} --> wurde gestern abgehalten.
+Die [Versammlung]^MED^ <!-- {{ infill | est=18 | imgbbox="450,1200,280,45" | confidence=MED | region_ocr="Bcrfamm" | guess="Versammlung" | notes="ABBYY has Bcr=Ver, famm=samml" }} --> wurde gestern abgehalten.
 ```
 
 **Distinction between gap and infill:** A `gap` is a region where you're not confident enough to assign a formal confidence level — the guess is there for readability and as a starting point for future passes. An `infill` is a region where you've done the cross-referencing work and can defend the guess with evidence and a confidence rating.
@@ -142,7 +144,30 @@ Use Ad for: commercial content, classified ads, legal notices paid for by indivi
 
 ---
 
-### 6. Column Break Marker
+### 6. Image Marker
+
+Mark areas of the page that contain images, illustrations, engravings, or other non-text visual content:
+
+```
+{{ Img | bbox="x,y,w,h" | desc="brief description" }}
+```
+
+**Fields:**
+- `bbox` (required): Bounding box in the source image as `"x,y,w,h"` in pixels. Be generous.
+- `desc` (required): Brief description of the image content (e.g. "engraving of courthouse", "portrait of speaker", "decorative border")
+
+**Examples:**
+```
+{{ Img | bbox="200,400,600,800" | desc="engraving of Austin County courthouse" }}
+
+{{ Img | bbox="50,2800,1100,200" | desc="decorative rule separating masthead from articles" }}
+```
+
+This allows future processing to identify and skip non-text regions, or to extract images for separate handling.
+
+---
+
+### 8. Column Break Marker
 
 When you detect that OCR has interleaved columns (two unrelated texts merged mid-sentence), mark where the break occurs:
 
@@ -154,7 +179,7 @@ Where N and M are column numbers (1 = leftmost).
 
 ---
 
-### 7. Page Break Marker
+### 9. Page Break Marker
 
 In multi-page documents, mark page boundaries:
 
@@ -194,7 +219,9 @@ In multi-page documents, mark page boundaries:
 
 ### Große Feier
 
-des Ehrentages der Deutschen am [sechsten Oktober]^MED^ <!-- {{ infill | est=16 | confidence=MED | region_ocr="" | guess="sechsten Oktober" | notes="date matches program header 'am 6. Oktober' below" }} --> in Austin County.
+des Ehrentages der Deutschen am [sechsten Oktober]^MED^ <!-- {{ infill | est=16 | imgbbox="380,620,300,40" | confidence=MED | region_ocr="" | guess="sechsten Oktober" | notes="date matches program header 'am 6. Oktober' below" }} --> in Austin County.
+
+{{ Img | bbox="200,680,500,120" | desc="decorative flourish below program header" }}
 
 ### Bellville
 
@@ -204,17 +231,17 @@ veranstaltet von den deutschen Vereinen in Austin County.
 
 ### PROGRAMM:
 
-Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend [aus]^HIGH^ <!-- {{ infill | est=3 | confidence=HIGH | region_ocr="" | guess="aus" | notes="grammatically required after 'bestehend'" }} -->
+Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend [aus]^HIGH^ <!-- {{ infill | est=3 | imgbbox="720,910,60,35" | confidence=HIGH | region_ocr="" | guess="aus" | notes="grammatically required after 'bestehend'" }} -->
 
 ### geschmückten Wagen,
 
-darstellend Begebenheiten aus der deutschen Geschichte, oder der {{ gap | est=30 | fragments="cidrd" | status=unresolved [verschiedenen Nationalitäten] }}
+darstellend Begebenheiten aus der deutschen Geschichte, oder der {{ gap | est=30 | imgbbox="300,1050,500,45" | fragments="cidrd" | status=unresolved [verschiedenen Nationalitäten] }}
 {{ /Column }}
 
 {{ Column002 }}
-**Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry [Goods]^HIGH^ <!-- {{ infill | est=5 | confidence=HIGH | region_ocr="Try" | guess="Goods" | notes="ABBYY 'Try' is T/D swap + r/o noise = 'Dry'; 'Goods' follows naturally" }} --> Haus, Ecke 14 u. Main Str. an der Arbeit wären.
+**Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry [Goods]^HIGH^ <!-- {{ infill | est=5 | imgbbox="950,1400,100,35" | confidence=HIGH | region_ocr="Try" | guess="Goods" | notes="ABBYY 'Try' is T/D swap + r/o noise" }} --> Haus, Ecke 14 u. Main Str. an der Arbeit wären.
 
-Die {{ gap | est=15 [Polizeibeamten] }} kamen sofort zur Stelle.
+Die {{ gap | est=15 | imgbbox="820,1460,280,40" [Polizeibeamten] }} kamen sofort zur Stelle.
 {{ /Column }}
 
 {{ Ad001 }}
@@ -238,14 +265,17 @@ Office über Haufschild's Store, Bellville.
 For programmatic extraction, tags follow these regex patterns:
 
 ```
-# Gap markers (with best guess in brackets)
-\{\{\s*gap\s*\|\s*est=(\d+)(?:\s*\|\s*fragments="([^"]*)")?(?:\s*\|\s*status=(\w+))?\s*\[([^\]]*)\]\s*\}\}
+# Gap markers (with imgbbox and best guess)
+\{\{\s*gap\s*\|\s*est=(\d+)\s*\|\s*imgbbox="([^"]*)"\s*(?:\|\s*fragments="([^"]*)")?\s*(?:\|\s*status=(\w+))?\s*\[([^\]]*)\]\s*\}\}
 
-# Infill markers (in HTML comments)
-\{\{\s*infill\s*\|\s*est=(\d+)\s*\|\s*confidence=(HIGH|MED|LOW|VLOW)\s*\|\s*region_ocr="([^"]*)"\s*\|\s*guess="([^"]*)"(?:\s*\|\s*notes="([^"]*)")?\s*\}\}
+# Infill markers (in HTML comments, with imgbbox)
+\{\{\s*infill\s*\|\s*est=(\d+)\s*\|\s*imgbbox="([^"]*)"\s*\|\s*confidence=(HIGH|MED|LOW|VLOW)\s*\|\s*region_ocr="([^"]*)"\s*\|\s*guess="([^"]*)"(?:\s*\|\s*notes="([^"]*)")?\s*\}\}
 
 # Inline display
 \[([^\]]+)\]\^(HIGH|MED|LOW|VLOW)\^
+
+# Image markers
+\{\{\s*Img\s*\|\s*bbox="([^"]*)"\s*\|\s*desc="([^"]*)"\s*\}\}
 
 # Correction markers
 \{\{\s*corrected\s*\|\s*original="([^"]*)"\s*\|\s*rule="([^"]*)"\s*\}\}
