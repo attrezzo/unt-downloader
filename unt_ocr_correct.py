@@ -1893,19 +1893,8 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                     if res["status"] == "ok":
                         page_md_path.write_text(
                             res["markdown"], encoding="utf-8")
-                        if _dashboard:
-                            _dashboard.page_done()
-                            # Track completed page in worker history
-                            with _dashboard._lock:
-                                if wid in _dashboard._workers:
-                                    w = _dashboard._workers[wid]
-                                    pg_str = f"p{pg:02d}"
-                                    if pg_str not in w["done_pages"]:
-                                        w["done_pages"].append(pg_str)
-                                    w["task"] = ""
-                                    w["status"] = f"p{pg:02d} done  {len(res['text'])} chars"
-                        log_event(f"p{pg:02d} done  "
-                                  f"{len(res['text'])} chars",
+                        chars = len(res['text'])
+                        log_event(f"p{pg:02d} done  {chars} chars",
                                   worker=wid)
                     elif res["status"] == "no_image":
                         log_event(f"p{pg:02d} no image", "skip",
@@ -1917,6 +1906,18 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                         log_event(
                             f"p{pg:02d} {res.get('error', 'unknown')}",
                             "error", worker=wid)
+
+                    # Update dashboard page counter and worker history
+                    if _dashboard:
+                        _dashboard.page_done()
+                        with _dashboard._lock:
+                            if wid in _dashboard._workers:
+                                w = _dashboard._workers[wid]
+                                pg_str = f"p{pg:02d}"
+                                if pg_str not in w["done_pages"]:
+                                    w["done_pages"].append(pg_str)
+                                w["task"] = ""
+                                w["status"] = ""
 
                     print_status(cost_tracker,
                                  step_name="AI OCR Correction",
