@@ -1007,8 +1007,8 @@ These pages have complex layouts. Read them in this order:
    - Centered text (column text is usually justified)
    - Business names, addresses, or product listings
    - Sometimes ads span multiple columns or interrupt column flow
-   - An ad in the middle of columns 4-5-6 means column text continues
-     above and below the ad — read those parts as column text
+   - When an ad interrupts columns, column text continues above and
+     below the ad — read those parts as column text
 
 4. READING ORDER for each column:
    a. Start at the top of the column

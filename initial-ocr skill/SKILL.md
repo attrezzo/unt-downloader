@@ -58,7 +58,7 @@ These pages have complex layouts. Read them in this order:
    - Centered text (column text is usually justified)
    - Business names, addresses, or product listings
    - Ads may span multiple columns or interrupt column flow
-   - When an ad interrupts columns 4-5-6, the column text continues above and below the ad
+   - When an ad interrupts columns, column text continues above and below the ad
 4. **Reading order** for each column: start at top, read down through articles, tag ads that interrupt with `{{ AdNNN }}`, continue column text below the ad, finish column, move right.
 
 **Instructions:**
