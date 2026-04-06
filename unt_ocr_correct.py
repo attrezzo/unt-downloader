@@ -1227,7 +1227,8 @@ def preload_images(issues, resume=True, retry_failed=False, workers=4):
 
 def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                   resume, force, rate_limiter=None,
-                  cost_tracker=None, worker_id="", api_workers=3):
+                  cost_tracker=None, worker_id="", api_workers=3,
+                  override_complete=False):
     """Process one newspaper issue through the AI OCR pipeline."""
     ark_id = issue["ark_id"]
     vol    = str(issue.get("volume", "?")).zfill(2)
@@ -1240,6 +1241,15 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     corr_path  = CORRECTED_DIR / fname
     ark_dir    = ARTICLES_DIR / ark_id
     ai_ocr_dir = AI_OCR_DIR / ark_id
+
+    # GUI completion gate — skip human-verified issues unless overridden
+    if not override_complete:
+        from gui.models.completion import is_issue_complete
+        collection_dir_for_gate = Path(str(AI_OCR_DIR)).parent if AI_OCR_DIR else None
+        if collection_dir_for_gate and is_issue_complete(collection_dir_for_gate, ark_id):
+            tprint(f"  SKIP {fname} (human-verified complete; use --override-complete to force)",
+                   worker=worker_id, level=1)
+            return "skipped"
 
     # Resume check
     if resume and not force and corr_path.exists() and corr_path.stat().st_size > 500:
@@ -1376,92 +1386,10 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
 # REFINEMENT — TEXT AND IMAGE MODES
 # ============================================================================
 
-# Regex to parse gap tags
-GAP_RE = re.compile(
-    r'\{\{\s*gap\s*\|'
-    r'\s*est=(\d+)'
-    r'\s*\|\s*imgbbox="([^"]*)"'
-    r'(?:\s*\|\s*cnf="([^"]*)")?'
-    r'(?:\s*\|\s*status=(\S+))?'
-    r'(?:\s*\|\s*fragments="([^"]*)")?'
-    r'(?:\s*\|\s*region_ocr="([^"]*)")?'
-    r'\s*\[([^\]]*)\]'
-    r'\s*\}\}')
-
-
-def parse_gaps(text: str) -> list:
-    """Extract all gap tags from text with their positions and fields."""
-    gaps = []
-    for m in GAP_RE.finditer(text):
-        gaps.append({
-            "match": m,
-            "start": m.start(),
-            "end": m.end(),
-            "est": int(m.group(1)),
-            "imgbbox": m.group(2),
-            "cnf": float(m.group(3)) if m.group(3) else 0.0,
-            "status": m.group(4) or "",
-            "fragments": m.group(5) or "",
-            "region_ocr": m.group(6) or "",
-            "guess": m.group(7),
-            "full_tag": m.group(0),
-        })
-    return gaps
-
-
-def get_context(text: str, start: int, end: int, chars: int = 200) -> str:
-    """Get ~chars characters of context before and after a position."""
-    before = text[max(0, start - chars):start].strip()
-    after = text[end:end + chars].strip()
-    return f"...{before} [GAP] {after}..."
-
-
-def parse_bbox(bbox_str: str) -> tuple:
-    """Parse 'x,y,w,h' string into (x, y, w, h) ints."""
-    parts = bbox_str.split(",")
-    if len(parts) == 4:
-        return tuple(int(p.strip()) for p in parts)
-    return (0, 0, 0, 0)
-
-
-def merge_bboxes(bboxes: list, padding: int = 50) -> tuple:
-    """Merge a list of (x,y,w,h) bboxes into a single bounding box."""
-    if not bboxes:
-        return (0, 0, 0, 0)
-    x_min = min(b[0] for b in bboxes) - padding
-    y_min = min(b[1] for b in bboxes) - padding
-    x_max = max(b[0] + b[2] for b in bboxes) + padding
-    y_max = max(b[1] + b[3] for b in bboxes) + padding
-    return (max(0, x_min), max(0, y_min), x_max - max(0, x_min), y_max - max(0, y_min))
-
-
-def group_gaps_by_bbox(gaps: list, proximity_px: int = 100) -> list:
-    """Group gaps whose bboxes overlap or are within proximity_px vertically.
-    Returns list of lists of gaps."""
-    if not gaps:
-        return []
-
-    # Sort by y position
-    sorted_gaps = sorted(gaps, key=lambda g: parse_bbox(g["imgbbox"])[1])
-    groups = []
-    current_group = [sorted_gaps[0]]
-    current_bbox = parse_bbox(sorted_gaps[0]["imgbbox"])
-    current_bottom = current_bbox[1] + current_bbox[3]
-
-    for gap in sorted_gaps[1:]:
-        bbox = parse_bbox(gap["imgbbox"])
-        gap_top = bbox[1]
-        if gap_top <= current_bottom + proximity_px:
-            current_group.append(gap)
-            current_bottom = max(current_bottom, bbox[1] + bbox[3])
-        else:
-            groups.append(current_group)
-            current_group = [gap]
-            current_bbox = bbox
-            current_bottom = bbox[1] + bbox[3]
-
-    groups.append(current_group)
-    return groups
+# Gap parsing utilities shared with the GUI — imported from gap_utils.py
+from gap_utils import (GAP_RE, parse_gaps, get_context, parse_bbox,
+                       merge_bboxes, group_gaps_by_bbox, build_gap_tag,
+                       bbox_to_str, split_bbox_horizontal)
 
 
 def crop_image(image_bytes: bytes, bbox: tuple) -> bytes:
@@ -2281,6 +2209,8 @@ def main():
     # Accept but ignore these (passed by orchestrator)
     p.add_argument("--issue-delay",    type=float, default=None)
     p.add_argument("--max-output-tokens", type=int, default=None)
+    p.add_argument("--override-complete", action="store_true",
+                   help="Reprocess issues/pages already marked complete by the GUI")
     args = p.parse_args()
 
     global LOG_LEVEL
@@ -2543,7 +2473,8 @@ def main():
             rate_limiter=rate_limiter,
             cost_tracker=cost_tracker,
             worker_id="",
-            api_workers=effective_workers)
+            api_workers=effective_workers,
+            override_complete=getattr(args, "override_complete", False))
 
         with log_lock:
             log.append({"ark_id": ark_id, "status": status})
