@@ -112,9 +112,39 @@ This is optional for common Tier 1 swaps (d/b, f/s) — those are so pervasive t
 
 ---
 
-### 4. Column Break Marker
+### 4. Article (Column) Marker
 
-When you detect that OCR has interleaved columns, mark the boundaries:
+Wrap each discrete article, news item, editorial, or notice in a numbered Column tag. Numbers are sequential per page (001, 002, 003...).
+
+```
+{{ Column001 }}
+## Headline
+
+**Dateline,** Date. Article body text here...
+{{ /Column }}
+```
+
+Use Column for: news articles, editorials, notices, programs, poetry, masthead, any non-advertising content.
+
+---
+
+### 5. Advertisement Marker
+
+Wrap each advertisement in a numbered Ad tag. Numbers are sequential per page (001, 002, 003...).
+
+```
+{{ Ad001 }}
+Ad text here. Business name, address, products/services.
+{{ /Ad }}
+```
+
+Use Ad for: commercial content, classified ads, legal notices paid for by individuals/businesses.
+
+---
+
+### 6. Column Break Marker
+
+When you detect that OCR has interleaved columns (two unrelated texts merged mid-sentence), mark where the break occurs:
 
 ```
 <!-- {{ column_break | from=N | to=M }} -->
@@ -124,15 +154,13 @@ Where N and M are column numbers (1 = leftmost).
 
 ---
 
-### 5. Article Boundary Marker
+### 7. Page Break Marker
 
-Mark where articles begin and end for structural metadata:
+In multi-page documents, mark page boundaries:
 
 ```
-<!-- {{ article | type="TYPE" | dateline="CITY, DATE" | topic="brief description" }} -->
+[---Page 1---]
 ```
-
-**Types:** `international`, `national`, `texas`, `local`, `program`, `advertisement`, `editorial`, `obituary`
 
 ---
 
@@ -161,8 +189,7 @@ Mark where articles begin and end for structural metadata:
 
 ---
 
-<!-- {{ article | type="program" | dateline="Bellville" | topic="Deutscher Tag festival program Oct 6" }} -->
-
+{{ Column001 }}
 ## Der Deutsche Tag!
 
 ### Große Feier
@@ -182,14 +209,26 @@ Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend [aus]^HIG
 ### geschmückten Wagen,
 
 darstellend Begebenheiten aus der deutschen Geschichte, oder der {{ gap | est=30 | fragments="cidrd" | status=unresolved [verschiedenen Nationalitäten] }}
+{{ /Column }}
 
----
-
-<!-- {{ article | type="texas" | dateline="Fort Worth, 13. Sept." | topic="Dry goods store burglary" }} -->
-
+{{ Column002 }}
 **Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry [Goods]^HIGH^ <!-- {{ infill | est=5 | confidence=HIGH | region_ocr="Try" | guess="Goods" | notes="ABBYY 'Try' is T/D swap + r/o noise = 'Dry'; 'Goods' follows naturally" }} --> Haus, Ecke 14 u. Main Str. an der Arbeit wären.
 
 Die {{ gap | est=15 [Polizeibeamten] }} kamen sofort zur Stelle.
+{{ /Column }}
+
+{{ Ad001 }}
+## C.A. Hermes
+Buchdrucker und Herausgeber.
+Bellville, Austin County, Texas.
+Abonnementspreis: $1.50 per Jahr.
+{{ /Ad }}
+
+{{ Ad002 }}
+## Dr. F. Reichardt
+Zahnarzt.
+Office über Haufschild's Store, Bellville.
+{{ /Ad }}
 ```
 
 ---
@@ -210,6 +249,13 @@ For programmatic extraction, tags follow these regex patterns:
 
 # Correction markers
 \{\{\s*corrected\s*\|\s*original="([^"]*)"\s*\|\s*rule="([^"]*)"\s*\}\}
+
+# Article/column structural markers
+\{\{\s*(Column|Ad)(\d{3})\s*\}\}     # opening tag
+\{\{\s*/(Column|Ad)\s*\}\}            # closing tag
+
+# Page breaks
+\[---Page\s*(\d+)---\]
 ```
 
 ## Refinement Workflow

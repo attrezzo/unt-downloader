@@ -44,9 +44,22 @@ Read the uploaded page image directly. Work section by section (masthead, then c
    {{ gap | est=NN [best guess] }}
    ```
    where `NN` is your best estimate of the character count and `[best guess]` is your prediction of what the text says based on context. Always guess — even a speculative guess is valuable for future refinement.
-5. Preserve paragraph and article boundaries with blank lines
-7. Mark article headlines with `##` and subheads with `###`
-8. Preserve any visible datelines (city, date) at the start of news items in **bold**
+5. Wrap each discrete article/news item/notice in a numbered Column tag:
+   ```
+   {{ Column001 }}
+   ## Headline
+   **Dateline,** Date. Article body...
+   {{ /Column }}
+   ```
+6. Wrap each advertisement in a numbered Ad tag:
+   ```
+   {{ Ad001 }}
+   Business name. Products/services. Address.
+   {{ /Ad }}
+   ```
+7. Number Column and Ad tags sequentially per page (001, 002, 003...)
+8. Mark article headlines with `##` and subheads with `###`
+9. Preserve any visible datelines (city, date) at the start of news items in **bold**
 
 **Before reading**, consult `references/fraktur-errors.md` to prime yourself on systematic Fraktur OCR failure modes. Apply these corrections as you read — e.g., when you see what looks like "b" but context demands "d", use "d".
 

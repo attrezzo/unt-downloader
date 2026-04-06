@@ -493,13 +493,14 @@ PASS 1 - DIRECT FRAKTUR OCR:
    {{{{ gap | est=NN [best guess of missing text] }}}}
    ALWAYS include a guess. Use context, sentence structure, article topic,
    and 1890s German knowledge. Even a speculative guess is valuable.
-7. Do NOT correct Texas German dialect words or pre-1901 spellings
-8. Do NOT translate English loanwords to German
-9. Mark article boundaries with:
-   <!-- {{{{ article | type="TYPE" | dateline="CITY, DATE" | topic="brief description" }}}} -->
-   Types: international, national, texas, local, program, advertisement,
-   editorial, obituary, masthead, notice, poetry
-10. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
+7. Wrap each article/news item/notice in a numbered Column tag:
+   {{{{ Column001 }}}} article text {{{{ /Column }}}}
+8. Wrap each advertisement in a numbered Ad tag:
+   {{{{ Ad001 }}}} ad text {{{{ /Ad }}}}
+9. Number Column and Ad tags sequentially per page (001, 002, 003...)
+10. Do NOT correct Texas German dialect words or pre-1901 spellings
+11. Do NOT translate English loanwords to German
+12. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
 
 PASS 2 - GAP INVENTORY:
 For each {{{{ gap }}}} from Pass 1:
@@ -725,6 +726,10 @@ def extract_clean_text(raw_response: str) -> str:
         r'[^}]*\}\}\s*-->',
         '', text)
 
+    # Strip structural tags: {{ Column001 }}, {{ /Column }}, {{ Ad001 }}, {{ /Ad }}
+    text = re.sub(r'\{\{\s*(?:Column|Ad)\d{3}\s*\}\}', '', text)
+    text = re.sub(r'\{\{\s*/(?:Column|Ad)\s*\}\}', '', text)
+
     # Extract best guess from gap markers: {{ gap | est=NN ... [guess] }} -> guess
     text = re.sub(
         r'\{\{\s*gap\s*\|[^[]*\[([^\]]*)\]\s*\}\}',
@@ -732,9 +737,6 @@ def extract_clean_text(raw_response: str) -> str:
     # Fallback for old-style gaps without guess
     text = re.sub(r'\{\{\s*gap\s*\|[^}]*\}\}', '', text)
     text = re.sub(r'\{\{\s*gap\s*\}\}', '', text)
-
-    # Also handle legacy [unleserlich] from old files
-    # (kept for backward compat with pre-existing corrected/ files)
 
     # Strip markdown heading markers for plain text
     text = re.sub(r'^##\s+', '', text, flags=re.M)
@@ -815,6 +817,7 @@ RULES:
   - If an item clearly starts mid-sentence, set continues_from_prev: true
   - If an item clearly ends mid-sentence, set continues_to_next: true
   - Preserve {{ gap }} markers exactly as-is
+  - Preserve {{ Column }}, {{ Ad }}, {{ /Column }}, {{ /Ad }} markers
 
 OUTPUT - valid JSON only, no markdown:
 {"page": <int>, "items": [{"type": "article|advertisement|masthead|notice|poetry",
@@ -1389,14 +1392,12 @@ def compile_issue(issue: dict, config: dict, collection_dir: Path):
     ]
 
     for pg_num, clean_text in sorted(all_clean_pages):
-        lines.append(f"### Page {pg_num}")
+        lines.append(f"[---Page {pg_num}---]")
         lines.append("")
         if clean_text.strip():
             lines.append(clean_text)
         else:
             lines.append("*(page empty or unavailable)*")
-        lines.append("")
-        lines.append("---")
         lines.append("")
 
     out_path = readable_dir / f"{fname}.md"
