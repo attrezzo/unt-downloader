@@ -513,22 +513,26 @@ For each {{{{ gap }}}} from Pass 1:
    {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="visible_text" }}}}
 
 PASS 3 - CROSS-REFERENCE, GUESS, AND CONFIDENCE:
-This is where guessing happens. Every gap MUST get a [guess] and cnf score.
+This is where guessing happens. Every remaining gap gets a guess and cnf.
 For each gap:
 1. If ABBYY/portal OCR is provided, find the corresponding region
 2. Apply the Fraktur error correction table to decode the raw OCR fragment
 3. Cross-reference: your reading + OCR fragment + context + 1890s German +
    article topic (international news = more Hochdeutsch, local = more dialect)
-4. Produce your best guess and assign a confidence score. Add [guess], cnf,
-   and region_ocr to the gap tag:
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="..." | region_ocr="raw_ocr" [your guess] }}}}
-   region_ocr MUST contain the exact raw OCR text, uncorrected.
-5. cnf >= 0.80: add status=auto-resolved
+4. Assign a confidence score:
+   cnf >= 0.95: PROMOTE TO PLAIN TEXT. Remove the gap tag entirely.
+     The text becomes untagged high-confidence output like Pass 1 text.
+   cnf 0.80-0.94: keep gap, add status=auto-resolved. Rarely needs review.
+   cnf < 0.80: keep gap, open for future refinement.
+5. Gaps that remain MUST have [guess], cnf, and region_ocr:
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="..." | region_ocr="raw_ocr" [guess] }}}}
+   region_ocr = exact raw OCR text, uncorrected.
 6. For non-gap corrections where the fix is ambiguous:
    corrected_word <!-- {{{{ corrected | original="ocr_reading" | rule="rule_name" }}}} -->
 
-cnf scale: 0.90-0.99=high, 0.70-0.89=moderate, 0.40-0.69=low,
-0.01-0.39=speculative, 0.00=pure context guess. Never 1.00.
+cnf: 0.95-0.99=promote to plain text, 0.80-0.94=auto-resolved,
+0.70-0.79=moderate, 0.40-0.69=low, 0.01-0.39=speculative,
+0.00=pure context guess.
 
 OUTPUT FORMAT - return this exact structure:
 

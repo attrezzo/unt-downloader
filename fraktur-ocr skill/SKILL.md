@@ -21,86 +21,74 @@ A three-pass pipeline for extracting readable text from 19th-century German-lang
 - Optionally: existing OCR text (e.g., ABBYY output from Portal to Texas History)
 - The user should specify the newspaper name, date, and page number if known
 
-## Output Format
+## Output
 
-The pipeline produces **Markdown** with inline metadata tags. See `references/markup-spec.md` for the full tag specification.
+A single final document in Markdown with inline metadata tags. The three passes happen internally — only the merged result is returned. See `references/markup-spec.md` for the full tag specification.
 
-**Key principle:** Every character in the output is either HIGH CONFIDENCE (unmarked) or tagged with metadata explaining its provenance and confidence level. Future AI passes can target only the tagged regions for refinement without re-processing the entire page.
+**Key principle:** Most text on the page should be high-confidence plain text with no tags. Only uncertain regions get `{{ gap }}` tags. If cross-referencing pushes confidence to cnf >= 0.95, the gap is promoted to plain text and the tag is removed.
 
 ---
 
 ## The Three Passes
 
-### PASS 1 — Direct Fraktur OCR
+All three passes happen in sequence. Return only the final merged result.
 
-Read the uploaded page image directly. Work section by section (masthead, then columns left to right, top to bottom).
+### PASS 1 — Direct Fraktur OCR (high-confidence extraction)
+
+Read the page image directly. This is where most of the text gets captured as plain, untagged, high-confidence output.
+
+**Before reading**, internalize:
+- `references/fraktur-errors.md` — systematic Fraktur OCR failure modes
+- `references/texas-german.md` — Texas German vocabulary, loanwords, period spelling
 
 **Instructions:**
-1. Identify the page layout: masthead, column count, any center-page features (advertisements, program announcements)
-2. Read each section in Fraktur, writing the text in standard Latin characters
-3. Where text is **confidently readable**, write it directly — no tags needed
-4. Where text is **illegible or uncertain**, insert a gap marker with estimated size and location. Do NOT guess yet — guessing happens in Pass 3.
+1. Identify the page layout: masthead, column count, center-page features (ads, programs, large headlines), visible damage
+2. Read each section in Fraktur, transcribing to Latin characters
+3. Apply Fraktur error corrections as you read (Tier 1 aggressively, Tiers 2-5 with context)
+4. Where text is **confidently readable**, write it directly — no tags needed. This should be the majority of the page.
+5. Where text is **illegible or uncertain**, mark with a gap. Do NOT guess yet — just record location and estimated size:
    ```
    {{ gap | est=NN | imgbbox="x,y,w,h" }}
    ```
-   - `est` = estimated character count of the missing text
-   - `imgbbox` = approximate pixel region in the source image (x,y = top-left, w,h = size). Be generous — overestimate to ensure the text is fully contained. This allows future refinement passes to crop just this region instead of resending the full page.
-5. Mark any images, illustrations, or engravings on the page:
+   `est` = estimated character count. `imgbbox` = approximate pixel bounding box (x,y = top-left, w,h = size). Be generous with the box.
+6. Mark images, illustrations, or engravings:
    ```
    {{ Img | bbox="x,y,w,h" | desc="brief description" }}
    ```
-6. Wrap each discrete article/news item/notice in a numbered Column tag:
+7. Wrap each article/news item/notice in a numbered Column tag:
    ```
    {{ Column001 }}
    ## Headline
    **Dateline,** Date. Article body...
    {{ /Column }}
    ```
-7. Wrap each advertisement in a numbered Ad tag:
+8. Wrap each advertisement in a numbered Ad tag:
    ```
    {{ Ad001 }}
    Business name. Products/services. Address.
    {{ /Ad }}
    ```
-8. Number Column and Ad tags sequentially per page (001, 002, 003...)
-9. Mark article headlines with `##` and subheads with `###`
-10. Preserve any visible datelines (city, date) at the start of news items in **bold**
-
-**Before reading**, consult `references/fraktur-errors.md` to prime yourself on systematic Fraktur OCR failure modes. Apply these corrections as you read — e.g., when you see what looks like "b" but context demands "d", use "d".
-
-**Texas German awareness:** Consult `references/texas-german.md` before reading. Do NOT normalize Texas German vocabulary to standard Hochdeutsch. Preserve English loanwords, hybrid compounds, period spellings, and Germanized place names exactly as printed.
-
-**Output this pass as:**
-```
-## PASS 1 — Direct OCR
-### Metadata
-- Newspaper: [name]
-- Date: [date]
-- Page: [N] of [total]
-- Source image: [filename]
-
-### Text
-[transcribed text with {{gap|est=NN}} markers]
-```
+9. Number Column and Ad tags sequentially per page (001, 002, 003...)
+10. Headlines: `##` | Subheads: `###` | Datelines: **bold**
+11. Do NOT correct Texas German dialect words or pre-1901 spellings
+12. Do NOT translate English loanwords to German
 
 ---
 
-### PASS 2 — Gap Inventory
+### PASS 2 — Gap Inventory (observation only)
 
-Review your Pass 1 output. For each `{{ gap }}` marker:
+Review your Pass 1 output. For each `{{ gap }}` marker, re-examine the image at that location.
 
-1. Examine the image again at that location
-2. Refine the character count estimate and bounding box
-3. Note what partial letterforms, ascenders, descenders, or fragments you can see
-4. Do NOT guess yet — just record what you see
+1. Refine the character count estimate and bounding box
+2. Note what partial letterforms, ascenders, descenders, or fragments you can see
+3. Do NOT guess yet — just record what you observe
 
-**Output this pass as an update** — add fragments and refine imgbbox/est:
-
+Update each gap with fragments:
 ```
 {{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" }}
 ```
 
-For example:
+Example:
 ```
 {{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" }}
 ```
@@ -109,45 +97,49 @@ For example:
 
 ### PASS 3 — Cross-Reference, Guess, and Confidence
 
-This is where guessing happens. For every gap, produce a best guess and assign a confidence score. Use ABBYY/portal OCR if available; otherwise work from the image and context alone.
+This is where guessing happens. For every gap, produce a best guess and assign a confidence score.
 
 **Instructions:**
 
 1. For each `{{ gap }}` marker, examine:
-   - The original image at that location (re-examine carefully)
-   - The corresponding region in the ABBYY OCR (if provided)
-   - Surrounding context in both your Pass 1 text and the ABBYY text
-   - Your knowledge of 1890s German, Texas German dialect, and the topic at hand
+   - The original image at that location (one more careful look)
+   - The corresponding region in the ABBYY/portal OCR (if provided)
+   - Surrounding context
+   - Your knowledge of 1890s German, Texas German dialect, and the article topic
 
-2. Apply the Fraktur error correction table from `references/fraktur-errors.md` to decode the ABBYY fragments
+2. Apply the Fraktur error correction table to decode the ABBYY fragments
 
-3. Produce a best guess for the missing text and assign a confidence score. Add the guess in square brackets, cnf, and the raw OCR source to the gap tag:
+3. Assign a confidence score and produce your best guess:
 
-```
-{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial" | region_ocr="raw_abbyy" [your guess] }}
-```
+   **If cnf >= 0.95 — PROMOTE TO PLAIN TEXT.** Remove the gap tag entirely. The text is confident enough to stand as untagged output, just like the text from Pass 1. This happens when your reading and the ABBYY OCR strongly agree, context tightly constrains the word, and/or it's a common word with clear fragments.
+
+   **If cnf 0.80–0.94 — auto-resolved gap.** Keep the gap tag with `status=auto-resolved`. Future refinement passes skip these by default:
+   ```
+   {{ gap | est=12 | imgbbox="450,1200,280,45" | cnf="0.85" | status=auto-resolved | fragments="Verfa...ung" | region_ocr="Bcrfaffung" [Verfassung] }}
+   ```
+
+   **If cnf < 0.80 — open gap.** Needs future review:
+   ```
+   {{ gap | est=22 | imgbbox="820,2100,400,50" | cnf="0.25" | fragments="cidrd" | region_ocr="cidrd Rationalitätcn" [verschiedenen Nationalitäten] }}
+   ```
 
 4. **Confidence scale (`cnf`):**
-   - `0.90–0.99` — High. Multiple sources agree, strong context. Rarely needs review.
-   - `0.70–0.89` — Moderate. Fragments match, context fits. Worth reviewing.
+   - `0.95–0.99` — Promote to plain text. Remove the gap tag.
+   - `0.80–0.94` — High. Add `status=auto-resolved`. Rarely needs review.
+   - `0.70–0.79` — Moderate. Fragments match, context fits. Worth reviewing.
    - `0.40–0.69` — Low. Context-based, fragments ambiguous. Should be reviewed.
    - `0.01–0.39` — Speculative. Mostly guessing from context.
    - `0.00` — Pure educated guess. No evidence beyond sentence structure and topic.
 
 5. `region_ocr` MUST contain the exact raw OCR text for this region, uncorrected. This is the most valuable field for future refinement.
 
-6. When cnf >= 0.80, add `status=auto-resolved`. Future refinement passes skip these by default:
-```
-{{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" | status=auto-resolved [aus] }}
-```
-
-**IMPORTANT:** Every gap MUST get a `[guess]` and a `cnf` score in this pass. Never leave a gap without a guess. Even `cnf="0.00"` with a wild guess is more useful than nothing.
+6. Every gap that remains MUST have a `[guess]` and a `cnf` score. Never leave a gap without a guess. Even `cnf="0.00"` with a wild guess is more useful than nothing.
 
 ---
 
-## Final Output Assembly
+## Final Output
 
-After all three passes, produce the final document:
+Return a single document with this structure:
 
 ```markdown
 # [Newspaper Name] — [Date] — Page [N]
@@ -157,7 +149,7 @@ After all three passes, produce the final document:
 - Source image: [filename]
 - Reference OCR: [source, e.g. "UNT Portal to Texas History / ABBYY"]
 - Processing date: [today]
-- Total gaps: [count]
+- Total gaps remaining: [count]
 
 ### Statistics
 - Estimated total characters on page: [N]
@@ -168,7 +160,7 @@ After all three passes, produce the final document:
 
 ---
 
-[Final merged text with inline tags as described above]
+[Final merged text — mostly plain text, with {{ gap }} tags only where uncertain]
 ```
 
 ---
