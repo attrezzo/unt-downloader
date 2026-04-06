@@ -1211,7 +1211,7 @@ def preload_images(issues, resume=True, retry_failed=False, workers=4):
 
 def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                   resume, force, rate_limiter=None,
-                  cost_tracker=None, worker_id=""):
+                  cost_tracker=None, worker_id="", api_workers=3):
     """Process one newspaper issue through the AI OCR pipeline."""
     ark_id = issue["ark_id"]
     vol    = str(issue.get("volume", "?")).zfill(2)
@@ -1265,45 +1265,56 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     ai_ocr_dir.mkdir(parents=True, exist_ok=True)
     corrected_pages = dict(existing_corrected)
 
+    # Build list of pages that need processing
+    pages_todo = []
     for pg in range(1, actual_pages + 1):
-        # Skip already-corrected pages
         page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
         if (not force and pg in existing_corrected
                 and existing_corrected[pg].strip()
                 and page_md_path.exists()):
             tprint(f"  p{pg:02d} SKIP (exists)", worker=worker_id, level=2)
             continue
+        pages_todo.append(pg)
 
-        # Budget check
-        if cost_tracker and cost_tracker.would_exceed_budget():
-            tprint(f"\n  BUDGET LIMIT: Stopping before page {pg}. "
-                   f"{cost_tracker.summary()}", worker=worker_id, level=1)
-            break
+    if not pages_todo:
+        tprint(f"  All pages already corrected", worker=worker_id, level=1)
+    else:
+        def _correct_one(pg):
+            """Correct a single page (runs in thread pool)."""
+            if cost_tracker and cost_tracker.would_exceed_budget():
+                return pg, {"status": "budget", "text": ""}
+            tprint(f"  p{pg:02d} correcting ...", worker=worker_id, level=1)
+            result = correct_page(
+                ark_id, pg, actual_pages, newspaper, date, fname,
+                pass12_prompt, pass3_prompt, api_key,
+                rate_limiter, cost_tracker)
+            return pg, result
 
-        tprint(f"  p{pg:02d} correcting ...", worker=worker_id, level=1)
-
-        result = correct_page(
-            ark_id, pg, actual_pages, newspaper, date, fname,
-            pass12_prompt, pass3_prompt, api_key,
-            rate_limiter, cost_tracker)
-
-        if result["status"] == "ok":
-            corrected_pages[pg] = result["text"]
-            page_md_path.write_text(result["markdown"], encoding="utf-8")
-            tprint(f"  p{pg:02d} ok  ({len(result['text'])} chars)",
-                   worker=worker_id, level=1)
-        elif result["status"] == "no_image":
-            tprint(f"  p{pg:02d} SKIP (no image or OCR)",
-                   worker=worker_id, level=1)
-            corrected_pages[pg] = ""
-        else:
-            tprint(f"  p{pg:02d} FAILED: {result.get('error', 'unknown')}",
-                   worker=worker_id, level=1)
-            corrected_pages[pg] = (
-                f"[CORRECTION FAILED: {result.get('error', 'unknown')}]")
-
-        if delay > 0:
-            time.sleep(delay)
+        with ThreadPoolExecutor(max_workers=api_workers) as ex:
+            futures = {ex.submit(_correct_one, pg): pg for pg in pages_todo}
+            for fut in as_completed(futures):
+                pg, result = fut.result()
+                page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
+                if result["status"] == "ok":
+                    corrected_pages[pg] = result["text"]
+                    page_md_path.write_text(
+                        result["markdown"], encoding="utf-8")
+                    tprint(f"  p{pg:02d} ok  ({len(result['text'])} chars)",
+                           worker=worker_id, level=1)
+                elif result["status"] == "no_image":
+                    tprint(f"  p{pg:02d} SKIP (no image or OCR)",
+                           worker=worker_id, level=1)
+                    corrected_pages[pg] = ""
+                elif result["status"] == "budget":
+                    tprint(f"  p{pg:02d} BUDGET LIMIT",
+                           worker=worker_id, level=1)
+                else:
+                    tprint(f"  p{pg:02d} FAILED: "
+                           f"{result.get('error', 'unknown')}",
+                           worker=worker_id, level=1)
+                    corrected_pages[pg] = (
+                        f"[CORRECTION FAILED: "
+                        f"{result.get('error', 'unknown')}]")
 
     # Write corrected/ file
     out_lines = [header, ""]
@@ -1571,196 +1582,227 @@ def apply_refinement_results(page_text: str, gaps: list,
     return page_text
 
 
+def _refine_text_page(page_file, cnf_min, cnf_max, include_resolved,
+                      model, prompt, api_key, rate_limiter, cost_tracker):
+    """Refine one page's gaps (text-only). Returns (updated, promoted, unchanged)."""
+    text = page_file.read_text(encoding="utf-8")
+    gaps = parse_gaps(text)
+
+    eligible = [g for g in gaps
+                if cnf_min <= g["cnf"] <= cnf_max
+                and (include_resolved or g["status"] != "auto-resolved")
+                and (g["fragments"] or g["region_ocr"])]
+
+    if not eligible:
+        return 0, 0, 0
+
+    tprint(f"  {page_file.parent.name}/{page_file.name}: "
+           f"{len(eligible)} gaps", level=1)
+
+    batch_lines = []
+    for i, g in enumerate(eligible, 1):
+        ctx = get_context(text, g["start"], g["end"])
+        batch_lines.append(
+            f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
+            f"fragments=\"{g['fragments']}\" "
+            f"region_ocr=\"{g['region_ocr']}\" "
+            f"current_guess=\"{g['guess']}\"\n"
+            f"  Context: {ctx}")
+
+    user_msg = "\n\n".join(batch_lines)
+
+    try:
+        result, _ = claude_api_call(
+            {"model": model, "max_tokens": 4000,
+             "system": prompt,
+             "messages": [{"role": "user", "content": user_msg}]},
+            api_key, rate_limiter,
+            est_tokens=len(user_msg) // 4 + 2000,
+            cost_tracker=cost_tracker)
+    except Exception as e:
+        tprint(f"    Error: {e}", level=1)
+        return 0, 0, 0
+
+    new_text = apply_refinement_results(text, eligible, result)
+    updated = promoted = unchanged = 0
+    if new_text != text:
+        page_file.write_text(new_text, encoding="utf-8")
+        for line in result.strip().split("\n"):
+            if line.startswith("UPDATED:"):
+                updated += 1
+            elif line.startswith("PROMOTED:"):
+                promoted += 1
+            elif line.startswith("UNCHANGED:"):
+                unchanged += 1
+    return updated, promoted, unchanged
+
+
 def refine_text(issues, config, collection_dir, api_key,
                 cnf_min=0.0, cnf_max=0.79, include_resolved=False,
-                rate_limiter=None, cost_tracker=None, model=None):
-    """Text-only refinement pass across all matching gaps."""
+                rate_limiter=None, cost_tracker=None, model=None,
+                api_workers=3):
+    """Text-only refinement pass across all matching gaps (parallelized)."""
     model = model or MODEL_RESOLVE
     prompt = build_text_refine_prompt()
-    total_updated = 0
-    total_promoted = 0
-    total_unchanged = 0
 
+    # Collect all page files
+    page_files = []
     for issue in issues:
-        ark_id = issue["ark_id"]
-        ai_dir = collection_dir / "ai_ocr" / ark_id
-        if not ai_dir.exists():
-            continue
+        ai_dir = collection_dir / "ai_ocr" / issue["ark_id"]
+        if ai_dir.exists():
+            page_files.extend(sorted(ai_dir.glob("page_*.md")))
 
-        for page_file in sorted(ai_dir.glob("page_*.md")):
-            text = page_file.read_text(encoding="utf-8")
-            gaps = parse_gaps(text)
+    if not page_files:
+        print("No ai_ocr/ pages found.")
+        return 0
 
-            # Filter by cnf range and status
-            eligible = []
-            for g in gaps:
-                if g["cnf"] < cnf_min or g["cnf"] > cnf_max:
-                    continue
-                if g["status"] == "auto-resolved" and not include_resolved:
-                    continue
-                # For text refinement, skip gaps with nothing to work with
-                if not g["fragments"] and not g["region_ocr"]:
-                    continue
-                eligible.append(g)
+    total_updated = total_promoted = total_unchanged = 0
 
-            if not eligible:
-                continue
-
-            tprint(f"  {ark_id}/{page_file.name}: {len(eligible)} gaps",
-                   level=1)
-
-            # Build batch prompt
-            batch_lines = []
-            for i, g in enumerate(eligible, 1):
-                ctx = get_context(text, g["start"], g["end"])
-                batch_lines.append(
-                    f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
-                    f"fragments=\"{g['fragments']}\" "
-                    f"region_ocr=\"{g['region_ocr']}\" "
-                    f"current_guess=\"{g['guess']}\"\n"
-                    f"  Context: {ctx}")
-
-            user_msg = "\n\n".join(batch_lines)
-
-            try:
-                result, _ = claude_api_call(
-                    {"model": model, "max_tokens": 4000,
-                     "system": prompt,
-                     "messages": [{"role": "user", "content": user_msg}]},
-                    api_key, rate_limiter, est_tokens=len(user_msg) // 4 + 2000,
-                    cost_tracker=cost_tracker)
-            except Exception as e:
-                tprint(f"    Error: {e}", level=1)
-                continue
-
-            # Apply results
-            new_text = apply_refinement_results(text, eligible, result)
-            if new_text != text:
-                page_file.write_text(new_text, encoding="utf-8")
-                # Count changes
-                for line in result.strip().split("\n"):
-                    if line.startswith("UPDATED:"):
-                        total_updated += 1
-                    elif line.startswith("PROMOTED:"):
-                        total_promoted += 1
-                    elif line.startswith("UNCHANGED:"):
-                        total_unchanged += 1
+    with ThreadPoolExecutor(max_workers=api_workers) as ex:
+        futures = {
+            ex.submit(
+                _refine_text_page, pf, cnf_min, cnf_max,
+                include_resolved, model, prompt,
+                api_key, rate_limiter, cost_tracker
+            ): pf for pf in page_files
+        }
+        for fut in as_completed(futures):
+            u, p, uc = fut.result()
+            total_updated += u
+            total_promoted += p
+            total_unchanged += uc
 
     print(f"\nText refinement: {total_promoted} promoted, "
           f"{total_updated} updated, {total_unchanged} unchanged")
     return total_promoted + total_updated
 
 
+def _refine_image_page(page_file, ark_id, cnf_min, cnf_max,
+                       include_resolved, model, prompt,
+                       api_key, rate_limiter, cost_tracker):
+    """Refine one page's gaps with image cropping. Returns (updated, promoted).
+    Groups within a page are processed sequentially (they modify same text)."""
+    text = page_file.read_text(encoding="utf-8")
+    gaps = parse_gaps(text)
+
+    eligible = [g for g in gaps
+                if cnf_min <= g["cnf"] <= cnf_max
+                and (include_resolved or g["status"] != "auto-resolved")
+                and not (not g["fragments"] and not g["region_ocr"]
+                         and g["cnf"] == 0.0)]
+
+    if not eligible:
+        return 0, 0
+
+    pg_match = re.search(r'page_(\d+)', page_file.stem)
+    if not pg_match:
+        return 0, 0
+    pg_num = int(pg_match.group(1))
+    img_bytes, _ = fetch_page_image(ark_id, pg_num)
+    if not img_bytes:
+        tprint(f"  {ark_id}/p{pg_num}: no image, skipping", level=1)
+        return 0, 0
+
+    groups = group_gaps_by_bbox(eligible)
+    tprint(f"  {ark_id}/p{pg_num}: {len(eligible)} gaps in "
+           f"{len(groups)} batch(es)", level=1)
+
+    updated = promoted = 0
+    any_changed = False
+
+    for group in groups:
+        bboxes = [parse_bbox(g["imgbbox"]) for g in group]
+        merged = merge_bboxes(bboxes, padding=50)
+
+        try:
+            crop_bytes = crop_image(img_bytes, merged)
+        except Exception as e:
+            tprint(f"    Crop failed: {e}", level=2)
+            continue
+
+        content = [
+            {"type": "image", "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.standard_b64encode(
+                    crop_bytes).decode("ascii"),
+            }},
+        ]
+
+        batch_lines = []
+        for i, g in enumerate(group, 1):
+            ctx = get_context(text, g["start"], g["end"])
+            batch_lines.append(
+                f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
+                f"fragments=\"{g['fragments']}\" "
+                f"region_ocr=\"{g['region_ocr']}\" "
+                f"current_guess=\"{g['guess']}\"\n"
+                f"  Context: {ctx}")
+
+        content.append({"type": "text",
+                        "text": "\n\n".join(batch_lines)})
+
+        try:
+            result, _ = claude_api_call(
+                {"model": model, "max_tokens": 2000,
+                 "system": prompt,
+                 "messages": [{"role": "user", "content": content}]},
+                api_key, rate_limiter, est_tokens=5000,
+                cost_tracker=cost_tracker)
+        except Exception as e:
+            tprint(f"    Error: {e}", level=1)
+            continue
+
+        new_text = apply_refinement_results(text, group, result)
+        if new_text != text:
+            text = new_text
+            any_changed = True
+            for line in result.strip().split("\n"):
+                if line.startswith("UPDATED:"):
+                    updated += 1
+                elif line.startswith("PROMOTED:"):
+                    promoted += 1
+
+    if any_changed:
+        page_file.write_text(text, encoding="utf-8")
+    return updated, promoted
+
+
 def refine_image(issues, config, collection_dir, api_key,
                  cnf_min=0.01, cnf_max=0.60, include_resolved=False,
-                 rate_limiter=None, cost_tracker=None, model=None):
-    """Image-assisted refinement with bbox cropping and batching."""
+                 rate_limiter=None, cost_tracker=None, model=None,
+                 api_workers=3):
+    """Image-assisted refinement with bbox cropping and batching (parallelized)."""
     model = model or MODEL_REFINE
     prompt = build_image_refine_prompt()
-    total_updated = 0
-    total_promoted = 0
 
+    # Collect all (page_file, ark_id) pairs
+    page_items = []
     for issue in issues:
         ark_id = issue["ark_id"]
         ai_dir = collection_dir / "ai_ocr" / ark_id
-        if not ai_dir.exists():
-            continue
+        if ai_dir.exists():
+            for pf in sorted(ai_dir.glob("page_*.md")):
+                page_items.append((pf, ark_id))
 
-        for page_file in sorted(ai_dir.glob("page_*.md")):
-            text = page_file.read_text(encoding="utf-8")
-            gaps = parse_gaps(text)
+    if not page_items:
+        print("No ai_ocr/ pages found.")
+        return 0
 
-            # Filter
-            eligible = []
-            for g in gaps:
-                if g["cnf"] < cnf_min or g["cnf"] > cnf_max:
-                    continue
-                if g["status"] == "auto-resolved" and not include_resolved:
-                    continue
-                # Skip pure context guesses with nothing visible
-                if not g["fragments"] and not g["region_ocr"] and g["cnf"] == 0.0:
-                    continue
-                eligible.append(g)
+    total_updated = total_promoted = 0
 
-            if not eligible:
-                continue
-
-            # Get the page image
-            pg_match = re.search(r'page_(\d+)', page_file.stem)
-            if not pg_match:
-                continue
-            pg_num = int(pg_match.group(1))
-            img_bytes, img_type = fetch_page_image(ark_id, pg_num)
-            if not img_bytes:
-                tprint(f"  {ark_id}/p{pg_num}: no image, skipping", level=1)
-                continue
-
-            # Group gaps by bbox proximity for batching
-            groups = group_gaps_by_bbox(eligible)
-            tprint(f"  {ark_id}/p{pg_num}: {len(eligible)} gaps in "
-                   f"{len(groups)} batch(es)", level=1)
-
-            any_changed = False
-            for group in groups:
-                # Merge bboxes for this group
-                bboxes = [parse_bbox(g["imgbbox"]) for g in group]
-                merged = merge_bboxes(bboxes, padding=50)
-
-                # Crop
-                try:
-                    crop_bytes = crop_image(img_bytes, merged)
-                except Exception as e:
-                    tprint(f"    Crop failed: {e}", level=2)
-                    continue
-
-                # Build batch prompt with image
-                content = [
-                    {"type": "image", "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": base64.standard_b64encode(
-                            crop_bytes).decode("ascii"),
-                    }},
-                ]
-
-                batch_lines = []
-                for i, g in enumerate(group, 1):
-                    ctx = get_context(text, g["start"], g["end"])
-                    batch_lines.append(
-                        f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
-                        f"fragments=\"{g['fragments']}\" "
-                        f"region_ocr=\"{g['region_ocr']}\" "
-                        f"current_guess=\"{g['guess']}\"\n"
-                        f"  Context: {ctx}")
-
-                content.append(
-                    {"type": "text",
-                     "text": "\n\n".join(batch_lines)})
-
-                try:
-                    result, _ = claude_api_call(
-                        {"model": model, "max_tokens": 2000,
-                         "system": prompt,
-                         "messages": [{"role": "user",
-                                       "content": content}]},
-                        api_key, rate_limiter, est_tokens=5000,
-                        cost_tracker=cost_tracker)
-                except Exception as e:
-                    tprint(f"    Error: {e}", level=1)
-                    continue
-
-                new_text = apply_refinement_results(text, group, result)
-                if new_text != text:
-                    text = new_text
-                    any_changed = True
-                    for line in result.strip().split("\n"):
-                        if line.startswith("UPDATED:"):
-                            total_updated += 1
-                        elif line.startswith("PROMOTED:"):
-                            total_promoted += 1
-
-            if any_changed:
-                page_file.write_text(text, encoding="utf-8")
+    with ThreadPoolExecutor(max_workers=api_workers) as ex:
+        futures = {
+            ex.submit(
+                _refine_image_page, pf, ark_id, cnf_min, cnf_max,
+                include_resolved, model, prompt,
+                api_key, rate_limiter, cost_tracker
+            ): pf for pf, ark_id in page_items
+        }
+        for fut in as_completed(futures):
+            u, p = fut.result()
+            total_updated += u
+            total_promoted += p
 
     print(f"\nImage refinement: {total_promoted} promoted, "
           f"{total_updated} updated")
@@ -2225,6 +2267,7 @@ def main():
         return
 
     if args.refine_text or args.refine_image:
+        effective_workers = 1 if args.serial else args.api_workers
         rate_limiter = (limiter_from_tier(args.tier)
                         if ClaudeRateLimiter else None)
         cost_tracker = CostTracker(MODEL_RESOLVE, budget=args.budget)
@@ -2239,7 +2282,8 @@ def main():
                         include_resolved=args.include_resolved,
                         rate_limiter=rate_limiter,
                         cost_tracker=cost_tracker,
-                        model=args.model_resolve)
+                        model=args.model_resolve,
+                        api_workers=effective_workers)
 
         if args.refine_image:
             cnf_min = args.cnf_min if args.cnf_min is not None else 0.01
@@ -2251,7 +2295,8 @@ def main():
                          include_resolved=args.include_resolved,
                          rate_limiter=rate_limiter,
                          cost_tracker=cost_tracker,
-                         model=args.model_refine)
+                         model=args.model_refine,
+                         api_workers=effective_workers)
 
         # Regenerate corrected/ and readable/ from updated ai_ocr/
         print("\nRegenerating corrected/ and readable/ ...", flush=True)
@@ -2319,12 +2364,14 @@ def main():
                    level=1)
             break
 
+        effective_workers = 1 if args.serial else args.api_workers
         status = process_issue(
             issue, api_key, pass12_prompt, pass3_prompt,
             args.delay, args.resume, args.force,
             rate_limiter=rate_limiter,
             cost_tracker=cost_tracker,
-            worker_id="")
+            worker_id="",
+            api_workers=effective_workers)
 
         with log_lock:
             log.append({"ark_id": ark_id, "status": status})
