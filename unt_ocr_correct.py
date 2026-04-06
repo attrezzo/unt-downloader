@@ -582,7 +582,7 @@ def claude_api_call(payload: dict, api_key: str,
         except urllib.error.HTTPError as e:
             if e.code in (429, 503, 529):
                 wait = 30 * attempt
-                tprint(f" [rate limit {e.code}, wait {wait}s]", level=1)
+                log_event(f"rate limit {e.code}, waiting {wait}s...")
                 time.sleep(wait)
             else:
                 raise
@@ -864,24 +864,29 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 
     est = EST_INPUT_TOKENS_PASS12 if has_image else 5_000
 
+    log_event(f"p{page_num:02d} pass 1-2 started  ({MODEL_INITIAL})")
     try:
-        tprint(f"      pass 1-2 ({MODEL_INITIAL}) ...", level=2)
-        pass12_raw, _ = claude_api_call(
+        pass12_raw, usage1 = claude_api_call(
             {"model": MODEL_INITIAL, "max_tokens": MAX_OUTPUT_TOKENS,
              "system": pass12_prompt,
              "messages": [{"role": "user", "content": content}]},
             api_key, rate_limiter, est_tokens=est, cost_tracker=cost_tracker)
     except Exception as e:
-        tprint(f"    x p{page_num:02d} Pass 1-2 error: {e}", level=1)
+        log_event(f"p{page_num:02d} pass 1-2 FAILED  {e}", "error")
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": str(e)}
 
     if not pass12_raw.strip():
+        log_event(f"p{page_num:02d} pass 1-2 empty response", "error")
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": "empty pass 1-2 response"}
 
+    in1 = usage1.get("input_tokens", 0)
+    out1 = usage1.get("output_tokens", 0)
+    log_event(f"p{page_num:02d} pass 1-2 done     "
+              f"{in1:,}in+{out1:,}out tok", "ok")
+
     # ── Call 2: Pass 3 (text-only cross-reference) ───────────────────────
-    # Build text-only prompt with Pass 1-2 output + reference OCR
     ref_ocr = abbyy_text or portal_ocr or ""
     pass3_user = (
         f"PASS 1-2 TRANSCRIPTION (with gap markers):\n"
@@ -895,22 +900,28 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
         "Resolve all gaps: add [guess], cnf, region_ocr. "
         "Promote cnf >= 0.95 to plain text.")
 
+    log_event(f"p{page_num:02d} pass 3 started    ({MODEL_RESOLVE})")
     try:
-        tprint(f"      pass 3 ({MODEL_RESOLVE}) ...", level=2)
-        raw, _ = claude_api_call(
+        raw, usage3 = claude_api_call(
             {"model": MODEL_RESOLVE, "max_tokens": MAX_OUTPUT_TOKENS,
              "system": pass3_prompt,
              "messages": [{"role": "user", "content": pass3_user}]},
             api_key, rate_limiter, est_tokens=EST_INPUT_TOKENS_PASS3,
             cost_tracker=cost_tracker)
     except Exception as e:
-        tprint(f"    x p{page_num:02d} Pass 3 error: {e} — using Pass 1-2",
-               level=1)
-        # Fall back to Pass 1-2 output (gaps unresolved but text is there)
+        log_event(f"p{page_num:02d} pass 3 FAILED    {e} (using pass 1-2)",
+                  "error")
         raw = pass12_raw
+        usage3 = {}
 
     if not raw.strip():
-        raw = pass12_raw  # fallback
+        raw = pass12_raw
+
+    in3 = usage3.get("input_tokens", 0)
+    out3 = usage3.get("output_tokens", 0)
+    if usage3:
+        log_event(f"p{page_num:02d} pass 3 done      "
+                  f"{in3:,}in+{out3:,}out tok", "ok")
 
     clean_text = extract_clean_text(raw)
     stats = extract_stats(raw)
@@ -1465,7 +1476,7 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                     page_md_path.write_text(
                         result["markdown"], encoding="utf-8")
                     log_event(
-                        f"p{pg:02d} {ark_id}  "
+                        f"p{pg:02d} COMPLETE  {ark_id}  "
                         f"{len(result['text'])} chars", "ok")
                 elif result["status"] == "no_image":
                     log_event(f"p{pg:02d} {ark_id}  no image", "skip")
