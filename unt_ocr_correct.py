@@ -300,7 +300,9 @@ def get_portal_ocr_text(issue_fname: str, page_num: int):
 # ============================================================================
 
 class CostTracker:
-    """Track actual API costs during a batch run."""
+    """Track actual API costs during a batch run. Thread-safe."""
+
+    REVISE_AFTER_PAGES = 5  # show revised estimate after this many pages
 
     def __init__(self, model: str, budget=None):
         self._lock = threading.Lock()
@@ -312,6 +314,8 @@ class CostTracker:
         self.pages_processed = 0
         self.input_price = 0.0   # $/MTok
         self.output_price = 0.0  # $/MTok
+        self._revised_shown = False
+        self._budget_abort = False  # set True if estimate > budget
 
         if load_pricing:
             pricing = load_pricing()
@@ -344,8 +348,11 @@ class CostTracker:
             ) / 1_000_000
 
     def would_exceed_budget(self) -> bool:
+        """Check if processing one more page would likely exceed budget."""
         if self.budget is None:
             return False
+        if self._budget_abort:
+            return True
         with self._lock:
             if self.pages_processed == 0:
                 avg_cost = (
@@ -366,6 +373,15 @@ class CostTracker:
                     (EST_OUTPUT_TOKENS_PASS12 + EST_OUTPUT_TOKENS_PASS3) *
                     self.output_price) / 1_000_000
             return self.total_cost / self.pages_processed
+
+    def should_show_revised(self) -> bool:
+        """Returns True once, after REVISE_AFTER_PAGES pages processed."""
+        with self._lock:
+            if (not self._revised_shown
+                    and self.pages_processed >= self.REVISE_AFTER_PAGES):
+                self._revised_shown = True
+                return True
+            return False
 
     def summary(self) -> str:
         with self._lock:
@@ -1211,7 +1227,7 @@ def preload_images(issues, resume=True, retry_failed=False, workers=4):
 
 def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                   resume, force, rate_limiter=None,
-                  cost_tracker=None, worker_id=""):
+                  cost_tracker=None, worker_id="", api_workers=3):
     """Process one newspaper issue through the AI OCR pipeline."""
     ark_id = issue["ark_id"]
     vol    = str(issue.get("volume", "?")).zfill(2)
@@ -1265,45 +1281,56 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     ai_ocr_dir.mkdir(parents=True, exist_ok=True)
     corrected_pages = dict(existing_corrected)
 
+    # Build list of pages that need processing
+    pages_todo = []
     for pg in range(1, actual_pages + 1):
-        # Skip already-corrected pages
         page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
         if (not force and pg in existing_corrected
                 and existing_corrected[pg].strip()
                 and page_md_path.exists()):
             tprint(f"  p{pg:02d} SKIP (exists)", worker=worker_id, level=2)
             continue
+        pages_todo.append(pg)
 
-        # Budget check
-        if cost_tracker and cost_tracker.would_exceed_budget():
-            tprint(f"\n  BUDGET LIMIT: Stopping before page {pg}. "
-                   f"{cost_tracker.summary()}", worker=worker_id, level=1)
-            break
+    if not pages_todo:
+        tprint(f"  All pages already corrected", worker=worker_id, level=1)
+    else:
+        def _correct_one(pg):
+            """Correct a single page (runs in thread pool)."""
+            if cost_tracker and cost_tracker.would_exceed_budget():
+                return pg, {"status": "budget", "text": ""}
+            tprint(f"  p{pg:02d} correcting ...", worker=worker_id, level=1)
+            result = correct_page(
+                ark_id, pg, actual_pages, newspaper, date, fname,
+                pass12_prompt, pass3_prompt, api_key,
+                rate_limiter, cost_tracker)
+            return pg, result
 
-        tprint(f"  p{pg:02d} correcting ...", worker=worker_id, level=1)
-
-        result = correct_page(
-            ark_id, pg, actual_pages, newspaper, date, fname,
-            pass12_prompt, pass3_prompt, api_key,
-            rate_limiter, cost_tracker)
-
-        if result["status"] == "ok":
-            corrected_pages[pg] = result["text"]
-            page_md_path.write_text(result["markdown"], encoding="utf-8")
-            tprint(f"  p{pg:02d} ok  ({len(result['text'])} chars)",
-                   worker=worker_id, level=1)
-        elif result["status"] == "no_image":
-            tprint(f"  p{pg:02d} SKIP (no image or OCR)",
-                   worker=worker_id, level=1)
-            corrected_pages[pg] = ""
-        else:
-            tprint(f"  p{pg:02d} FAILED: {result.get('error', 'unknown')}",
-                   worker=worker_id, level=1)
-            corrected_pages[pg] = (
-                f"[CORRECTION FAILED: {result.get('error', 'unknown')}]")
-
-        if delay > 0:
-            time.sleep(delay)
+        with ThreadPoolExecutor(max_workers=api_workers) as ex:
+            futures = {ex.submit(_correct_one, pg): pg for pg in pages_todo}
+            for fut in as_completed(futures):
+                pg, result = fut.result()
+                page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
+                if result["status"] == "ok":
+                    corrected_pages[pg] = result["text"]
+                    page_md_path.write_text(
+                        result["markdown"], encoding="utf-8")
+                    tprint(f"  p{pg:02d} ok  ({len(result['text'])} chars)",
+                           worker=worker_id, level=1)
+                elif result["status"] == "no_image":
+                    tprint(f"  p{pg:02d} SKIP (no image or OCR)",
+                           worker=worker_id, level=1)
+                    corrected_pages[pg] = ""
+                elif result["status"] == "budget":
+                    tprint(f"  p{pg:02d} BUDGET LIMIT",
+                           worker=worker_id, level=1)
+                else:
+                    tprint(f"  p{pg:02d} FAILED: "
+                           f"{result.get('error', 'unknown')}",
+                           worker=worker_id, level=1)
+                    corrected_pages[pg] = (
+                        f"[CORRECTION FAILED: "
+                        f"{result.get('error', 'unknown')}]")
 
     # Write corrected/ file
     out_lines = [header, ""]
@@ -1571,196 +1598,231 @@ def apply_refinement_results(page_text: str, gaps: list,
     return page_text
 
 
+def _refine_text_page(page_file, cnf_min, cnf_max, include_resolved,
+                      model, prompt, api_key, rate_limiter, cost_tracker):
+    """Refine one page's gaps (text-only). Returns (updated, promoted, unchanged)."""
+    if cost_tracker and cost_tracker.would_exceed_budget():
+        return 0, 0, 0
+    text = page_file.read_text(encoding="utf-8")
+    gaps = parse_gaps(text)
+
+    eligible = [g for g in gaps
+                if cnf_min <= g["cnf"] <= cnf_max
+                and (include_resolved or g["status"] != "auto-resolved")
+                and (g["fragments"] or g["region_ocr"])]
+
+    if not eligible:
+        return 0, 0, 0
+
+    tprint(f"  {page_file.parent.name}/{page_file.name}: "
+           f"{len(eligible)} gaps", level=1)
+
+    batch_lines = []
+    for i, g in enumerate(eligible, 1):
+        ctx = get_context(text, g["start"], g["end"])
+        batch_lines.append(
+            f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
+            f"fragments=\"{g['fragments']}\" "
+            f"region_ocr=\"{g['region_ocr']}\" "
+            f"current_guess=\"{g['guess']}\"\n"
+            f"  Context: {ctx}")
+
+    user_msg = "\n\n".join(batch_lines)
+
+    try:
+        result, _ = claude_api_call(
+            {"model": model, "max_tokens": 4000,
+             "system": prompt,
+             "messages": [{"role": "user", "content": user_msg}]},
+            api_key, rate_limiter,
+            est_tokens=len(user_msg) // 4 + 2000,
+            cost_tracker=cost_tracker)
+    except Exception as e:
+        tprint(f"    Error: {e}", level=1)
+        return 0, 0, 0
+
+    new_text = apply_refinement_results(text, eligible, result)
+    updated = promoted = unchanged = 0
+    if new_text != text:
+        page_file.write_text(new_text, encoding="utf-8")
+        for line in result.strip().split("\n"):
+            if line.startswith("UPDATED:"):
+                updated += 1
+            elif line.startswith("PROMOTED:"):
+                promoted += 1
+            elif line.startswith("UNCHANGED:"):
+                unchanged += 1
+    return updated, promoted, unchanged
+
+
 def refine_text(issues, config, collection_dir, api_key,
                 cnf_min=0.0, cnf_max=0.79, include_resolved=False,
-                rate_limiter=None, cost_tracker=None, model=None):
-    """Text-only refinement pass across all matching gaps."""
+                rate_limiter=None, cost_tracker=None, model=None,
+                api_workers=3):
+    """Text-only refinement pass across all matching gaps (parallelized)."""
     model = model or MODEL_RESOLVE
     prompt = build_text_refine_prompt()
-    total_updated = 0
-    total_promoted = 0
-    total_unchanged = 0
 
+    # Collect all page files
+    page_files = []
     for issue in issues:
-        ark_id = issue["ark_id"]
-        ai_dir = collection_dir / "ai_ocr" / ark_id
-        if not ai_dir.exists():
-            continue
+        ai_dir = collection_dir / "ai_ocr" / issue["ark_id"]
+        if ai_dir.exists():
+            page_files.extend(sorted(ai_dir.glob("page_*.md")))
 
-        for page_file in sorted(ai_dir.glob("page_*.md")):
-            text = page_file.read_text(encoding="utf-8")
-            gaps = parse_gaps(text)
+    if not page_files:
+        print("No ai_ocr/ pages found.")
+        return 0
 
-            # Filter by cnf range and status
-            eligible = []
-            for g in gaps:
-                if g["cnf"] < cnf_min or g["cnf"] > cnf_max:
-                    continue
-                if g["status"] == "auto-resolved" and not include_resolved:
-                    continue
-                # For text refinement, skip gaps with nothing to work with
-                if not g["fragments"] and not g["region_ocr"]:
-                    continue
-                eligible.append(g)
+    total_updated = total_promoted = total_unchanged = 0
 
-            if not eligible:
-                continue
-
-            tprint(f"  {ark_id}/{page_file.name}: {len(eligible)} gaps",
-                   level=1)
-
-            # Build batch prompt
-            batch_lines = []
-            for i, g in enumerate(eligible, 1):
-                ctx = get_context(text, g["start"], g["end"])
-                batch_lines.append(
-                    f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
-                    f"fragments=\"{g['fragments']}\" "
-                    f"region_ocr=\"{g['region_ocr']}\" "
-                    f"current_guess=\"{g['guess']}\"\n"
-                    f"  Context: {ctx}")
-
-            user_msg = "\n\n".join(batch_lines)
-
-            try:
-                result, _ = claude_api_call(
-                    {"model": model, "max_tokens": 4000,
-                     "system": prompt,
-                     "messages": [{"role": "user", "content": user_msg}]},
-                    api_key, rate_limiter, est_tokens=len(user_msg) // 4 + 2000,
-                    cost_tracker=cost_tracker)
-            except Exception as e:
-                tprint(f"    Error: {e}", level=1)
-                continue
-
-            # Apply results
-            new_text = apply_refinement_results(text, eligible, result)
-            if new_text != text:
-                page_file.write_text(new_text, encoding="utf-8")
-                # Count changes
-                for line in result.strip().split("\n"):
-                    if line.startswith("UPDATED:"):
-                        total_updated += 1
-                    elif line.startswith("PROMOTED:"):
-                        total_promoted += 1
-                    elif line.startswith("UNCHANGED:"):
-                        total_unchanged += 1
+    with ThreadPoolExecutor(max_workers=api_workers) as ex:
+        futures = {
+            ex.submit(
+                _refine_text_page, pf, cnf_min, cnf_max,
+                include_resolved, model, prompt,
+                api_key, rate_limiter, cost_tracker
+            ): pf for pf in page_files
+        }
+        for fut in as_completed(futures):
+            u, p, uc = fut.result()
+            total_updated += u
+            total_promoted += p
+            total_unchanged += uc
 
     print(f"\nText refinement: {total_promoted} promoted, "
           f"{total_updated} updated, {total_unchanged} unchanged")
     return total_promoted + total_updated
 
 
+def _refine_image_page(page_file, ark_id, cnf_min, cnf_max,
+                       include_resolved, model, prompt,
+                       api_key, rate_limiter, cost_tracker):
+    """Refine one page's gaps with image cropping. Returns (updated, promoted).
+    Groups within a page are processed sequentially (they modify same text)."""
+    if cost_tracker and cost_tracker.would_exceed_budget():
+        return 0, 0
+    text = page_file.read_text(encoding="utf-8")
+    gaps = parse_gaps(text)
+
+    eligible = [g for g in gaps
+                if cnf_min <= g["cnf"] <= cnf_max
+                and (include_resolved or g["status"] != "auto-resolved")
+                and not (not g["fragments"] and not g["region_ocr"]
+                         and g["cnf"] == 0.0)]
+
+    if not eligible:
+        return 0, 0
+
+    pg_match = re.search(r'page_(\d+)', page_file.stem)
+    if not pg_match:
+        return 0, 0
+    pg_num = int(pg_match.group(1))
+    img_bytes, _ = fetch_page_image(ark_id, pg_num)
+    if not img_bytes:
+        tprint(f"  {ark_id}/p{pg_num}: no image, skipping", level=1)
+        return 0, 0
+
+    groups = group_gaps_by_bbox(eligible)
+    tprint(f"  {ark_id}/p{pg_num}: {len(eligible)} gaps in "
+           f"{len(groups)} batch(es)", level=1)
+
+    updated = promoted = 0
+    any_changed = False
+
+    for group in groups:
+        bboxes = [parse_bbox(g["imgbbox"]) for g in group]
+        merged = merge_bboxes(bboxes, padding=50)
+
+        try:
+            crop_bytes = crop_image(img_bytes, merged)
+        except Exception as e:
+            tprint(f"    Crop failed: {e}", level=2)
+            continue
+
+        content = [
+            {"type": "image", "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.standard_b64encode(
+                    crop_bytes).decode("ascii"),
+            }},
+        ]
+
+        batch_lines = []
+        for i, g in enumerate(group, 1):
+            ctx = get_context(text, g["start"], g["end"])
+            batch_lines.append(
+                f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
+                f"fragments=\"{g['fragments']}\" "
+                f"region_ocr=\"{g['region_ocr']}\" "
+                f"current_guess=\"{g['guess']}\"\n"
+                f"  Context: {ctx}")
+
+        content.append({"type": "text",
+                        "text": "\n\n".join(batch_lines)})
+
+        try:
+            result, _ = claude_api_call(
+                {"model": model, "max_tokens": 2000,
+                 "system": prompt,
+                 "messages": [{"role": "user", "content": content}]},
+                api_key, rate_limiter, est_tokens=5000,
+                cost_tracker=cost_tracker)
+        except Exception as e:
+            tprint(f"    Error: {e}", level=1)
+            continue
+
+        new_text = apply_refinement_results(text, group, result)
+        if new_text != text:
+            text = new_text
+            any_changed = True
+            for line in result.strip().split("\n"):
+                if line.startswith("UPDATED:"):
+                    updated += 1
+                elif line.startswith("PROMOTED:"):
+                    promoted += 1
+
+    if any_changed:
+        page_file.write_text(text, encoding="utf-8")
+    return updated, promoted
+
+
 def refine_image(issues, config, collection_dir, api_key,
                  cnf_min=0.01, cnf_max=0.60, include_resolved=False,
-                 rate_limiter=None, cost_tracker=None, model=None):
-    """Image-assisted refinement with bbox cropping and batching."""
+                 rate_limiter=None, cost_tracker=None, model=None,
+                 api_workers=3):
+    """Image-assisted refinement with bbox cropping and batching (parallelized)."""
     model = model or MODEL_REFINE
     prompt = build_image_refine_prompt()
-    total_updated = 0
-    total_promoted = 0
 
+    # Collect all (page_file, ark_id) pairs
+    page_items = []
     for issue in issues:
         ark_id = issue["ark_id"]
         ai_dir = collection_dir / "ai_ocr" / ark_id
-        if not ai_dir.exists():
-            continue
+        if ai_dir.exists():
+            for pf in sorted(ai_dir.glob("page_*.md")):
+                page_items.append((pf, ark_id))
 
-        for page_file in sorted(ai_dir.glob("page_*.md")):
-            text = page_file.read_text(encoding="utf-8")
-            gaps = parse_gaps(text)
+    if not page_items:
+        print("No ai_ocr/ pages found.")
+        return 0
 
-            # Filter
-            eligible = []
-            for g in gaps:
-                if g["cnf"] < cnf_min or g["cnf"] > cnf_max:
-                    continue
-                if g["status"] == "auto-resolved" and not include_resolved:
-                    continue
-                # Skip pure context guesses with nothing visible
-                if not g["fragments"] and not g["region_ocr"] and g["cnf"] == 0.0:
-                    continue
-                eligible.append(g)
+    total_updated = total_promoted = 0
 
-            if not eligible:
-                continue
-
-            # Get the page image
-            pg_match = re.search(r'page_(\d+)', page_file.stem)
-            if not pg_match:
-                continue
-            pg_num = int(pg_match.group(1))
-            img_bytes, img_type = fetch_page_image(ark_id, pg_num)
-            if not img_bytes:
-                tprint(f"  {ark_id}/p{pg_num}: no image, skipping", level=1)
-                continue
-
-            # Group gaps by bbox proximity for batching
-            groups = group_gaps_by_bbox(eligible)
-            tprint(f"  {ark_id}/p{pg_num}: {len(eligible)} gaps in "
-                   f"{len(groups)} batch(es)", level=1)
-
-            any_changed = False
-            for group in groups:
-                # Merge bboxes for this group
-                bboxes = [parse_bbox(g["imgbbox"]) for g in group]
-                merged = merge_bboxes(bboxes, padding=50)
-
-                # Crop
-                try:
-                    crop_bytes = crop_image(img_bytes, merged)
-                except Exception as e:
-                    tprint(f"    Crop failed: {e}", level=2)
-                    continue
-
-                # Build batch prompt with image
-                content = [
-                    {"type": "image", "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": base64.standard_b64encode(
-                            crop_bytes).decode("ascii"),
-                    }},
-                ]
-
-                batch_lines = []
-                for i, g in enumerate(group, 1):
-                    ctx = get_context(text, g["start"], g["end"])
-                    batch_lines.append(
-                        f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
-                        f"fragments=\"{g['fragments']}\" "
-                        f"region_ocr=\"{g['region_ocr']}\" "
-                        f"current_guess=\"{g['guess']}\"\n"
-                        f"  Context: {ctx}")
-
-                content.append(
-                    {"type": "text",
-                     "text": "\n\n".join(batch_lines)})
-
-                try:
-                    result, _ = claude_api_call(
-                        {"model": model, "max_tokens": 2000,
-                         "system": prompt,
-                         "messages": [{"role": "user",
-                                       "content": content}]},
-                        api_key, rate_limiter, est_tokens=5000,
-                        cost_tracker=cost_tracker)
-                except Exception as e:
-                    tprint(f"    Error: {e}", level=1)
-                    continue
-
-                new_text = apply_refinement_results(text, group, result)
-                if new_text != text:
-                    text = new_text
-                    any_changed = True
-                    for line in result.strip().split("\n"):
-                        if line.startswith("UPDATED:"):
-                            total_updated += 1
-                        elif line.startswith("PROMOTED:"):
-                            total_promoted += 1
-
-            if any_changed:
-                page_file.write_text(text, encoding="utf-8")
+    with ThreadPoolExecutor(max_workers=api_workers) as ex:
+        futures = {
+            ex.submit(
+                _refine_image_page, pf, ark_id, cnf_min, cnf_max,
+                include_resolved, model, prompt,
+                api_key, rate_limiter, cost_tracker
+            ): pf for pf, ark_id in page_items
+        }
+        for fut in as_completed(futures):
+            u, p = fut.result()
+            total_updated += u
+            total_promoted += p
 
     print(f"\nImage refinement: {total_promoted} promoted, "
           f"{total_updated} updated")
@@ -1993,18 +2055,46 @@ def compile_all(issues: list, config: dict, collection_dir: Path,
 # COST ESTIMATION DISPLAY
 # ============================================================================
 
-def show_cost_estimate(pages_to_process, budget):
-    """Display pre-batch cost estimate for tiered models. Returns est cost."""
+def _model_price(model):
+    """Get (input_$/MTok, output_$/MTok) for a model from pricing.json."""
     pricing = load_pricing() if load_pricing else {}
+    mp = pricing.get(model, {})
+    return mp.get("input", 3.0), mp.get("output", 15.0)
 
-    def _price(model):
-        mp = pricing.get(model, {})
-        return mp.get("input", 3.0), mp.get("output", 15.0)
 
-    p12_in, p12_out = _price(MODEL_INITIAL)
-    p3_in, p3_out = _price(MODEL_RESOLVE)
+def show_cost_estimate(step_name, units, unit_label,
+                       est_input_tok, est_output_tok, model, budget):
+    """Display pre-batch cost estimate. Returns (est_cost, per_unit_cost)."""
+    in_price, out_price = _model_price(model)
+    per_unit = (est_input_tok * in_price +
+                est_output_tok * out_price) / 1_000_000
+    est_cost = units * per_unit
+    est_high = est_cost * 1.2
 
-    # Per-page cost: Call 1 (image) + Call 2 (text-only)
+    print()
+    print("=" * 60)
+    print(f"  {step_name} -- COST ESTIMATE")
+    print("=" * 60)
+    print(f"  Model            : {model} "
+          f"(${in_price:.2f}/${out_price:.2f} per MTok)")
+    print(f"  {unit_label:<18} : {units:,}")
+    print(f"  Est. cost/unit   : ${per_unit:.4f}")
+    print(f"  Est. total cost  : ${est_cost:.2f} - ${est_high:.2f}")
+    if budget is not None:
+        print(f"  Budget limit     : ${budget:.2f}")
+        if est_high > budget:
+            affordable = int(budget / per_unit) if per_unit > 0 else 0
+            print(f"  Budget covers    : ~{affordable} of {units} {unit_label}")
+    print("=" * 60)
+    print()
+    return est_cost, per_unit
+
+
+def show_correction_estimate(pages_to_process, budget):
+    """Cost estimate for tiered --correct (Haiku + Sonnet)."""
+    p12_in, p12_out = _model_price(MODEL_INITIAL)
+    p3_in, p3_out = _model_price(MODEL_RESOLVE)
+
     cost_p12 = (EST_INPUT_TOKENS_PASS12 * p12_in +
                 EST_OUTPUT_TOKENS_PASS12 * p12_out) / 1_000_000
     cost_p3 = (EST_INPUT_TOKENS_PASS3 * p3_in +
@@ -2033,22 +2123,22 @@ def show_cost_estimate(pages_to_process, budget):
                   f"{pages_to_process} pages")
     print("=" * 60)
     print()
-    return est_cost
+    return est_cost, per_page
 
 
-def show_revised_estimate(cost_tracker, pages_remaining, total_pages):
-    """Show revised cost estimate after first issue."""
-    est_remaining = cost_tracker.estimate_remaining(pages_remaining)
+def show_revised_estimate(cost_tracker, units_remaining, unit_label="pages"):
+    """Show revised cost estimate based on actual usage so far."""
+    est_remaining = cost_tracker.estimate_remaining(units_remaining)
     avg = cost_tracker.avg_cost_per_page()
 
     print()
     print("-" * 60)
-    print("  REVISED COST ESTIMATE (based on actual usage)")
+    print(f"  REVISED ESTIMATE (after {cost_tracker.pages_processed} "
+          f"{unit_label})")
     print("-" * 60)
-    print(f"  Pages processed  : {cost_tracker.pages_processed}")
-    print(f"  Actual cost/page : ${avg:.4f}")
+    print(f"  Actual cost/unit : ${avg:.4f}")
     print(f"  Spent so far     : ${cost_tracker.total_cost:.2f}")
-    print(f"  Pages remaining  : {pages_remaining}")
+    print(f"  Remaining units  : {units_remaining}")
     print(f"  Est. remaining   : ${est_remaining:.2f}")
     print(f"  Est. total       : "
           f"${cost_tracker.total_cost + est_remaining:.2f}")
@@ -2057,9 +2147,72 @@ def show_revised_estimate(cost_tracker, pages_remaining, total_pages):
         print(f"  Budget remaining : ${remaining_budget:.2f}")
         if est_remaining > remaining_budget:
             affordable = int(remaining_budget / max(avg, 0.001))
-            print(f"  Budget covers    : ~{affordable} more pages")
+            print(f"  Budget covers    : ~{affordable} more {unit_label}")
     print("-" * 60)
     print()
+
+
+def confirm_or_abort(prompt_msg, skip=False):
+    """Prompt user for y/N confirmation. Returns True to proceed."""
+    if skip:
+        return True
+    confirm = input(f"{prompt_msg} [y/N]: ").strip().lower()
+    return confirm in ("y", "yes")
+
+
+def check_revised_and_budget(cost_tracker, total_units, unit_label,
+                             skip_estimate=False):
+    """After REVISE_AFTER_PAGES, show revised estimate. If revised estimate
+    exceeds budget, set abort flag and return False. Returns True to continue."""
+    if not cost_tracker.should_show_revised():
+        return True
+
+    units_remaining = total_units - cost_tracker.pages_processed
+    if units_remaining <= 0:
+        return True
+
+    show_revised_estimate(cost_tracker, units_remaining, unit_label)
+
+    if cost_tracker.budget is not None:
+        est_rem = cost_tracker.estimate_remaining(units_remaining)
+        bud_rem = cost_tracker.budget - cost_tracker.total_cost
+        if est_rem > bud_rem:
+            avg = cost_tracker.avg_cost_per_page()
+            affordable = int(bud_rem / max(avg, 0.001))
+            print(f"  WARNING: Revised estimate ${est_rem:.2f} exceeds "
+                  f"remaining budget ${bud_rem:.2f}.")
+            print(f"  ~{affordable} more {unit_label} affordable.")
+            if not confirm_or_abort("Continue?", skip=skip_estimate):
+                cost_tracker._budget_abort = True
+                return False
+    return True
+
+
+def count_refinement_gaps(issues, collection_dir, cnf_min, cnf_max,
+                          include_resolved, require_evidence=False):
+    """Count eligible gaps across all issues for pre-batch estimation."""
+    total_gaps = 0
+    total_pages_with_gaps = 0
+    for issue in issues:
+        ai_dir = collection_dir / "ai_ocr" / issue["ark_id"]
+        if not ai_dir.exists():
+            continue
+        for pf in ai_dir.glob("page_*.md"):
+            text = pf.read_text(encoding="utf-8")
+            gaps = parse_gaps(text)
+            eligible = 0
+            for g in gaps:
+                if g["cnf"] < cnf_min or g["cnf"] > cnf_max:
+                    continue
+                if g["status"] == "auto-resolved" and not include_resolved:
+                    continue
+                if require_evidence and not g["fragments"] and not g["region_ocr"]:
+                    continue
+                eligible += 1
+            if eligible:
+                total_gaps += eligible
+                total_pages_with_gaps += 1
+    return total_gaps, total_pages_with_gaps
 
 
 # ============================================================================
@@ -2122,6 +2275,9 @@ def main():
                    help="Shorthand for --logging 5")
     p.add_argument("--yes",            action="store_true",
                    help="Skip cost confirmation prompt")
+    p.add_argument("--skip-estimate",  action="store_true",
+                   help="Skip cost estimates and revised estimates "
+                        "(budget checks still apply)")
     # Accept but ignore these (passed by orchestrator)
     p.add_argument("--issue-delay",    type=float, default=None)
     p.add_argument("--max-output-tokens", type=int, default=None)
@@ -2225,38 +2381,94 @@ def main():
         return
 
     if args.refine_text or args.refine_image:
+        effective_workers = 1 if args.serial else args.api_workers
         rate_limiter = (limiter_from_tier(args.tier)
                         if ClaudeRateLimiter else None)
-        cost_tracker = CostTracker(MODEL_RESOLVE, budget=args.budget)
 
         if args.refine_text:
             cnf_min = args.cnf_min if args.cnf_min is not None else 0.0
             cnf_max = args.cnf_max if args.cnf_max is not None else 0.79
-            print(f"\nText refinement: cnf {cnf_min:.2f}-{cnf_max:.2f} "
-                  f"using {args.model_resolve or MODEL_RESOLVE}", flush=True)
-            refine_text(issues, config, collection_dir, api_key,
-                        cnf_min=cnf_min, cnf_max=cnf_max,
-                        include_resolved=args.include_resolved,
-                        rate_limiter=rate_limiter,
-                        cost_tracker=cost_tracker,
-                        model=args.model_resolve)
+            model = args.model_resolve or MODEL_RESOLVE
+
+            # Count eligible gaps and estimate cost
+            total_gaps, pages_with_gaps = count_refinement_gaps(
+                issues, collection_dir, cnf_min, cnf_max,
+                args.include_resolved, require_evidence=True)
+            print(f"\nText refinement: {total_gaps} gaps across "
+                  f"{pages_with_gaps} pages (cnf {cnf_min:.2f}-{cnf_max:.2f},"
+                  f" model: {model})")
+
+            if total_gaps == 0:
+                print("  No eligible gaps found.")
+            else:
+                # ~2k tokens per page batch (gaps + context)
+                if not args.skip_estimate:
+                    est, _ = show_cost_estimate(
+                        "TEXT REFINEMENT", pages_with_gaps, "pages",
+                        2000, 1000, model, args.budget)
+                    if args.budget and est > args.budget:
+                        if not confirm_or_abort(
+                                "Estimate exceeds budget. Proceed?",
+                                skip=args.yes):
+                            print("Cancelled.")
+                            return
+
+                if confirm_or_abort(
+                        f"Proceed with text refinement?",
+                        skip=args.yes):
+                    cost_tracker = CostTracker(model, budget=args.budget)
+                    refine_text(issues, config, collection_dir, api_key,
+                                cnf_min=cnf_min, cnf_max=cnf_max,
+                                include_resolved=args.include_resolved,
+                                rate_limiter=rate_limiter,
+                                cost_tracker=cost_tracker,
+                                model=model,
+                                api_workers=effective_workers)
+                    print(f"  {cost_tracker.summary()}")
 
         if args.refine_image:
             cnf_min = args.cnf_min if args.cnf_min is not None else 0.01
             cnf_max = args.cnf_max if args.cnf_max is not None else 0.60
-            print(f"\nImage refinement: cnf {cnf_min:.2f}-{cnf_max:.2f} "
-                  f"using {args.model_refine or MODEL_REFINE}", flush=True)
-            refine_image(issues, config, collection_dir, api_key,
-                         cnf_min=cnf_min, cnf_max=cnf_max,
-                         include_resolved=args.include_resolved,
-                         rate_limiter=rate_limiter,
-                         cost_tracker=cost_tracker,
-                         model=args.model_refine)
+            model = args.model_refine or MODEL_REFINE
+
+            total_gaps, pages_with_gaps = count_refinement_gaps(
+                issues, collection_dir, cnf_min, cnf_max,
+                args.include_resolved, require_evidence=False)
+            print(f"\nImage refinement: {total_gaps} gaps across "
+                  f"{pages_with_gaps} pages (cnf {cnf_min:.2f}-{cnf_max:.2f},"
+                  f" model: {model})")
+
+            if total_gaps == 0:
+                print("  No eligible gaps found.")
+            else:
+                # ~5k tokens per batch (cropped image + context)
+                if not args.skip_estimate:
+                    est, _ = show_cost_estimate(
+                        "IMAGE REFINEMENT", total_gaps, "gap batches",
+                        5000, 500, model, args.budget)
+                    if args.budget and est > args.budget:
+                        if not confirm_or_abort(
+                                "Estimate exceeds budget. Proceed?",
+                                skip=args.yes):
+                            print("Cancelled.")
+                            return
+
+                if confirm_or_abort(
+                        f"Proceed with image refinement?",
+                        skip=args.yes):
+                    cost_tracker = CostTracker(model, budget=args.budget)
+                    refine_image(issues, config, collection_dir, api_key,
+                                 cnf_min=cnf_min, cnf_max=cnf_max,
+                                 include_resolved=args.include_resolved,
+                                 rate_limiter=rate_limiter,
+                                 cost_tracker=cost_tracker,
+                                 model=model,
+                                 api_workers=effective_workers)
+                    print(f"  {cost_tracker.summary()}")
 
         # Regenerate corrected/ and readable/ from updated ai_ocr/
         print("\nRegenerating corrected/ and readable/ ...", flush=True)
         regenerate_corrected(issues, config, collection_dir)
-        print(f"Cost: {cost_tracker.summary()}")
         return
 
     # Count pages to process (respecting --resume/--force)
@@ -2281,16 +2493,23 @@ def main():
         print("\nNothing to process -- all files already complete.")
         return
 
-    # Cost estimate and confirmation
-    show_cost_estimate(pages_to_process, args.budget)
+    # Cost estimate
+    if not args.skip_estimate:
+        est_cost, per_page = show_correction_estimate(
+            pages_to_process, args.budget)
+        # Abort if initial estimate exceeds budget
+        if args.budget is not None and est_cost > args.budget:
+            print(f"  Initial estimate ${est_cost:.2f} exceeds budget "
+                  f"${args.budget:.2f}.")
+            if not confirm_or_abort("Proceed anyway?", skip=args.yes):
+                print("Cancelled.")
+                return
 
-    if not args.yes:
-        confirm = input(
-            f"Proceed with AI OCR correction? "
-            f"({pages_to_process} pages) [y/N]: ").strip().lower()
-        if confirm not in ("y", "yes"):
-            print("Cancelled.")
-            return
+    if not confirm_or_abort(
+            f"Proceed with AI OCR correction? ({pages_to_process} pages)",
+            skip=args.yes):
+        print("Cancelled.")
+        return
 
     # Initialize tracking
     pass12_prompt = build_pass12_prompt(config)
@@ -2302,8 +2521,7 @@ def main():
     log = []
     log_lock = threading.Lock()
     ctr = {"ok": 0, "skipped": 0, "err": 0}
-
-    first_issue_done = False
+    effective_workers = 1 if args.serial else args.api_workers
 
     for idx, issue in enumerate(issues):
         ark_id = issue["ark_id"]
@@ -2324,7 +2542,8 @@ def main():
             args.delay, args.resume, args.force,
             rate_limiter=rate_limiter,
             cost_tracker=cost_tracker,
-            worker_id="")
+            worker_id="",
+            api_workers=effective_workers)
 
         with log_lock:
             log.append({"ark_id": ark_id, "status": status})
@@ -2338,33 +2557,13 @@ def main():
         else:
             ctr["err"] += 1
 
-        # After first completed issue: show revised estimate
-        if (not first_issue_done and status == "ok"
-                and cost_tracker.pages_processed > 0):
-            first_issue_done = True
-            pages_done = cost_tracker.pages_processed
-            pages_remaining = pages_to_process - pages_done
-            if pages_remaining > 0:
-                show_revised_estimate(
-                    cost_tracker, pages_remaining, pages_to_process)
-
-                # Warn if budget insufficient
-                if cost_tracker.budget is not None:
-                    est_rem = cost_tracker.estimate_remaining(pages_remaining)
-                    bud_rem = (cost_tracker.budget
-                               - cost_tracker.total_cost)
-                    if est_rem > bud_rem * 1.1:
-                        avg = cost_tracker.avg_cost_per_page()
-                        affordable = int(bud_rem / max(avg, 0.001))
-                        print(f"  WARNING: Budget may not cover all "
-                              f"remaining pages. ~{affordable} more "
-                              f"pages affordable.")
-                        if not args.yes:
-                            confirm = input(
-                                "Continue? [y/N]: ").strip().lower()
-                            if confirm not in ("y", "yes"):
-                                print("Stopped by user.")
-                                break
+        # Revised estimate after 5 pages, budget abort if exceeded
+        if not args.skip_estimate:
+            if not check_revised_and_budget(
+                    cost_tracker, pages_to_process, "pages",
+                    skip_estimate=args.yes):
+                print("Stopped: revised estimate exceeds budget.")
+                break
 
     # Final summary
     if rate_limiter:
