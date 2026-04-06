@@ -1240,6 +1240,180 @@ def process_issue(issue, api_key, system_prompt, delay,
 
 
 # ============================================================================
+# COMPILE — READABLE MARKDOWN OUTPUT
+# ============================================================================
+
+READABLE_DIR = None
+
+
+def compute_confidence(raw_text: str) -> dict:
+    """Compute confidence breakdown from a raw AI OCR page response."""
+    stats = extract_stats(raw_text)
+    if stats:
+        return stats
+
+    # Fall back: count characters from the markup directly
+    total = len(raw_text)
+    if total == 0:
+        return {"high_confidence_pct": 0}
+
+    # Count characters inside infill tags by confidence
+    infill_chars = {lvl: 0 for lvl in ["HIGH", "MED", "LOW", "VLOW"]}
+    for m in re.finditer(r'\[([^\]]+)\]\^(HIGH|MED|LOW|VLOW)\^', raw_text):
+        infill_chars[m.group(2)] += len(m.group(1))
+
+    # Count characters inside gap tags (the guess part)
+    gap_chars = 0
+    for m in re.finditer(r'\{\{\s*gap\s*\|[^[]*\[([^\]]*)\]\s*\}\}', raw_text):
+        gap_chars += len(m.group(1))
+
+    # Extract just the text body for total char count
+    clean = extract_clean_text(raw_text)
+    total_chars = len(clean) if clean else 1
+
+    tagged_chars = sum(infill_chars.values()) + gap_chars
+    high_conf = max(0, total_chars - tagged_chars)
+
+    return {
+        "estimated_chars": total_chars,
+        "high_confidence_chars": high_conf,
+        "high_confidence_pct": round(high_conf / total_chars * 100, 1)
+                               if total_chars > 0 else 0,
+        "infill_high": infill_chars["HIGH"],
+        "infill_med": infill_chars["MED"],
+        "infill_low": infill_chars["LOW"],
+        "infill_vlow": infill_chars["VLOW"],
+        "unresolved_gaps": gap_chars,
+    }
+
+
+def compile_issue(issue: dict, config: dict, collection_dir: Path):
+    """
+    Compile a single readable markdown file from per-page AI OCR output.
+    Reads ai_ocr/{ark_id}/page_NN.md files, strips markup, adds header.
+    Output: readable/{issue_filename}.md
+    """
+    ark_id = issue["ark_id"]
+    vol    = str(issue.get("volume", "?")).zfill(2)
+    num    = str(issue.get("number", "?")).zfill(2)
+    date   = re.sub(r"[^\w\-]", "-", issue.get("date", "unknown"))
+    fname  = f"{ark_id}_vol{vol}_no{num}_{date}"
+    newspaper = config.get("title_name", "")
+
+    ai_ocr_dir = collection_dir / "ai_ocr" / ark_id
+    readable_dir = collection_dir / "readable"
+    readable_dir.mkdir(parents=True, exist_ok=True)
+
+    if not ai_ocr_dir.exists():
+        return None
+
+    # Collect all page files
+    page_files = sorted(ai_ocr_dir.glob("page_*.md"))
+    if not page_files:
+        return None
+
+    total_pages = len(page_files)
+    all_clean_pages = []
+    total_stats = {
+        "estimated_chars": 0,
+        "high_confidence_chars": 0,
+        "infill_high": 0, "infill_med": 0,
+        "infill_low": 0, "infill_vlow": 0,
+        "unresolved_gaps": 0,
+    }
+
+    for pf in page_files:
+        raw = pf.read_text(encoding="utf-8", errors="replace")
+
+        # Get confidence stats from this page
+        page_stats = compute_confidence(raw)
+        for k in total_stats:
+            total_stats[k] += page_stats.get(k, 0)
+
+        # Extract clean text
+        clean = extract_clean_text(raw)
+        pg_num = re.search(r'page_(\d+)', pf.stem)
+        pg_label = int(pg_num.group(1)) if pg_num else 0
+
+        all_clean_pages.append((pg_label, clean))
+
+    # Compute overall confidence percentage
+    est = total_stats["estimated_chars"]
+    high = total_stats["high_confidence_chars"]
+    pct = round(high / est * 100, 1) if est > 0 else 0
+
+    # Build the readable markdown
+    today = datetime.now().strftime("%Y-%m-%d")
+    issue_date = issue.get("date", "unknown")
+    full_title = issue.get("full_title", newspaper)
+
+    lines = [
+        f"# {newspaper}",
+        f"## {full_title}",
+        "",
+        f"**Date:** {issue_date}  ",
+        f"**Volume:** {issue.get('volume', '?')}  "
+        f"**Number:** {issue.get('number', '?')}  ",
+        f"**Pages:** {total_pages}  ",
+        f"**Source:** Portal to Texas History "
+        f"([{ark_id}](https://texashistory.unt.edu/ark:/67531/{ark_id}/))  ",
+        "",
+        f"**Compiled:** {today}  ",
+        f"**High-confidence text:** {pct}%  ",
+        f"**Pipeline:** AI OCR v2.0 (Claude Vision)  ",
+        "",
+        "---",
+        "",
+    ]
+
+    for pg_num, clean_text in sorted(all_clean_pages):
+        lines.append(f"### Page {pg_num}")
+        lines.append("")
+        if clean_text.strip():
+            lines.append(clean_text)
+        else:
+            lines.append("*(page empty or unavailable)*")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    out_path = readable_dir / f"{fname}.md"
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
+
+def compile_all(issues: list, config: dict, collection_dir: Path,
+                resume: bool = True):
+    """Compile readable markdown for all issues."""
+    readable_dir = collection_dir / "readable"
+    readable_dir.mkdir(parents=True, exist_ok=True)
+
+    compiled = 0
+    skipped = 0
+    for issue in issues:
+        ark_id = issue["ark_id"]
+        vol = str(issue.get("volume", "?")).zfill(2)
+        num = str(issue.get("number", "?")).zfill(2)
+        date = re.sub(r"[^\w\-]", "-", issue.get("date", "unknown"))
+        fname = f"{ark_id}_vol{vol}_no{num}_{date}.md"
+        out_path = readable_dir / fname
+
+        if resume and out_path.exists() and out_path.stat().st_size > 100:
+            skipped += 1
+            continue
+
+        result = compile_issue(issue, config, collection_dir)
+        if result:
+            tprint(f"  {fname}  ({result.stat().st_size // 1024}KB)", level=1)
+            compiled += 1
+        else:
+            tprint(f"  {fname}  (no ai_ocr data)", level=2)
+
+    print(f"\nCompiled: {compiled}  Skipped: {skipped}  "
+          f"Output: {readable_dir}/", flush=True)
+
+
+# ============================================================================
 # COST ESTIMATION DISPLAY
 # ============================================================================
 
@@ -1330,6 +1504,9 @@ def main():
     p.add_argument("--serial",         action="store_true")
     p.add_argument("--tier",           default="default",
                    choices=["default", "build", "custom"])
+    p.add_argument("--compile",        action="store_true",
+                   help="Compile readable markdown from AI OCR output "
+                        "(no API calls, run after --correct)")
     p.add_argument("--budget",         type=float, default=None,
                    help="Max dollar amount to spend (stops before exceeding)")
     p.add_argument("--logging",        type=int, default=1,
@@ -1381,7 +1558,7 @@ def main():
                or os.environ.get("ANTHROPIC_API_KEY", "")
                or global_config.get("anthropic_api_key", "")
                or config.get("anthropic_api_key", ""))
-    if not args.preload_images and not api_key:
+    if not args.preload_images and not args.compile and not api_key:
         sys.exit("Error: API key required. Set in config.json, "
                  "ANTHROPIC_API_KEY env var, or --api-key flag.")
 
@@ -1420,6 +1597,13 @@ def main():
         preload_images(issues, resume=True,
                        retry_failed=args.retry_failed,
                        workers=args.workers)
+        return
+
+    if args.compile:
+        print(f"\nCompiling readable markdown from AI OCR output ...",
+              flush=True)
+        compile_all(issues, config, collection_dir,
+                    resume=not args.force)
         return
 
     # Count pages to process (respecting --resume/--force)

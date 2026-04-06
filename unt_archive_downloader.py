@@ -1696,6 +1696,8 @@ def main():
                    help="Download all page images to local cache (run before --correct)")
     p.add_argument("--correct",        action="store_true",
                    help="Correct OCR errors using Claude vision API")
+    p.add_argument("--compile",        action="store_true",
+                   help="Compile readable markdown from corrected OCR (no API calls)")
     p.add_argument("--translate",      action="store_true",
                    help="Translate to English using Claude vision API")
     p.add_argument("--render-pdf",     action="store_true",
@@ -1759,8 +1761,8 @@ def main():
         args.download_ocr = True
 
     if not any([args.configure, args.update_skill, args.discover, args.download_ocr,
-                args.download_pdf, args.preload_images, args.correct, args.translate,
-                args.status, args.render_pdf]):
+                args.download_pdf, args.preload_images, args.correct, args.compile,
+                args.translate, args.status, args.render_pdf]):
         p.print_help()
         return
 
@@ -1869,6 +1871,15 @@ def main():
         if args.budget is not None:
             correct_args += ["--budget", str(args.budget)]
         run_worker("unt_ocr_correct.py", correct_args)
+
+    if args.compile:
+        compile_args = ["--config-path", str(config_path), "--compile"]
+        if args.resume:    compile_args.append("--resume")
+        if args.force:     compile_args.append("--force")
+        if args.ark:       compile_args += ["--ark", args.ark]
+        if args.date_from: compile_args += ["--date-from", args.date_from]
+        if args.date_to:   compile_args += ["--date-to", args.date_to]
+        run_worker("unt_ocr_correct.py", compile_args)
 
     if args.translate:
         run_worker("unt_translate.py", worker_args)
