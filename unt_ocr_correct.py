@@ -631,9 +631,12 @@ def _claude_call_standard(req_data, api_key, timeout=300):
 
 
 def _claude_call_streaming(req_data, api_key, label, timeout=300):
-    """Streaming API call. Reads SSE events, prints token progress,
-    returns (text, usage) matching standard call interface."""
-    # Add stream:true to the payload
+    """Streaming API call. Reads SSE events, shows progress on stdout.
+
+    LOG_LEVEL 4: stdout shows token count every 3s (activity indicator)
+    LOG_LEVEL 5: stdout shows token count every 2s, file log gets every
+                 SSE event type, full usage details, and response text
+    """
     payload = json.loads(req_data)
     payload["stream"] = True
     stream_data = json.dumps(payload).encode("utf-8")
@@ -649,15 +652,22 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
     text_parts = []
     usage = {}
     out_tokens = 0
+    event_count = 0
     last_report = time.monotonic()
+    t_start = time.monotonic()
+    verbose = LOG_LEVEL >= 5
+    report_interval = 2.0 if verbose else 3.0
 
     try:
         for raw_line in resp:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or not line.startswith("data: "):
                 continue
-            data_str = line[6:]  # strip "data: " prefix
+            data_str = line[6:]
             if data_str == "[DONE]":
+                if verbose:
+                    log_debug(f"{label} SSE: [DONE] after "
+                              f"{event_count} events", level=5)
                 break
             try:
                 event = json.loads(data_str)
@@ -665,21 +675,24 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
                 continue
 
             etype = event.get("type", "")
+            event_count += 1
+
+            if verbose:
+                log_debug(f"{label} SSE #{event_count}: {etype}", level=5)
 
             if etype == "content_block_delta":
                 delta = event.get("delta", {})
                 if delta.get("type") == "text_delta":
                     chunk = delta.get("text", "")
                     text_parts.append(chunk)
-                    out_tokens += len(chunk) // 4 + 1  # rough estimate
+                    out_tokens += len(chunk) // 4 + 1
 
-                    # Print progress every 2 seconds
                     now = time.monotonic()
-                    if now - last_report >= 2.0:
-                        log_debug(f"{label} streaming... "
-                                  f"~{out_tokens} tok", level=5)
-                        print(f"    {label} streaming... "
-                              f"~{out_tokens} tok", flush=True)
+                    if now - last_report >= report_interval:
+                        elapsed = now - t_start
+                        print(f"    {label} generating... "
+                              f"~{out_tokens} tok  {elapsed:.0f}s",
+                              flush=True)
                         last_report = now
 
             elif etype == "message_start":
@@ -687,16 +700,34 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
                 u = msg.get("usage", {})
                 if u:
                     usage["input_tokens"] = u.get("input_tokens", 0)
+                    if verbose:
+                        log_debug(f"{label} input_tokens="
+                                  f"{usage['input_tokens']}", level=5)
 
             elif etype == "message_delta":
                 u = event.get("usage", {})
                 if u:
                     usage["output_tokens"] = u.get("output_tokens", 0)
 
+            elif etype == "error":
+                err = event.get("error", {})
+                log_event(f"{label} stream error: "
+                          f"{err.get('message', event)}", "error")
+                if verbose:
+                    log_debug(f"{label} error event: "
+                              f"{json.dumps(event)}", level=5)
+
     finally:
         resp.close()
 
     text = "".join(text_parts).strip()
+
+    # Level 5: log the full response text for debugging
+    if verbose and text:
+        log_debug(f"{label} response text ({len(text)} chars):\n"
+                  f"{text[:2000]}{'...[truncated]' if len(text) > 2000 else ''}",
+                  level=5)
+
     return text, usage
 
 
@@ -704,14 +735,35 @@ def claude_api_call(payload: dict, api_key: str,
                     rate_limiter=None, est_tokens: int = 8000,
                     cost_tracker=None, label: str = ""):
     """Make a Claude API call with retry/rate-limit. Returns (text, usage).
-    Uses streaming when LOG_LEVEL >= 5 for real-time token progress."""
+    Uses streaming when LOG_LEVEL >= 4 for progress feedback."""
     model = payload.get("model", "?")
-    use_streaming = LOG_LEVEL >= 5
+    use_streaming = LOG_LEVEL >= 4
     log_debug(f"API call: model={model} max_tokens={payload.get('max_tokens')} "
               f"est={est_tokens} stream={use_streaming} label={label}",
               level=3)
     req_data = json.dumps(payload).encode("utf-8")
     req_mb = len(req_data) / 1_048_576
+
+    # Level 5: log payload structure for debugging
+    if LOG_LEVEL >= 5:
+        sys_len = len(payload.get("system", ""))
+        msgs = payload.get("messages", [])
+        msg_summary = []
+        for m in msgs:
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            if isinstance(content, str):
+                msg_summary.append(f"{role}:{len(content)}chars")
+            elif isinstance(content, list):
+                parts = []
+                for c in content:
+                    if c.get("type") == "image":
+                        parts.append("image")
+                    elif c.get("type") == "text":
+                        parts.append(f"text:{len(c.get('text',''))}chars")
+                msg_summary.append(f"{role}:[{','.join(parts)}]")
+        log_debug(f"{label} payload: {req_mb:.2f}MB  system={sys_len}chars  "
+                  f"messages={' '.join(msg_summary)}", level=5)
 
     if rate_limiter:
         t_wait = time.monotonic()
