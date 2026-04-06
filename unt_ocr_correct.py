@@ -489,49 +489,46 @@ PASS 1 - DIRECT FRAKTUR OCR:
    - Tier 2 with context checking (capital letter confusions)
    - Tiers 3-5 case by case (ligature breaks, number/letter, hyphenation)
 5. Where text is confidently readable, write it directly with no tags
-6. Where text is illegible or uncertain, insert a gap tag with:
-   - est = estimated character count
-   - imgbbox = approximate pixel bounding box (x,y=top-left, w,h=size), be generous
-   - cnf = confidence 0-1 (0.95=high, 0.5=moderate, 0.0=pure guess)
-   - [best guess] = your prediction in square brackets
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" [best guess] }}}}
-   ALWAYS guess. Set cnf="0.00" if it's pure context inference.
-7. After cross-referencing with ABBYY/portal OCR, add region_ocr (raw text):
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial" | region_ocr="raw" [guess] }}}}
-8. Mark images/illustrations/engravings:
+6. Where text is illegible or uncertain, mark with a gap tag. Do NOT guess
+   yet - just record location and estimated size:
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" }}}}
+   est = estimated character count. imgbbox = pixel bounding box (be generous).
+7. Mark images/illustrations/engravings:
    {{{{ Img | bbox="x,y,w,h" | desc="brief description" }}}}
-9. Wrap each article/news item/notice in a numbered Column tag:
+8. Wrap each article/news item/notice in a numbered Column tag:
    {{{{ Column001 }}}} article text {{{{ /Column }}}}
-10. Wrap each advertisement in a numbered Ad tag:
+9. Wrap each advertisement in a numbered Ad tag:
    {{{{ Ad001 }}}} ad text {{{{ /Ad }}}}
-11. Number Column and Ad tags sequentially per page (001, 002, 003...)
-12. Do NOT correct Texas German dialect words or pre-1901 spellings
-13. Do NOT translate English loanwords to German
-14. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
+10. Number Column and Ad tags sequentially per page (001, 002, 003...)
+11. Do NOT correct Texas German dialect words or pre-1901 spellings
+12. Do NOT translate English loanwords to German
+13. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
 
 PASS 2 - GAP INVENTORY:
 For each {{{{ gap }}}} from Pass 1:
-1. Re-examine the image at that location
+1. Re-examine the image at each gap location
 2. Note partial letterforms, ascenders, descenders, dots, fragments
-3. Refine the character count estimate, bounding box, and your best guess
-4. Add fragments field and adjust cnf:
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="visible" [refined guess] }}}}
+3. Refine the character count estimate and bounding box
+4. Add fragments field. Do NOT guess yet:
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="visible_text" }}}}
 
-PASS 3 - CROSS-REFERENCE AND CONFIDENCE:
+PASS 3 - CROSS-REFERENCE, GUESS, AND CONFIDENCE:
+This is where guessing happens. Every gap MUST get a [guess] and cnf score.
 For each gap:
 1. If ABBYY/portal OCR is provided, find the corresponding region
 2. Apply the Fraktur error correction table to decode the raw OCR fragment
-3. Cross-reference: your reading + OCR fragment + 1890s German +
+3. Cross-reference: your reading + OCR fragment + context + 1890s German +
    article topic (international news = more Hochdeutsch, local = more dialect)
-4. Update the gap tag: refine your guess, adjust cnf, add region_ocr:
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="..." | region_ocr="raw_ocr" [best guess] }}}}
+4. Produce your best guess and assign a confidence score. Add [guess], cnf,
+   and region_ocr to the gap tag:
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="..." | region_ocr="raw_ocr" [your guess] }}}}
    region_ocr MUST contain the exact raw OCR text, uncorrected.
-5. For non-gap corrections where the fix is ambiguous:
+5. cnf >= 0.80: add status=auto-resolved
+6. For non-gap corrections where the fix is ambiguous:
    corrected_word <!-- {{{{ corrected | original="ocr_reading" | rule="rule_name" }}}} -->
 
 cnf scale: 0.90-0.99=high, 0.70-0.89=moderate, 0.40-0.69=low,
 0.01-0.39=speculative, 0.00=pure context guess. Never 1.00.
-When cnf >= 0.80, add status=auto-resolved to the gap tag.
 
 OUTPUT FORMAT - return this exact structure:
 

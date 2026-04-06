@@ -39,13 +39,12 @@ Read the uploaded page image directly. Work section by section (masthead, then c
 1. Identify the page layout: masthead, column count, any center-page features (advertisements, program announcements)
 2. Read each section in Fraktur, writing the text in standard Latin characters
 3. Where text is **confidently readable**, write it directly — no tags needed
-4. Where text is **illegible or uncertain**, insert a gap marker with your best guess and an approximate bounding box:
+4. Where text is **illegible or uncertain**, insert a gap marker with estimated size and location. Do NOT guess yet — guessing happens in Pass 3.
    ```
-   {{ gap | est=NN | imgbbox="x,y,w,h" [best guess] }}
+   {{ gap | est=NN | imgbbox="x,y,w,h" }}
    ```
-   - `NN` = estimated character count
+   - `est` = estimated character count of the missing text
    - `imgbbox` = approximate pixel region in the source image (x,y = top-left, w,h = size). Be generous — overestimate to ensure the text is fully contained. This allows future refinement passes to crop just this region instead of resending the full page.
-   - `[best guess]` = your prediction based on context. Always guess.
 5. Mark any images, illustrations, or engravings on the page:
    ```
    {{ Img | bbox="x,y,w,h" | desc="brief description" }}
@@ -91,26 +90,26 @@ Read the uploaded page image directly. Work section by section (masthead, then c
 Review your Pass 1 output. For each `{{ gap }}` marker:
 
 1. Examine the image again at that location
-2. Refine the character count estimate
-3. Note what partial letterforms or fragments you can see
-4. Refine your best guess based on fragments
+2. Refine the character count estimate and bounding box
+3. Note what partial letterforms, ascenders, descenders, or fragments you can see
+4. Do NOT guess yet — just record what you see
 
-**Output this pass as an update** — add fragments and refine imgbbox:
+**Output this pass as an update** — add fragments and refine imgbbox/est:
 
 ```
-{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial_text" [refined guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" }}
 ```
 
 For example:
 ```
-{{ gap | est=25 | imgbbox="820,2100,400,50" | cnf="0.40" | fragments="Ber...lung" [Versammlung] }}
+{{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" }}
 ```
 
 ---
 
-### PASS 3 — Cross-Reference and Confidence
+### PASS 3 — Cross-Reference, Guess, and Confidence
 
-This pass requires the existing ABBYY OCR (or other traditional OCR) if available. If no reference OCR exists, work from the image alone using contextual inference.
+This is where guessing happens. For every gap, produce a best guess and assign a confidence score. Use ABBYY/portal OCR if available; otherwise work from the image and context alone.
 
 **Instructions:**
 
@@ -122,27 +121,27 @@ This pass requires the existing ABBYY OCR (or other traditional OCR) if availabl
 
 2. Apply the Fraktur error correction table from `references/fraktur-errors.md` to decode the ABBYY fragments
 
-3. Update the gap tag with your best guess, a confidence score, and the raw OCR source:
+3. Produce a best guess for the missing text and assign a confidence score. Add the guess in square brackets, cnf, and the raw OCR source to the gap tag:
 
 ```
-{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial" | region_ocr="raw_abbyy" [refined guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial" | region_ocr="raw_abbyy" [your guess] }}
 ```
 
-**Confidence scale (`cnf`):**
-- `0.90–0.99` — High. Multiple sources agree, strong context. Rarely needs review.
-- `0.70–0.89` — Moderate. Fragments match, context fits. Worth reviewing.
-- `0.40–0.69` — Low. Context-based, fragments ambiguous. Should be reviewed.
-- `0.01–0.39` — Speculative. Mostly guessing from context.
-- `0.00` — Pure educated guess. No evidence beyond sentence structure and topic.
+4. **Confidence scale (`cnf`):**
+   - `0.90–0.99` — High. Multiple sources agree, strong context. Rarely needs review.
+   - `0.70–0.89` — Moderate. Fragments match, context fits. Worth reviewing.
+   - `0.40–0.69` — Low. Context-based, fragments ambiguous. Should be reviewed.
+   - `0.01–0.39` — Speculative. Mostly guessing from context.
+   - `0.00` — Pure educated guess. No evidence beyond sentence structure and topic.
 
-4. `region_ocr` MUST contain the exact raw OCR text for this region, uncorrected. This is the most valuable field for future refinement.
+5. `region_ocr` MUST contain the exact raw OCR text for this region, uncorrected. This is the most valuable field for future refinement.
 
-5. When cnf >= 0.80, add `status=auto-resolved` to the gap tag. This tells future refinement passes to skip it by default:
+6. When cnf >= 0.80, add `status=auto-resolved`. Future refinement passes skip these by default:
 ```
 {{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" | status=auto-resolved [aus] }}
 ```
 
-**IMPORTANT:** Never leave text blank or use `[unleserlich]`. Every gap gets a best guess and a `cnf` score. Even `cnf="0.00"` with a wild guess is more useful than nothing.
+**IMPORTANT:** Every gap MUST get a `[guess]` and a `cnf` score in this pass. Never leave a gap without a guess. Even `cnf="0.00"` with a wild guess is more useful than nothing.
 
 ---
 
