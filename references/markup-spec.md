@@ -47,7 +47,7 @@ The universal tag for any text that is not 100% confident. Covers everything fro
   - `0.00` — Pure educated guess. No fragments, no OCR source. Derived entirely from context.
   - `1.00` — Never used. Perfect OCR wouldn't be in a gap tag.
 - `status` (auto-set): `auto-resolved` when cnf >= 0.80. Indicates the gap is considered resolved and will be skipped by default in future refinement passes. Lower-confidence gaps have no status field and are always candidates for refinement.
-- `fragments` (optional): Any partial letterforms visible, as best-guess Latin characters
+- `fragments` (optional): Raw character-level reading of what the letters look like in the image, independent of meaning. Use `...` for unreadable characters. Examples: `"Ber...lung"`, `"$ouft...b"`, `"nid)t"`, `"Bcrfamm"`. NOT a description ("visible capitals") or a guess ("likely Versammlung").
 - `region_ocr` (optional): The raw ABBYY/portal OCR text for this region, exactly as it appears — garbled and all. Critical for future refinement.
 - `[best guess]` (required): Always present. The current best prediction in square brackets.
 

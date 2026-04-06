@@ -82,17 +82,34 @@ Read the page image directly. This is where most of the text gets captured as pl
 Review your Pass 1 output. For each `{{ gap }}` marker, re-examine the image at that location.
 
 1. Refine the character count estimate and bounding box
-2. Note what partial letterforms, ascenders, descenders, or fragments you can see
-3. Do NOT guess yet — just record what you observe
+2. Record what individual characters you can see — character by character
+3. Do NOT guess at meaning — just record the raw letterforms
+4. Use `...` for characters you cannot make out at all
+
+The `fragments` field is a **character-level reading** — what the individual letters look like independent of meaning. Not a description, not a guess, not context. Just the raw characters as you see them, including garbled or wrong ones.
+
+**Good fragments:**
+- `fragments="Ber...lung"` — visible B, e, r, gap, l, u, n, g
+- `fragments="(i 77l"` — literally what the characters look like (maybe "little")
+- `fragments="Bcrfamm"` — garbled but character-accurate (maybe "Versamml")
+- `fragments="nid)t"` — broken ch ligature visible
+- `fragments="$ouft..."` — $ for Fraktur H, partial word
+
+**Bad fragments (do NOT do this):**
+- `fragments="visible capitals suggest story beginning"` — this is a description
+- `fragments="[illegible footer section]"` — this is a label
+- `fragments="likely Versammlung"` — this is a guess (guessing is Pass 3)
 
 Update each gap with fragments:
 ```
-{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="raw_characters" }}
 ```
 
 Example:
 ```
 {{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" }}
+{{ gap | est=15 | imgbbox="100,400,200,30" | fragments="$ouft...b" }}
+{{ gap | est=8 | imgbbox="300,800,120,25" | fragments="nid)..." }}
 ```
 
 ---

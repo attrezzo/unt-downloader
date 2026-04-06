@@ -1002,9 +1002,14 @@ PASS 1 - DIRECT FRAKTUR OCR (high-confidence extraction):
 13. Do NOT translate English loanwords
 
 PASS 2 - GAP INVENTORY (observation only):
-For each gap, re-examine the image. Record what you see. Do NOT guess.
-Update each gap with fragments:
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="visible_text" }}}}
+For each gap, re-examine the image. Do NOT guess at meaning.
+Record the raw characters you can see, character by character.
+Use ... for characters you cannot make out. The fragments field is
+a character-level reading — what the letters literally look like,
+even if garbled. Not a description, not a guess.
+Good: fragments="Ber...lung"  fragments="$ouft...b"  fragments="nid)t"
+Bad:  fragments="visible capitals"  fragments="likely a noun"
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="raw_chars" }}}}
 
 OUTPUT FORMAT:
 LAYOUT: <one-line description>
@@ -1063,11 +1068,14 @@ For every gap, produce a best guess and assign a confidence score.
 
 INSTRUCTIONS:
 1. For each {{{{ gap }}}} marker, cross-reference:
-   - The fragments field (partial letterforms from the image)
-   - The corresponding region in the ABBYY/portal OCR text
+   - The fragments field (raw character-level reading from the image,
+     e.g. "Bcrfamm" — these are what the letters literally look like,
+     not guesses. Apply Fraktur error corrections to decode them.)
+   - The corresponding region in the ABBYY/portal OCR text (region_ocr)
    - Surrounding context in the transcription
    - Your knowledge of 1890s German, Texas German dialect, article topic
-2. Apply the Fraktur error correction table to decode garbled OCR fragments
+2. Apply the Fraktur error correction table to decode both fragments
+   and region_ocr (they may contain the same OCR errors)
 3. Assign a confidence score and produce your best guess. Remember est
    is approximate (Fraktur proportional — l is ~30% width of W). Prefer
    linguistic sense over exact character count match.
