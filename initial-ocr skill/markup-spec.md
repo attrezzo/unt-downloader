@@ -37,7 +37,7 @@ The universal tag for any text that is not 100% confident. Covers everything fro
 ```
 
 **Fields:**
-- `est` (required): Estimated character count of the text region
+- `est` (required): Estimated character count of the text region. This is approximate — Fraktur is proportional, so narrow characters (l, i, t, f) take ~30-40% the width of wide ones (W, M, m, w). A gap with est=12 could hold 8 wide or 18 narrow characters. Guesses should prioritize linguistic sense over exact character count.
 - `imgbbox` (required): Approximate bounding box as `"x,y,w,h"` in pixels (x,y = top-left, w,h = size). Be generous — overestimate to ensure the text is fully contained. Enables future refinement passes to crop just this region instead of resending the full page.
 - `cnf` (required): Confidence score from 0 to 1:
   - `0.90–0.99` — High confidence. Multiple sources agree, strong context. Rarely needs review.

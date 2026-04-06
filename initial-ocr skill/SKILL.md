@@ -51,6 +51,8 @@ Read the page image directly. This is where most of the text gets captured as pl
    {{ gap | est=NN | imgbbox="x,y,w,h" }}
    ```
    `est` = estimated character count. `imgbbox` = approximate pixel bounding box (x,y = top-left, w,h = size). Be generous with the box.
+
+   **Note on `est`:** Fraktur is a proportional typeface. Narrow characters (l, i, t, f, 1) take roughly 30-40% of the width of wide characters (W, M, m, w). A gap region that fits ~12 average characters could hold 8 wide or 18 narrow. Treat `est` as a rough midpoint, not a hard constraint. When guessing in Pass 3, prefer the reading that makes linguistic sense over one that exactly matches the character count.
 6. Mark images, illustrations, or engravings:
    ```
    {{ Img | bbox="x,y,w,h" | desc="brief description" }}
@@ -109,7 +111,7 @@ This is where guessing happens. For every gap, produce a best guess and assign a
 
 2. Apply the Fraktur error correction table to decode the ABBYY fragments
 
-3. Assign a confidence score and produce your best guess:
+3. Assign a confidence score and produce your best guess. Remember that `est` is approximate — Fraktur is proportional, so a gap could hold fewer wide characters or more narrow ones than `est` suggests. Prefer the reading that makes linguistic sense over one that exactly matches the character count.
 
    **If cnf >= 0.95 — PROMOTE TO PLAIN TEXT.** Remove the gap tag entirely. The text is confident enough to stand as untagged output, just like the text from Pass 1. This happens when your reading and the ABBYY OCR strongly agree, context tightly constrains the word, and/or it's a common word with clear fragments.
 

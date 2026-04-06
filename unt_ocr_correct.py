@@ -515,7 +515,9 @@ PASS 1 - DIRECT FRAKTUR OCR (high-confidence extraction):
 5. Confident text: write directly, no tags. This should be most of the page.
 6. Illegible/uncertain text: mark with a gap. Do NOT guess:
    {{{{ gap | est=NN | imgbbox="x,y,w,h" }}}}
-   est = char count estimate. imgbbox = pixel bounding box (be generous).
+   est = approximate char count (Fraktur is proportional — narrow chars
+   like l,i,t take ~30-40% the width of w,M,W, so treat est as rough).
+   imgbbox = pixel bounding box (be generous).
 7. Images/illustrations: {{{{ Img | bbox="x,y,w,h" | desc="..." }}}}
 8. Articles: {{{{ Column001 }}}} ... {{{{ /Column }}}}
 9. Advertisements: {{{{ Ad001 }}}} ... {{{{ /Ad }}}}
@@ -591,7 +593,9 @@ INSTRUCTIONS:
    - Surrounding context in the transcription
    - Your knowledge of 1890s German, Texas German dialect, article topic
 2. Apply the Fraktur error correction table to decode garbled OCR fragments
-3. Assign a confidence score and update the gap:
+3. Assign a confidence score and produce your best guess. Remember est
+   is approximate (Fraktur proportional — l is ~30% width of W). Prefer
+   linguistic sense over exact character count match.
 
    cnf >= 0.95: PROMOTE TO PLAIN TEXT. Remove the gap tag entirely.
      Write the text as untagged output.
@@ -1506,6 +1510,11 @@ REFERENCE: TEXAS GERMAN VOCABULARY
 TASK: Re-evaluate OCR gap tags using fragments, raw OCR, and context.
 No image is provided — work from text evidence only.
 
+Note: the est (character count) in each gap is approximate. Fraktur is
+proportional — narrow letters (l,i,t,f) are ~30-40% the width of wide
+ones (W,M,m,w). A gap with est=12 could hold 8 wide or 18 narrow chars.
+Prefer the reading that makes linguistic sense over matching est exactly.
+
 For each gap in the batch, return one line:
   UNCHANGED: <N>
   UPDATED: <N> | cnf="0.XX" [new guess]
@@ -1534,6 +1543,10 @@ REFERENCE: TEXAS GERMAN VOCABULARY
 TASK: You receive a cropped region of a newspaper page and one or more
 gap tags from that region with surrounding context. Examine the image
 carefully and produce updated guesses.
+
+Note: est (character count) is approximate. Fraktur is proportional —
+narrow letters are ~30-40% the width of wide ones. Prefer linguistic
+sense over matching the exact character count.
 
 For each gap, return one line:
   UNCHANGED: <N>

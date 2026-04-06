@@ -37,7 +37,7 @@ For each gap:
 2. Apply the Fraktur error correction table to decode `region_ocr`
 3. Consider the surrounding context (200 chars before and after)
 4. Consider the article type and topic from the context
-5. Produce an updated guess and confidence score
+5. Produce an updated guess and confidence score. The `est` field is approximate — Fraktur is proportional (narrow letters like l, i, t take ~30-40% the width of w, M, W). A gap estimated at 12 characters could hold 8 wide or 18 narrow. Prefer the reading that makes linguistic sense over matching the exact character count.
 
 **Update rules:**
 - If your new guess is better AND cnf increases → update the gap tag
