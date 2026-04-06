@@ -980,9 +980,46 @@ YOUR TASK: PASS 1 + PASS 2 (transcription and gap inventory)
 Read the newspaper page image. Produce a transcription where most text is
 plain, high-confidence output. Mark uncertain regions as gaps.
 
+CRITICAL: Transcribe EVERY word on the page. Never summarize, describe, or
+skip sections. "[Multiple advertisements, heavily degraded]" is WRONG — you
+must transcribe each advertisement word by word, using gap tags for the parts
+you cannot read. Even badly degraded text usually has readable words between
+the damaged parts. Your job is to extract every readable character.
+
+READING A 19TH-CENTURY NEWSPAPER PAGE — LAYOUT GUIDE:
+------------------------------------------------------
+These pages have complex layouts. Read them in this order:
+
+1. MASTHEAD: The newspaper title, date, volume/number at the top.
+   Usually spans the full width. Often in large decorative Fraktur.
+
+2. COLUMNS: The body text is arranged in columns (typically 4-6).
+   - Columns run the FULL HEIGHT of the page, top to bottom
+   - Read each column completely from top to bottom before moving
+     to the next column to the right
+   - A single column may contain multiple articles separated by
+     horizontal rules or headline changes
+   - Text continues within a column even when articles change
+
+3. ADVERTISEMENTS: Ads break the regular column flow. Look for:
+   - Larger or different fonts (bold, italic, or non-Fraktur type)
+   - Decorative borders, boxes, or horizontal rules
+   - Centered text (column text is usually justified)
+   - Business names, addresses, or product listings
+   - Sometimes ads span multiple columns or interrupt column flow
+   - An ad in the middle of columns 4-5-6 means column text continues
+     above and below the ad — read those parts as column text
+
+4. READING ORDER for each column:
+   a. Start at the top of the column
+   b. Read down through articles, separated by horizontal rules
+   c. When you hit an ad that interrupts, tag it as {{{{ AdNNN }}}}
+   d. Continue reading column text below the ad
+   e. Finish the column, then move to the next column right
+
 PASS 1 - DIRECT FRAKTUR OCR (high-confidence extraction):
 1. Identify layout: masthead, column count, center features, damage
-2. Read each section: masthead, center features, columns left-to-right
+2. Read left-to-right, column by column, top to bottom within each column
 3. Transcribe Fraktur to Latin characters
 4. Apply Fraktur error corrections as you read (Tier 1 aggressively,
    Tiers 2-5 with context)
@@ -993,7 +1030,7 @@ PASS 1 - DIRECT FRAKTUR OCR (high-confidence extraction):
    like l,i,t take ~30-40% the width of w,M,W, so treat est as rough).
    imgbbox = pixel bounding box (be generous).
 7. Images/illustrations: {{{{ Img | bbox="x,y,w,h" | desc="..." }}}}
-8. Articles: {{{{ Column001 }}}} ... {{{{ /Column }}}}
+8. Articles/news items: {{{{ Column001 }}}} ... {{{{ /Column }}}}
 9. Advertisements: {{{{ Ad001 }}}} ... {{{{ /Ad }}}}
 10. Number Column/Ad tags sequentially (001, 002, 003...)
 11. Headlines: ## | Subheads: ### | Datelines: **bold**
@@ -1029,6 +1066,8 @@ STATS:
 
 RULES:
 - NEVER guess in gaps — that happens in a separate pass
+- NEVER summarize or describe text — transcribe every word
+- NEVER write "[classified advertisements]" or similar — transcribe them
 - Preserve Texas German, period spellings, English loanwords as-is
 - Watch for column interleaving and mark with
   <!-- {{{{ column_break | from=N | to=M }}}} -->"""

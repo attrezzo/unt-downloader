@@ -37,43 +37,65 @@ All three passes happen in sequence. Return only the final merged result.
 
 Read the page image directly. This is where most of the text gets captured as plain, untagged, high-confidence output.
 
+**CRITICAL:** Transcribe EVERY word on the page. Never summarize, describe, or skip sections. Writing "[Multiple advertisements, heavily degraded]" is WRONG — you must transcribe each advertisement word by word, using gap tags for the parts you cannot read. Even badly degraded text usually has readable words between the damaged parts.
+
 **Before reading**, internalize:
 - `references/fraktur-errors.md` — systematic Fraktur OCR failure modes
 - `references/texas-german.md` — Texas German vocabulary, loanwords, period spelling
 
+**Reading a 19th-century newspaper page — layout guide:**
+
+These pages have complex layouts. Read them in this order:
+
+1. **MASTHEAD**: The newspaper title, date, volume/number at the top. Usually spans the full width. Often in large decorative Fraktur.
+2. **COLUMNS**: The body text is arranged in columns (typically 4-6).
+   - Columns run the **full height** of the page, top to bottom
+   - Read each column completely top-to-bottom before moving right
+   - A single column may contain multiple articles separated by horizontal rules
+3. **ADVERTISEMENTS**: Ads break the regular column flow. Look for:
+   - Larger or different fonts (bold, italic, or non-Fraktur type)
+   - Decorative borders, boxes, or horizontal rules
+   - Centered text (column text is usually justified)
+   - Business names, addresses, or product listings
+   - Ads may span multiple columns or interrupt column flow
+   - When an ad interrupts columns 4-5-6, the column text continues above and below the ad
+4. **Reading order** for each column: start at top, read down through articles, tag ads that interrupt with `{{ AdNNN }}`, continue column text below the ad, finish column, move right.
+
 **Instructions:**
 1. Identify the page layout: masthead, column count, center-page features (ads, programs, large headlines), visible damage
-2. Read each section in Fraktur, transcribing to Latin characters
-3. Apply Fraktur error corrections as you read (Tier 1 aggressively, Tiers 2-5 with context)
-4. Where text is **confidently readable**, write it directly — no tags needed. This should be the majority of the page.
-5. Where text is **illegible or uncertain**, mark with a gap. Do NOT guess yet — just record location and estimated size:
+2. Read left-to-right, column by column, top to bottom within each column
+3. Transcribe Fraktur to Latin characters
+4. Apply Fraktur error corrections as you read (Tier 1 aggressively, Tiers 2-5 with context)
+5. Where text is **confidently readable**, write it directly — no tags needed. This should be the majority of the page.
+6. Where text is **illegible or uncertain**, mark with a gap. Do NOT guess yet — just record location and estimated size:
    ```
    {{ gap | est=NN | imgbbox="x,y,w,h" }}
    ```
    `est` = estimated character count. `imgbbox` = approximate pixel bounding box (x,y = top-left, w,h = size). Be generous with the box.
 
    **Note on `est`:** Fraktur is a proportional typeface. Narrow characters (l, i, t, f, 1) take roughly 30-40% of the width of wide characters (W, M, m, w). A gap region that fits ~12 average characters could hold 8 wide or 18 narrow. Treat `est` as a rough midpoint, not a hard constraint. When guessing in Pass 3, prefer the reading that makes linguistic sense over one that exactly matches the character count.
-6. Mark images, illustrations, or engravings:
+7. Mark images, illustrations, or engravings:
    ```
    {{ Img | bbox="x,y,w,h" | desc="brief description" }}
    ```
-7. Wrap each article/news item/notice in a numbered Column tag:
+8. Wrap each article/news item/notice in a numbered Column tag:
    ```
    {{ Column001 }}
    ## Headline
    **Dateline,** Date. Article body...
    {{ /Column }}
    ```
-8. Wrap each advertisement in a numbered Ad tag:
+9. Wrap each advertisement in a numbered Ad tag:
    ```
    {{ Ad001 }}
    Business name. Products/services. Address.
    {{ /Ad }}
    ```
-9. Number Column and Ad tags sequentially per page (001, 002, 003...)
-10. Headlines: `##` | Subheads: `###` | Datelines: **bold**
-11. Do NOT correct Texas German dialect words or pre-1901 spellings
-12. Do NOT translate English loanwords to German
+10. Number Column and Ad tags sequentially per page (001, 002, 003...)
+11. Headlines: `##` | Subheads: `###` | Datelines: **bold**
+12. Do NOT correct Texas German dialect words or pre-1901 spellings
+13. Do NOT translate English loanwords to German
+14. Do NOT summarize or describe text — transcribe every word
 
 ---
 
