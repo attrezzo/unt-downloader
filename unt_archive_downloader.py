@@ -1193,20 +1193,25 @@ def download_all_ocr(config: dict, resume: bool = True, workers: int = 8,
 
 def clean_existing_ocr():
     """
-    Strip HTML from previously-downloaded OCR files in-place.
+    Strip HTML from previously-downloaded OCR files.
+
+    Backs up original HTML files to a sibling directory (ocr_html_backup/)
+    before overwriting the clean versions. Already-clean files are skipped.
 
     Converts old-format files (full HTML per page, ~100-200 KB each) to
     clean text (~5-20 KB each). Preserves the header and page markers.
-    Already-clean files are detected and skipped.
     """
-    if not OCR_DIR.exists():
-        print("No portal_ocr directory found. Run --download-ocr first.")
+    if not OCR_DIR or not OCR_DIR.exists():
+        print("No OCR directory found. Run --download-ocr first.")
         return
 
     files = sorted(OCR_DIR.glob("*.txt"))
     if not files:
         print("No OCR files found.")
         return
+
+    # Backup directory: sibling to OCR_DIR
+    backup_dir = OCR_DIR.parent / "ocr_html_backup"
 
     cleaned = 0
     skipped = 0
@@ -1216,6 +1221,14 @@ def clean_existing_ocr():
         if '<html' not in raw.lower() and '<div' not in raw.lower():
             skipped += 1
             continue
+
+        # Back up original before overwriting
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / fpath.name
+        if not backup_path.exists():
+            backup_path.write_text(raw, encoding="utf-8")
+
+        old_kb = fpath.stat().st_size // 1024
 
         # Parse into header + pages, clean each page, reassemble
         lines = raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')
@@ -1251,9 +1264,11 @@ def clean_existing_ocr():
         fpath.write_text('\n'.join(out_lines), encoding="utf-8")
         new_kb = fpath.stat().st_size // 1024
         cleaned += 1
-        print(f"  Cleaned: {fpath.name}  ({new_kb} KB)")
+        print(f"  Cleaned: {fpath.name}  ({old_kb} KB → {new_kb} KB)")
 
     print(f"\n✓ OCR clean complete: {cleaned} files cleaned, {skipped} already clean.")
+    if cleaned:
+        print(f"  Originals backed up to: {backup_dir}")
 
 
 # ---------------------------------------------------------------------------

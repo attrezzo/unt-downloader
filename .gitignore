@@ -7,6 +7,7 @@ __pycache__/
 # Each collection lives in its own directory (e.g. bellville_wochenblatt/).
 */metadata/
 */ocr/
+*/ocr_html_backup/
 */images/
 */abbyy/
 */corrected/
