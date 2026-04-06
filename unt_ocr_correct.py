@@ -1746,7 +1746,7 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     ocr_path   = PORTAL_OCR_DIR / fname
     corr_path  = CORRECTED_DIR / fname
     ark_dir    = ARTICLES_DIR / ark_id
-    ai_ocr_dir = AI_PORTAL_OCR_DIR / ark_id
+    ai_ocr_dir = AI_OCR_DIR / ark_id
 
     # Resume check
     if resume and not force and corr_path.exists() and corr_path.stat().st_size > 500:
