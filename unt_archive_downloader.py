@@ -1345,6 +1345,10 @@ def main():
                    help="Seconds between issues")
     p.add_argument("--retry-failed",   action="store_true",
                    help="(--correct only) Retry pages marked as failed")
+    p.add_argument("--force",          action="store_true",
+                   help="(--correct only) Reprocess all pages, ignoring existing output")
+    p.add_argument("--budget",         type=float, default=None,
+                   help="(--correct only) Max dollar amount to spend on API calls")
     p.add_argument("--columns",        type=int, default=5,
                    help="Newspaper columns for --render-pdf (default: 5)")
     p.add_argument("--max-output-tokens", type=int, default=32000,
@@ -1472,6 +1476,10 @@ def main():
         correct_args = list(worker_args)
         if args.retry_failed:
             correct_args.append("--retry-failed")
+        if args.force:
+            correct_args.append("--force")
+        if args.budget is not None:
+            correct_args += ["--budget", str(args.budget)]
         run_worker("unt_ocr_correct.py", correct_args)
 
     if args.translate:
