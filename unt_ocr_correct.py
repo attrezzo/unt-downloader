@@ -163,31 +163,45 @@ class WorkerDashboard:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._workers = {}  # worker_id -> {status, history}
+        self._workers = {}       # worker_id -> {current, history, t_start}
         self._completed = 0
         self._errors = 0
         self._skipped = 0
         self._start_time = time.monotonic()
         self._total_pages = 0
         self._cost_tracker = None
+        self._rate_limiter = None
+        self._issue_label = ""
+        self._total_in_tok = 0
+        self._total_out_tok = 0
         self._last_render = 0
-        self._render_lines = 0  # how many lines last render drew
+        self._render_lines = 0
 
-    def set_context(self, total_pages, cost_tracker=None):
+    def set_context(self, total_pages=0, cost_tracker=None,
+                    rate_limiter=None, issue_label=""):
         with self._lock:
-            self._total_pages = total_pages
-            self._cost_tracker = cost_tracker
+            if total_pages:
+                self._total_pages = total_pages
+            if cost_tracker:
+                self._cost_tracker = cost_tracker
+            if rate_limiter:
+                self._rate_limiter = rate_limiter
+            if issue_label:
+                self._issue_label = issue_label
 
     def update(self, worker_id: str, msg: str, status: str = "info"):
         """Update a worker's current state."""
         with self._lock:
             if worker_id not in self._workers:
                 self._workers[worker_id] = {
-                    "current": "", "history": deque(maxlen=3)}
+                    "current": "", "history": deque(maxlen=3),
+                    "t_start": time.monotonic()}
             w = self._workers[worker_id]
-            if w["current"]:
+            # Push current to history (skip if it's a streaming update)
+            if w["current"] and "generating" not in msg:
                 w["history"].appendleft(w["current"])
             w["current"] = msg
+            w["t_start"] = time.monotonic()
             if status == "ok":
                 self._completed += 1
             elif status == "error":
@@ -202,9 +216,8 @@ class WorkerDashboard:
             return
         with self._lock:
             self._last_render = now
-            lines = self._build_lines()
+            lines = self._build_lines(now)
 
-        # Move cursor up to overwrite previous render
         if self._render_lines > 0:
             sys.stdout.write(f"\033[{self._render_lines}A\033[J")
 
@@ -213,51 +226,104 @@ class WorkerDashboard:
         sys.stdout.flush()
         self._render_lines = len(lines)
 
-    def _build_lines(self):
-        lines = []
-        elapsed = time.monotonic() - self._start_time
-        rate = (self._completed / (elapsed / 60)) if elapsed > 60 else 0
+    def _fmt_time(self, secs):
+        if secs < 60:
+            return f"{secs:.0f}s"
+        m, s = divmod(int(secs), 60)
+        return f"{m}m {s:02d}s"
 
-        # Progress bar
+    def _build_lines(self, now):
+        lines = []
+        elapsed = now - self._start_time
+
+        # ── Issue header ──────────────────────────────────────────
+        if self._issue_label:
+            lines.append(f"  {self._issue_label}")
+            lines.append("")
+
+        # ── Progress bar + stats ──────────────────────────────────
         done = self._completed + self._errors + self._skipped
-        total = self._total_pages or 1
+        total = max(self._total_pages, 1)
         pct = min(100, done / total * 100)
-        bar_len = 30
+        bar_len = 35
         filled = int(bar_len * done / total)
         bar = "#" * filled + "-" * (bar_len - filled)
 
-        cost_str = ""
-        if self._cost_tracker:
-            cost_str = f" | ${self._cost_tracker.total_cost:.2f}"
-            if self._cost_tracker.budget:
-                cost_str += f"/${self._cost_tracker.budget:.2f}"
+        # ETA
+        if self._completed > 0 and elapsed > 5:
+            avg_per_page = elapsed / self._completed
+            remaining = (total - done) * avg_per_page
+            eta_str = f"ETA {self._fmt_time(remaining)}"
+        else:
+            eta_str = self._fmt_time(elapsed)
 
-        rate_str = f"{rate:.1f}/min" if rate > 0.1 else f"{elapsed:.0f}s"
-        lines.append(f"  [{bar}] {done}/{total} ({pct:.0f}%)  "
-                     f"ok:{self._completed} err:{self._errors} "
-                     f"skip:{self._skipped}  {rate_str}{cost_str}")
+        lines.append(f"  [{bar}] {done}/{total} ({pct:.0f}%)  {eta_str}")
         lines.append("")
 
-        # Per-worker state
+        # ── Cost + tokens ─────────────────────────────────────────
+        ct = self._cost_tracker
+        if ct:
+            cost_str = f"${ct.total_cost:.2f}"
+            if ct.budget:
+                cost_str += f" / ${ct.budget:.2f}"
+            avg_str = (f"${ct.total_cost / ct.pages_processed:.3f}/page"
+                       if ct.pages_processed > 0 else "")
+            lines.append(
+                f"  Cost: {cost_str}  "
+                f"Tokens: {ct.total_input_tokens:,}in "
+                f"+ {ct.total_output_tokens:,}out  {avg_str}")
+        else:
+            lines.append(f"  Time: {self._fmt_time(elapsed)}  "
+                         f"Done: {self._completed}")
+
+        # ── Rate limiter ──────────────────────────────────────────
+        rl = self._rate_limiter
+        if rl:
+            try:
+                s = rl.stats()
+                rpm_pct = s["rpm_bucket_level"] / rl._rpm_capacity * 100
+                tpm_pct = s["tpm_bucket_level"] / rl._tpm_capacity * 100
+                lines.append(
+                    f"  Rate:  RPM {s['rpm_bucket_level']:.0f}"
+                    f"/{rl._rpm_capacity:.0f} ({rpm_pct:.0f}%)  "
+                    f"TPM {s['tpm_bucket_level']:,.0f}"
+                    f"/{rl._tpm_capacity:,.0f} ({tpm_pct:.0f}%)")
+            except Exception:
+                pass
+
+        lines.append("")
+
+        # ── Workers ───────────────────────────────────────────────
         for wid in sorted(self._workers.keys()):
             w = self._workers[wid]
-            icon = ">"
-            lines.append(f"  {icon} {wid:<8} {w['current']}")
+            age = now - w["t_start"]
+            age_str = f"[{age:.0f}s]" if age >= 1 else ""
+            lines.append(f"  > {wid:<6} {w['current']:<50} {age_str}")
             for old in w["history"]:
-                lines.append(f"    {'':8} {old}")
+                lines.append(f"    {'':6} {old}")
 
         lines.append("")
         return lines
 
     def final_summary(self):
         """Print non-overwriting final summary."""
-        # Clear the dashboard
         if self._render_lines > 0:
             sys.stdout.write(f"\033[{self._render_lines}A\033[J")
             self._render_lines = 0
         elapsed = time.monotonic() - self._start_time
-        print(f"  Completed: {self._completed}  Errors: {self._errors}  "
-              f"Skipped: {self._skipped}  Time: {elapsed:.0f}s", flush=True)
+        ct = self._cost_tracker
+        cost_str = f"  Cost: ${ct.total_cost:.2f}" if ct else ""
+        tok_str = ""
+        if ct and ct.pages_processed > 0:
+            tok_str = (f"  Tokens: {ct.total_input_tokens:,}in"
+                       f" + {ct.total_output_tokens:,}out"
+                       f"  (${ct.total_cost / ct.pages_processed:.3f}/page)")
+        print(f"\n  Done: {self._completed}  Errors: {self._errors}  "
+              f"Skipped: {self._skipped}  "
+              f"Time: {self._fmt_time(elapsed)}{cost_str}")
+        if tok_str:
+            print(f"  {tok_str}")
+        print(flush=True)
 
 
 def init_logging(collection_dir: Path, log_level: int):
@@ -319,7 +385,8 @@ def print_status(cost_tracker=None, step_name="OCR Correction",
                  progress_current=0, progress_total=0):
     """Trigger a dashboard render with updated context."""
     if _dashboard:
-        _dashboard.set_context(progress_total, cost_tracker)
+        _dashboard.set_context(total_pages=progress_total,
+                               cost_tracker=cost_tracker)
         _dashboard.render(force=True)
 
 
@@ -3083,11 +3150,18 @@ def main():
 
     for idx, issue in enumerate(issues):
         ark_id = issue["ark_id"]
-        tprint(f"\n{'=' * 60}", level=1)
-        tprint(f"[{idx + 1}/{len(issues)}] {ark_id}  "
-               f"Vol.{issue.get('volume', '?')} "
-               f"No.{issue.get('number', '?')}  "
-               f"{issue.get('date', '')}", level=1)
+        issue_label = (f"[{idx + 1}/{len(issues)}] {ark_id}  "
+                       f"Vol.{issue.get('volume', '?')} "
+                       f"No.{issue.get('number', '?')}  "
+                       f"{issue.get('date', '')}  "
+                       f"({issue.get('pages', 8)} pages)")
+        if _dashboard:
+            _dashboard.set_context(
+                total_pages=int(issue.get("pages", 8)),
+                cost_tracker=cost_tracker,
+                rate_limiter=rate_limiter,
+                issue_label=issue_label)
+        print(f"\n  {issue_label}", flush=True)
 
         # Budget or interrupt check before starting issue
         if _interrupted:
@@ -3132,16 +3206,13 @@ def main():
                 print("Stopped: revised estimate exceeds budget.")
                 break
 
-    # Final summary
-    if rate_limiter:
-        tprint(f"\nRate limiter: {rate_limiter.status_line()}", level=1)
-    tprint(f"\n{'=' * 60}", level=1)
-    tprint(f"Complete: {ctr['ok']}  Skipped: {ctr['skipped']}  "
-           f"Errors: {ctr['err']}", level=1)
-    tprint(f"Cost: {cost_tracker.summary()}", level=1)
-    tprint(f"Corrected: {CORRECTED_DIR}", level=1)
-    tprint(f"AI OCR:    {AI_OCR_DIR}", level=1)
-    tprint(f"Articles:  {ARTICLES_DIR}", level=1)
+    # Final summary — clear dashboard and print static results
+    if _dashboard:
+        _dashboard.final_summary()
+    print(f"  Corrected: {CORRECTED_DIR}")
+    print(f"  AI OCR:    {AI_OCR_DIR}")
+    print(f"  Articles:  {ARTICLES_DIR}")
+    print(flush=True)
 
 
 if __name__ == "__main__":
