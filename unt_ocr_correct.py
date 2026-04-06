@@ -808,6 +808,7 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
                             with _dashboard._lock:
                                 if wid in _dashboard._workers:
                                     _dashboard._workers[wid]["status"] = msg
+                            _dashboard.render_throttled()
                         else:
                             print(f"    {label} {msg}", flush=True)
                         last_report = now
