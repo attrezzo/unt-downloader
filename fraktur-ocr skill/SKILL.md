@@ -39,13 +39,12 @@ Read the uploaded page image directly. Work section by section (masthead, then c
 1. Identify the page layout: masthead, column count, any center-page features (advertisements, program announcements)
 2. Read each section in Fraktur, writing the text in standard Latin characters
 3. Where text is **confidently readable**, write it directly — no tags needed
-4. Where text is **illegible or uncertain**, insert a gap marker:
+4. Where text is **illegible or uncertain**, insert a gap marker with your best guess of the missing text:
    ```
-   {{gap|est=NN}}
+   {{ gap | est=NN [best guess] }}
    ```
-   where `NN` is your best estimate of the character count of the missing text.
-5. Do NOT guess at illegible text in this pass. Guessing comes in Pass 3.
-6. Preserve paragraph and article boundaries with blank lines
+   where `NN` is your best estimate of the character count and `[best guess]` is your prediction of what the text says based on context. Always guess — even a speculative guess is valuable for future refinement.
+5. Preserve paragraph and article boundaries with blank lines
 7. Mark article headlines with `##` and subheads with `###`
 8. Preserve any visible datelines (city, date) at the start of news items in **bold**
 
@@ -70,22 +69,22 @@ Read the uploaded page image directly. Work section by section (masthead, then c
 
 ### PASS 2 — Gap Inventory
 
-Review your Pass 1 output. For each `{{gap}}` marker:
+Review your Pass 1 output. For each `{{ gap }}` marker:
 
 1. Examine the image again at that location
 2. Refine the character count estimate
 3. Note what partial letterforms or fragments you can see
-4. Note contextual constraints (what kind of word is expected: noun, verb, place name, etc.)
+4. Refine your best guess based on fragments
 
-**Output this pass as an update** — replace each `{{gap|est=NN}}` with an enriched marker:
+**Output this pass as an update** — replace each basic gap with an enriched marker:
 
 ```
-{{gap|est=NN|fragments="partial_text"|context="description"}}
+{{ gap | est=NN | fragments="partial_text" [refined guess] }}
 ```
 
 For example:
 ```
-{{gap|est=25|fragments="Ber...lung"|context="likely a noun, follows 'zur'"}}
+{{ gap | est=25 | fragments="Ber...lung" [Versammlung] }}
 ```
 
 ---
@@ -104,10 +103,10 @@ This pass requires the existing ABBYY OCR (or other traditional OCR) if availabl
 
 2. Apply the Fraktur error correction table from `references/fraktur-errors.md` to decode the ABBYY fragments
 
-3. Produce a best-guess reconstruction and wrap it in a metadata tag:
+3. If you can assign a confidence level, promote the gap to an **infill tag**:
 
 ```
-{{infill|est=NN|confidence=LOW|region_ocr="raw_abbyy_text"|guess="your reconstruction"}}
+[reconstructed text]^CONFIDENCE^ <!-- {{ infill | est=NN | confidence=LEVEL | region_ocr="raw_abbyy_text" | guess="your reconstruction" }} -->
 ```
 
 **Confidence levels:**
@@ -116,18 +115,15 @@ This pass requires the existing ABBYY OCR (or other traditional OCR) if availabl
 - `LOW` — Educated guess based primarily on context, could easily be wrong
 - `VLOW` — Speculative fill to maintain readability, treat as placeholder
 
-4. When writing the final output, render infilled text inside brackets with a superscript confidence marker:
+4. If you cannot confidently assign a level, leave as a gap with `status=unresolved` and your best guess:
 
 ```
-[reconstructed text]^MED^
+{{ gap | est=25 | fragments="Ber...lung" | status=unresolved [Versammlung] }}
 ```
 
-The full metadata tag is preserved as an HTML comment immediately after:
-```
-[reconstructed text]^MED^ <!-- {{infill|est=32|confidence=MED|region_ocr="ber Vcrfamm"|guess="der Versammlung"}} -->
-```
+The output is **human-readable** (guesses in brackets read naturally in context) AND **machine-parseable** (tags carry metadata for future passes).
 
-This way the output is **human-readable** (you see bracketed text with confidence) AND **machine-parseable** (the HTML comment contains full metadata for future passes).
+**IMPORTANT:** Never leave text blank or use `[unleserlich]`. Every unreadable region gets a best-guess prediction. Even a wild guess from context alone is more useful than a blank — future refinement passes can improve it.
 
 ---
 
@@ -155,7 +151,7 @@ After all three passes, produce the final document:
 - Characters infilled at MED confidence: [N] ([%])
 - Characters infilled at LOW confidence: [N] ([%])
 - Characters infilled at VLOW confidence: [N] ([%])
-- Characters unrecoverable: [N] ([%])
+- Characters in unresolved gaps: [N] ([%])
 
 ---
 

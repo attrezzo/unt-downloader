@@ -44,7 +44,7 @@ except ImportError:
 UNT_BASE      = "https://texashistory.unt.edu"
 ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL  = "claude-sonnet-4-6"
-ILLEGIBLE     = "[unleserlich]"
+ILLEGIBLE     = "[unleserlich]"  # deprecated — kept only for parsing legacy files
 
 # Token estimates (calibrated: ~56k image + ~5k prompt + ~1k reference OCR)
 EST_INPUT_TOKENS_PER_PAGE  = 62_000
@@ -474,42 +474,44 @@ PASS 1 - DIRECT FRAKTUR OCR:
    - Tier 2 with context checking (capital letter confusions)
    - Tiers 3-5 case by case (ligature breaks, number/letter, hyphenation)
 5. Where text is confidently readable, write it directly with no tags
-6. Where text is illegible or uncertain, insert: {{{{gap|est=NN}}}}
+6. Where text is illegible or uncertain, insert a gap with your best guess:
+   {{{{ gap | est=NN [best guess of missing text] }}}}
+   ALWAYS include a guess. Use context, sentence structure, article topic,
+   and 1890s German knowledge. Even a speculative guess is valuable.
 7. Do NOT correct Texas German dialect words or pre-1901 spellings
 8. Do NOT translate English loanwords to German
 9. Mark article boundaries with:
-   <!-- {{{{article|type="TYPE"|dateline="CITY, DATE"|topic="brief description"}}}} -->
+   <!-- {{{{ article | type="TYPE" | dateline="CITY, DATE" | topic="brief description" }}}} -->
    Types: international, national, texas, local, program, advertisement,
    editorial, obituary, masthead, notice, poetry
 10. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
 
 PASS 2 - GAP INVENTORY:
-For each {{{{gap}}}} from Pass 1:
+For each {{{{ gap }}}} from Pass 1:
 1. Re-examine the image at that location
 2. Note partial letterforms, ascenders, descenders, dots, fragments
-3. Note grammatical role (noun, verb, name, etc.) and contextual constraints
+3. Refine the character count estimate and your best guess
 4. Replace with enriched marker:
-   {{{{gap|est=NN|fragments="visible_fragments"|context="notes"}}}}
+   {{{{ gap | est=NN | fragments="visible_fragments" [refined guess] }}}}
 
 PASS 3 - CROSS-REFERENCE AND INFILL:
 For each enriched gap:
 1. If ABBYY/portal OCR is provided, find the corresponding region
 2. Apply the Fraktur error correction table to decode the raw OCR fragment
-3. Cross-reference: your reading + OCR fragment + context + 1890s German +
+3. Cross-reference: your reading + OCR fragment + 1890s German +
    article topic (international news = more Hochdeutsch, local = more dialect)
-4. Produce a reconstruction with confidence level:
-   - HIGH: Multiple sources agree, context tightly constrains, common word
-   - MED: Partial letterforms match, context fits, reasonable inference
-   - LOW: Primarily context-based, OCR fragments ambiguous, multiple readings
-   - VLOW: Little evidence, filled mainly for readability, treat as placeholder
-5. Replace the gap with infill (human-readable + machine-parseable):
+4. If you can assign a confidence level, promote to infill:
    [reconstructed text]^CONFIDENCE^
-   <!-- {{{{infill|est=NN|confidence=LEVEL|region_ocr="raw_ocr_text"|guess="clean_text"|notes="reasoning"}}}} -->
+   <!-- {{{{ infill | est=NN | confidence=LEVEL | region_ocr="raw_ocr_text" | guess="clean_text" | notes="reasoning" }}}} -->
+   Confidence: HIGH, MED, LOW, VLOW
    The region_ocr field MUST contain the exact raw OCR text, uncorrected.
-6. If you cannot reconstruct even speculatively, leave as:
-   {{{{gap|est=NN|fragments="..."|context="..."|status=unresolved}}}}
-7. For non-gap corrections where the fix is ambiguous or changes meaning, add:
-   corrected_word <!-- {{{{corrected|original="ocr_reading"|rule="rule_name"}}}} -->
+5. If still uncertain, keep as gap with status=unresolved and your best guess:
+   {{{{ gap | est=NN | fragments="..." | status=unresolved [best guess] }}}}
+6. For non-gap corrections where the fix is ambiguous or changes meaning:
+   corrected_word <!-- {{{{ corrected | original="ocr_reading" | rule="rule_name" }}}} -->
+
+IMPORTANT: Never use [unleserlich] or leave text blank. Every unreadable region
+gets a best-guess prediction in square brackets inside the gap tag.
 
 OUTPUT FORMAT - return this exact structure:
 
@@ -530,13 +532,14 @@ STATS:
 - infill_med: <N>
 - infill_low: <N>
 - infill_vlow: <N>
-- unrecoverable: <N>
+- unresolved_gaps: <N>
 - total_gaps: <N>
 - gaps_filled: <N>
 - gaps_remaining: <N>
 
 CRITICAL RULES:
-- Use {ILLEGIBLE} for text genuinely unreadable after all three passes
+- NEVER use [unleserlich] — always provide a best guess in a gap tag
+- Every gap tag MUST have est= and a [best guess] in square brackets
 - Preserve pre-1901 German spellings (thun, Noth, Theil, Eigenthum, -iren)
 - Preserve English loanwords as-is (Saloon, County, Farmer, Sheriff, Receiver)
 - Preserve Texas German dialect and hybrid forms (Dry Goods Haus, Stadtmarshall)
@@ -544,7 +547,7 @@ CRITICAL RULES:
 - Do NOT translate - text stays in original language
 - Do NOT modernize period orthography
 - Watch for column interleaving (sudden topic change mid-sentence) and mark with
-  <!-- {{{{column_break|from=N|to=M}}}} -->"""
+  <!-- {{{{ column_break | from=N | to=M }}}} -->"""
 
 
 def build_page_prompt(ark_id: str, page_num: int, total_pages: int,
@@ -696,12 +699,20 @@ def extract_clean_text(raw_response: str) -> str:
 
     # Strip HTML comment metadata tags
     text = re.sub(
-        r'<!--\s*\{\{(?:infill|article|column_break|interleaved)[^}]*\}\}\s*-->',
+        r'<!--\s*\{\{\s*(?:infill|article|column_break|interleaved|corrected)'
+        r'[^}]*\}\}\s*-->',
         '', text)
 
-    # Convert remaining {{gap}} markers to [unleserlich]
-    text = re.sub(r'\{\{gap\|[^}]*\}\}', ILLEGIBLE, text)
-    text = re.sub(r'\{\{gap\}\}', ILLEGIBLE, text)
+    # Extract best guess from gap markers: {{ gap | est=NN ... [guess] }} -> guess
+    text = re.sub(
+        r'\{\{\s*gap\s*\|[^[]*\[([^\]]*)\]\s*\}\}',
+        r'\1', text)
+    # Fallback for old-style gaps without guess
+    text = re.sub(r'\{\{\s*gap\s*\|[^}]*\}\}', '', text)
+    text = re.sub(r'\{\{\s*gap\s*\}\}', '', text)
+
+    # Also handle legacy [unleserlich] from old files
+    # (kept for backward compat with pre-existing corrected/ files)
 
     # Strip markdown heading markers for plain text
     text = re.sub(r'^##\s+', '', text, flags=re.M)
@@ -781,7 +792,7 @@ RULES:
   - Default for news = type "article"
   - If an item clearly starts mid-sentence, set continues_from_prev: true
   - If an item clearly ends mid-sentence, set continues_to_next: true
-  - Preserve [unleserlich] markers exactly
+  - Preserve {{ gap }} markers exactly as-is
 
 OUTPUT - valid JSON only, no markdown:
 {"page": <int>, "items": [{"type": "article|advertisement|masthead|notice|poetry",

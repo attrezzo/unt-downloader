@@ -6,43 +6,61 @@ Machine-readable tags for tracking OCR provenance, confidence, and reconstructio
 
 ## Design Goals
 
-1. **Human-readable**: A person reading the output sees clean text with bracketed uncertainties and confidence markers
-2. **Machine-parseable**: HTML comments contain structured metadata that scripts/AI can extract
-3. **Refinement-friendly**: Each uncertain region carries enough context for a future AI to make a better guess without seeing the original image
-4. **Strippable**: Confident text stands alone if all tags are removed
+1. **Human-readable**: A person reading the output sees clean text with bracketed guesses and confidence markers
+2. **Machine-parseable**: Tags contain structured metadata that scripts/AI can extract
+3. **Refinement-friendly**: Each uncertain region carries enough data for a future AI to make a better guess without seeing the original image
+4. **Always guessing**: Every unreadable region gets a best-guess prediction, even if speculative. No text is left blank.
+5. **Strippable**: Confident text stands alone if all tags are removed; guesses in brackets read naturally
 
 ---
 
 ## Tag Types
 
-### 1. Gap Marker (Pass 1-2, unfilled)
+### 1. Gap Marker (unresolved — best guess but low confidence)
 
-Used during Pass 1 and Pass 2 before infill. Marks a region that could not be read.
+Used when text could not be read with confidence. **Every gap MUST include:**
+- An estimated character count (`est`)
+- A best-guess prediction in square brackets, even if speculative
 
+The guess appears in square brackets inside the tag so the text reads naturally even before refinement.
+
+**Basic gap (Pass 1):**
 ```
-{{gap|est=NN}}
+{{ gap | est=NN [best guess] }}
 ```
 
-**Enriched version (after Pass 2):**
+**Enriched gap (after Pass 2, with visible fragments):**
 ```
-{{gap|est=NN|fragments="partial_text"|context="description"}}
+{{ gap | est=NN | fragments="partial_text" [best guess] }}
+```
+
+**Unresolved gap (after Pass 3, cross-referenced but still uncertain):**
+```
+{{ gap | est=NN | fragments="partial_text" | status=unresolved [best guess] }}
 ```
 
 **Fields:**
 - `est` (required): Estimated character count of missing text
 - `fragments` (optional): Any partial letterforms visible, as best-guess Latin characters
-- `context` (optional): Free-text note on what kind of word/phrase is expected
+- `status` (optional): `unresolved` marks gaps that survived all three passes
+- `[best guess]` (required): Always present. The current best prediction of what the text says, in square brackets. Use context, fragments, article topic, and 1890s German knowledge to produce this. Even a wild guess is better than nothing — future passes can improve it.
 
-**Example:**
+**Examples:**
 ```
-Die {{gap|est=18|fragments="Verfa...ung"|context="noun, likely 'Verfassung' or 'Versammlung'"}} wurde gestern abgehalten.
+Die {{ gap | est=12 | fragments="Verfa...ung" [Verfassung] }} wurde gestern abgehalten.
+
+Der Bürgermeister {{ gap | est=22 | fragments="Ber...lung" | status=unresolved [Versammlung] }} erklärte seine Absicht.
+
+Im {{ gap | est=8 [Gasthof] }} an der Hauptstraße fand die Sitzung statt.
 ```
+
+**IMPORTANT:** `[unleserlich]` is deprecated. Never use it. Every gap gets a best guess, no matter how speculative. If you truly have zero fragments and zero context, guess based on the article topic, surrounding sentence structure, and common 1890s German newspaper phrases. Mark such guesses with `status=unresolved` so future passes know to revisit.
 
 ---
 
-### 2. Infill Tag (Pass 3, filled)
+### 2. Infill Tag (filled with confidence)
 
-Replaces a gap marker after cross-referencing with ABBYY OCR and context.
+Replaces a gap marker after cross-referencing with ABBYY OCR and context. Used when you have enough evidence to assign a confidence level.
 
 **Inline display format:**
 ```
@@ -51,15 +69,15 @@ Replaces a gap marker after cross-referencing with ABBYY OCR and context.
 
 **Full metadata (HTML comment, immediately follows the inline display):**
 ```
-<!-- {{infill|est=NN|confidence=LEVEL|region_ocr="raw_text"|guess="clean_text"|notes="free_text"}} -->
+<!-- {{ infill | est=NN | confidence=LEVEL | region_ocr="raw_text" | guess="clean_text" | notes="free_text" }} -->
 ```
 
 **Fields:**
-- `est` (required): Character count estimate from Pass 2
+- `est` (required): Character count estimate
 - `confidence` (required): `HIGH`, `MED`, `LOW`, or `VLOW`
 - `region_ocr` (required): The raw ABBYY OCR text for this region, exactly as it appears in the source — garbled and all. This is the most critical field for future refinement.
 - `guess` (required): The clean reconstructed text (same as what appears in brackets)
-- `notes` (optional): Free-text notes on reasoning, alternative readings, or flags for future review
+- `notes` (optional): Free-text notes on reasoning, alternative readings considered
 
 **Confidence Definitions:**
 
@@ -72,8 +90,10 @@ Replaces a gap marker after cross-referencing with ABBYY OCR and context.
 
 **Example:**
 ```
-Die [Versammlung]^MED^ <!-- {{infill|est=18|confidence=MED|region_ocr="Bcrfamm"|guess="Versammlung"|notes="ABBYY has Bcr=Ver, famm=samml, likely Versammlung from context"}} --> wurde gestern abgehalten.
+Die [Versammlung]^MED^ <!-- {{ infill | est=18 | confidence=MED | region_ocr="Bcrfamm" | guess="Versammlung" | notes="ABBYY has Bcr=Ver, famm=samml" }} --> wurde gestern abgehalten.
 ```
+
+**Distinction between gap and infill:** A `gap` is a region where you're not confident enough to assign a formal confidence level — the guess is there for readability and as a starting point for future passes. An `infill` is a region where you've done the cross-referencing work and can defend the guess with evidence and a confidence rating.
 
 ---
 
@@ -82,7 +102,7 @@ Die [Versammlung]^MED^ <!-- {{infill|est=18|confidence=MED|region_ocr="Bcrfamm"|
 When you correct a word that was readable but clearly wrong (e.g., obvious Fraktur swap where you're confident of the fix), optionally tag it:
 
 ```
-corrected_word <!-- {{corrected|original="ocr_reading"|rule="fraktur_bd_swap"}} -->
+corrected_word <!-- {{ corrected | original="ocr_reading" | rule="fraktur_bd_swap" }} -->
 ```
 
 This is optional for common Tier 1 swaps (d/b, f/s) — those are so pervasive that tagging every instance would be noise. Use correction tags for:
@@ -97,7 +117,7 @@ This is optional for common Tier 1 swaps (d/b, f/s) — those are so pervasive t
 When you detect that OCR has interleaved columns, mark the boundaries:
 
 ```
-<!-- {{column_break|from=N|to=M}} -->
+<!-- {{ column_break | from=N | to=M }} -->
 ```
 
 Where N and M are column numbers (1 = leftmost).
@@ -109,7 +129,7 @@ Where N and M are column numbers (1 = leftmost).
 Mark where articles begin and end for structural metadata:
 
 ```
-<!-- {{article|type="TYPE"|dateline="CITY, DATE"|topic="brief description"}} -->
+<!-- {{ article | type="TYPE" | dateline="CITY, DATE" | topic="brief description" }} -->
 ```
 
 **Types:** `international`, `national`, `texas`, `local`, `program`, `advertisement`, `editorial`, `obituary`
@@ -137,17 +157,17 @@ Mark where articles begin and end for structural metadata:
 - Characters infilled at MED: 1480 (8%)
 - Characters infilled at LOW: 925 (5%)
 - Characters infilled at VLOW: 370 (2%)
-- Characters unrecoverable: 555 (3%)
+- Characters in unresolved gaps: 555 (3%)
 
 ---
 
-<!-- {{article|type="program"|dateline="Bellville"|topic="Deutscher Tag festival program Oct 6"}} -->
+<!-- {{ article | type="program" | dateline="Bellville" | topic="Deutscher Tag festival program Oct 6" }} -->
 
 ## Der Deutsche Tag!
 
 ### Große Feier
 
-des Ehrentages der Deutschen am [sechsten Oktober]^MED^ <!-- {{infill|est=16|confidence=MED|region_ocr=""|guess="sechsten Oktober"|notes="date matches program header 'am 6. Oktober' below"}} --> in Austin County.
+des Ehrentages der Deutschen am [sechsten Oktober]^MED^ <!-- {{ infill | est=16 | confidence=MED | region_ocr="" | guess="sechsten Oktober" | notes="date matches program header 'am 6. Oktober' below" }} --> in Austin County.
 
 ### Bellville
 
@@ -157,17 +177,19 @@ veranstaltet von den deutschen Vereinen in Austin County.
 
 ### PROGRAMM:
 
-Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend [aus]^HIGH^ <!-- {{infill|est=3|confidence=HIGH|region_ocr=""|guess="aus"|notes="grammatically required after 'bestehend'"}} -->
+Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend [aus]^HIGH^ <!-- {{ infill | est=3 | confidence=HIGH | region_ocr="" | guess="aus" | notes="grammatically required after 'bestehend'" }} -->
 
 ### geschmückten Wagen,
 
-darstellend Begebenheiten aus der deutschen Geschichte, oder der [verschiedenen Nationalitäten]^LOW^ <!-- {{infill|est=30|confidence=LOW|region_ocr="cidrd"|guess="verschiedenen Nationalitäten"|notes="ABBYY fragment 'cidrd' unclear, context suggests parade theme descriptions"}} -->
+darstellend Begebenheiten aus der deutschen Geschichte, oder der {{ gap | est=30 | fragments="cidrd" | status=unresolved [verschiedenen Nationalitäten] }}
 
 ---
 
-<!-- {{article|type="texas"|dateline="Fort Worth, 13. Sept."|topic="Dry goods store burglary"}} -->
+<!-- {{ article | type="texas" | dateline="Fort Worth, 13. Sept." | topic="Dry goods store burglary" }} -->
 
-**Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry [Goods]^HIGH^ <!-- {{infill|est=5|confidence=HIGH|region_ocr="Try"|guess="Goods"|notes="ABBYY 'Try' is T/D swap + r/o noise = 'Dry'; 'Goods' follows naturally as business name"}} --> Haus, Ecke 14 u. Main Str. an der Arbeit wären.
+**Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry [Goods]^HIGH^ <!-- {{ infill | est=5 | confidence=HIGH | region_ocr="Try" | guess="Goods" | notes="ABBYY 'Try' is T/D swap + r/o noise = 'Dry'; 'Goods' follows naturally" }} --> Haus, Ecke 14 u. Main Str. an der Arbeit wären.
+
+Die {{ gap | est=15 [Polizeibeamten] }} kamen sofort zur Stelle.
 ```
 
 ---
@@ -177,30 +199,30 @@ darstellend Begebenheiten aus der deutschen Geschichte, oder der [verschiedenen 
 For programmatic extraction, tags follow these regex patterns:
 
 ```
-# Gap markers (unfilled)
-\{\{gap\|est=(\d+)(?:\|fragments="([^"]*)")?(?:\|context="([^"]*)")?\}\}
+# Gap markers (with best guess in brackets)
+\{\{\s*gap\s*\|\s*est=(\d+)(?:\s*\|\s*fragments="([^"]*)")?(?:\s*\|\s*status=(\w+))?\s*\[([^\]]*)\]\s*\}\}
 
 # Infill markers (in HTML comments)
-\{\{infill\|est=(\d+)\|confidence=(HIGH|MED|LOW|VLOW)\|region_ocr="([^"]*)"\|guess="([^"]*)"(?:\|notes="([^"]*)")?\}\}
+\{\{\s*infill\s*\|\s*est=(\d+)\s*\|\s*confidence=(HIGH|MED|LOW|VLOW)\s*\|\s*region_ocr="([^"]*)"\s*\|\s*guess="([^"]*)"(?:\s*\|\s*notes="([^"]*)")?\s*\}\}
 
 # Inline display
 \[([^\]]+)\]\^(HIGH|MED|LOW|VLOW)\^
 
 # Correction markers
-\{\{corrected\|original="([^"]*)"\|rule="([^"]*)"\}\}
+\{\{\s*corrected\s*\|\s*original="([^"]*)"\s*\|\s*rule="([^"]*)"\s*\}\}
 ```
 
 ## Refinement Workflow
 
 To refine tagged output in a future pass:
 
-1. Extract all `{{infill}}` tags with `confidence=LOW` or `confidence=VLOW`
+1. Extract all `{{ gap }}` tags and `{{ infill }}` tags with `confidence=LOW` or `confidence=VLOW`
 2. For each, provide the future AI with:
-   - The `region_ocr` field (raw ABBYY text)
-   - The surrounding sentence context (±50 characters each side)
-   - The current `guess`
-   - Any `notes`
-3. The future AI can propose a new guess with updated confidence
+   - The `region_ocr` field (raw ABBYY text) if available
+   - The `fragments` field if available
+   - The surrounding sentence (±50 characters each side)
+   - The current guess (from `[brackets]` or `guess=` field)
+3. The future AI proposes a new guess with updated confidence
 4. Replace the tag in place, preserving the original `region_ocr` for audit trail
 
 This allows iterative refinement without re-reading the source image.
