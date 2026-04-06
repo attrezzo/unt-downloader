@@ -132,7 +132,8 @@ EST_INPUT_TOKENS_PASS12  = 15_000  # image (~1MB) + system prompt + OCR text
 EST_OUTPUT_TOKENS_PASS12 = 5_000   # full page text with gap markers
 EST_INPUT_TOKENS_PASS3   = 21_000  # Pass 1-2 output + OCR + system prompt
 EST_OUTPUT_TOKENS_PASS3  = 7_000   # full text with gap analysis + resolution
-MAX_OUTPUT_TOKENS        = 16_000
+MAX_OUTPUT_TOKENS        = 32_000
+MAX_OUTPUT_TOKENS_RETRY  = 64_000  # retry limit for truncated responses
 
 PRELOAD_LOG_NAME = "preload_failures.json"
 
@@ -877,6 +878,10 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
                                   f"{usage['input_tokens']}", level=5)
 
             elif etype == "message_delta":
+                delta = event.get("delta", {})
+                sr = delta.get("stop_reason")
+                if sr:
+                    usage["stop_reason"] = sr
                 u = event.get("usage", {})
                 if u:
                     usage["output_tokens"] = u.get("output_tokens", 0)
@@ -960,6 +965,7 @@ def claude_api_call(payload: dict, api_key: str,
             else:
                 result = _claude_call_standard(req_data, api_key)
                 usage = result.get("usage", {})
+                usage["stop_reason"] = result.get("stop_reason", "end_turn")
                 text = ""
                 for block in result.get("content", []):
                     if block.get("type") == "text":
@@ -1356,7 +1362,7 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     log_event(f"p{page_num:02d} pass 1-2", worker=wid)
     p_label = f"{wid} pass1-2"
     try:
-        pass12_raw, _ = claude_api_call(
+        pass12_raw, p12_usage = claude_api_call(
             {"model": MODEL_INITIAL, "max_tokens": MAX_OUTPUT_TOKENS,
              "system": pass12_prompt,
              "messages": [{"role": "user", "content": content}]},
@@ -1368,6 +1374,27 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
                 "status": "failed", "error": str(e)}
     if _dashboard:
         _dashboard.step()
+
+    # Detect truncation on pass 1-2 and retry with higher limit
+    if p12_usage.get("stop_reason") == "max_tokens":
+        log_event(f"p{page_num:02d} pass 1-2 TRUNCATED at {MAX_OUTPUT_TOKENS} "
+                  f"tokens — retrying with {MAX_OUTPUT_TOKENS_RETRY}", "warn",
+                  worker=wid)
+        try:
+            pass12_raw, p12_usage = claude_api_call(
+                {"model": MODEL_INITIAL, "max_tokens": MAX_OUTPUT_TOKENS_RETRY,
+                 "system": pass12_prompt,
+                 "messages": [{"role": "user", "content": content}]},
+                api_key, rate_limiter, est_tokens=est,
+                cost_tracker=cost_tracker, label=f"{wid} pass1-2-retry")
+        except Exception as e:
+            log_event(f"p{page_num:02d} pass 1-2 retry FAILED: {e}", "error",
+                      worker=wid)
+        if _dashboard:
+            _dashboard.step()
+        if p12_usage.get("stop_reason") == "max_tokens":
+            log_event(f"p{page_num:02d} pass 1-2 STILL TRUNCATED after retry",
+                      "warn", worker=wid)
 
     if not pass12_raw.strip():
         log_event(f"p{page_num:02d} pass 1-2 empty response", "error", worker=wid)
@@ -1391,7 +1418,7 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     log_event(f"p{page_num:02d} pass 3", worker=wid)
     p3_label = f"{wid} pass3"
     try:
-        raw, _ = claude_api_call(
+        raw, p3_usage = claude_api_call(
             {"model": MODEL_RESOLVE, "max_tokens": MAX_OUTPUT_TOKENS,
              "system": pass3_prompt,
              "messages": [{"role": "user", "content": pass3_user}]},
@@ -1400,8 +1427,32 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     except Exception as e:
         log_event(f"p{page_num:02d} pass 3 FAILED (using pass 1-2)", "error", worker=wid)
         raw = pass12_raw
+        p3_usage = {}
     if _dashboard:
         _dashboard.step()
+
+    # Detect truncation on pass 3 and retry with higher limit
+    if p3_usage.get("stop_reason") == "max_tokens":
+        log_event(f"p{page_num:02d} pass 3 TRUNCATED at {MAX_OUTPUT_TOKENS} "
+                  f"tokens — retrying with {MAX_OUTPUT_TOKENS_RETRY}", "warn",
+                  worker=wid)
+        try:
+            raw, p3_usage = claude_api_call(
+                {"model": MODEL_RESOLVE, "max_tokens": MAX_OUTPUT_TOKENS_RETRY,
+                 "system": pass3_prompt,
+                 "messages": [{"role": "user", "content": pass3_user}]},
+                api_key, rate_limiter, est_tokens=EST_INPUT_TOKENS_PASS3,
+                cost_tracker=cost_tracker, label=f"{wid} pass3-retry")
+        except Exception as e:
+            log_event(f"p{page_num:02d} pass 3 retry FAILED (using pass 1-2)",
+                      "error", worker=wid)
+            raw = pass12_raw
+            p3_usage = {}
+        if _dashboard:
+            _dashboard.step()
+        if p3_usage.get("stop_reason") == "max_tokens":
+            log_event(f"p{page_num:02d} pass 3 STILL TRUNCATED after retry "
+                      f"— output may be incomplete", "warn", worker=wid)
 
     if not raw.strip():
         raw = pass12_raw
