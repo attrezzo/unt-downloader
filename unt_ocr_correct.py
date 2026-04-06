@@ -162,11 +162,16 @@ _dashboard = None
 
 
 class WorkerDashboard:
-    """Thread-safe per-worker status display. Redraws in-place."""
+    """Thread-safe per-worker status display for PowerShell-compatible output.
+
+    Workers are identified by slot (w1, w2, w3) — not by page number.
+    Progress bar prints only when the completed count changes.
+    Full dashboard block prints on force=True (page completion milestones).
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._workers = {}       # worker_id -> {current, history, t_start}
+        self._workers = {}       # worker_id -> {current, t_start}
         self._completed = 0
         self._errors = 0
         self._skipped = 0
@@ -174,11 +179,8 @@ class WorkerDashboard:
         self._total_pages = 0
         self._cost_tracker = None
         self._rate_limiter = None
-        self._issue_label = ""
-        self._total_in_tok = 0
-        self._total_out_tok = 0
         self._last_render = 0
-        self._render_lines = 0
+        self._last_progress_count = -1  # track when count changes
 
     def set_context(self, total_pages=0, cost_tracker=None,
                     rate_limiter=None, issue_label=""):
@@ -189,20 +191,14 @@ class WorkerDashboard:
                 self._cost_tracker = cost_tracker
             if rate_limiter:
                 self._rate_limiter = rate_limiter
-            if issue_label:
-                self._issue_label = issue_label
 
     def update(self, worker_id: str, msg: str, status: str = "info"):
         """Update a worker's current state."""
         with self._lock:
             if worker_id not in self._workers:
                 self._workers[worker_id] = {
-                    "current": "", "history": deque(maxlen=3),
-                    "t_start": time.monotonic()}
+                    "current": "", "t_start": time.monotonic()}
             w = self._workers[worker_id]
-            # Push current to history (skip if it's a streaming update)
-            if w["current"] and "generating" not in msg:
-                w["history"].appendleft(w["current"])
             w["current"] = msg
             w["t_start"] = time.monotonic()
             if status == "ok":
@@ -213,12 +209,13 @@ class WorkerDashboard:
                 self._skipped += 1
 
     def render(self, force=False):
-        """Redraw the dashboard.
+        """Render dashboard output.
 
-        force=True  → full dashboard (progress + cost + rate + workers).
-                      Used on page completion milestones.
-        force=False → progress bar only, overwritten in-place via \\r.
-                      Throttled to every 2s.
+        force=True  → full block (progress + cost + workers). Page milestones.
+        force=False → progress bar line, throttled to 2s.
+
+        An empty line is always printed first so that PowerShell's
+        tendency to repeat the first line of output is harmless.
         """
         now = time.monotonic()
         if not force and (now - self._last_render) < 2.0:
@@ -228,20 +225,10 @@ class WorkerDashboard:
             if force:
                 lines = self._build_lines(now)
             else:
-                # Lightweight: just the progress bar on one line via \r
-                lines = None
-                bar_line = self._build_progress_line(now)
+                lines = [self._build_progress_line(now)]
 
-        if force:
-            # End the \r progress line before printing full block
-            sys.stdout.write("\r" + " " * 80 + "\r")
-            output = "\n".join(lines)
-            sys.stdout.write(output + "\n")
-            sys.stdout.flush()
-        else:
-            # Overwrite single line in place
-            sys.stdout.write("\r" + bar_line)
-            sys.stdout.flush()
+        # Empty line first — PowerShell may repeat it, which is fine
+        print("\n" + "\n".join(lines), flush=True)
 
     def _fmt_time(self, secs):
         if secs < 60:
@@ -250,7 +237,6 @@ class WorkerDashboard:
         return f"{m}m {s:02d}s"
 
     def _build_progress_line(self, now):
-        """Single-line progress bar for \r overwrite."""
         elapsed = now - self._start_time
         done = self._completed + self._errors + self._skipped
         total = max(self._total_pages, 1)
@@ -264,19 +250,17 @@ class WorkerDashboard:
             eta_str = f"ETA {self._fmt_time(remaining)}"
         else:
             eta_str = self._fmt_time(elapsed)
-        # Pad to 80 chars to overwrite previous content
-        line = f"  [{bar}] {done}/{total} ({pct:.0f}%)  {eta_str}"
-        return line.ljust(80)
+        return f"  [{bar}] {done}/{total} ({pct:.0f}%)  {eta_str}"
 
     def _build_lines(self, now):
         lines = []
-        elapsed = now - self._start_time
 
-        # ── Progress bar + stats ──────────────────────────────────
-        lines.append(self._build_progress_line(now).rstrip())
+        # ── Progress bar ──────────────────────────────────────────
+        lines.append(self._build_progress_line(now))
         lines.append("")
 
         # ── Cost + tokens ─────────────────────────────────────────
+        elapsed = now - self._start_time
         ct = self._cost_tracker
         if ct:
             cost_str = f"${ct.total_cost:.2f}"
@@ -313,20 +297,14 @@ class WorkerDashboard:
         for wid in sorted(self._workers.keys()):
             w = self._workers[wid]
             age = now - w["t_start"]
-            age_str = f"[{age:.0f}s]" if age >= 1 else ""
-            lines.append(f"  > {wid:<6} {w['current']:<50} {age_str}")
-            for old in w["history"]:
-                if "waiting for rate limiter" in old:
-                    continue
-                lines.append(f"    {'':6} {old}")
+            age_str = f"{age:.0f}s" if age >= 1 else ""
+            lines.append(f"  {wid:<4} {w['current']:<55} {age_str}")
 
         lines.append("")
         return lines
 
     def final_summary(self):
         """Print final summary."""
-        # Clear the \r progress line
-        sys.stdout.write("\r" + " " * 80 + "\r")
         elapsed = time.monotonic() - self._start_time
         ct = self._cost_tracker
         cost_str = f"  Cost: ${ct.total_cost:.2f}" if ct else ""
@@ -884,12 +862,10 @@ def claude_api_call(payload: dict, api_key: str,
 
     if rate_limiter:
         t_wait = time.monotonic()
-        if label:
-            log_event(f"{label} waiting for rate limiter...", worker=wid)
         rate_limiter.acquire(estimated_tokens=est_tokens)
         waited = time.monotonic() - t_wait
-        if waited > 1.0 and label:
-            log_event(f"{label} rate limiter wait: {waited:.0f}s", worker=wid)
+        if waited > 3.0 and label:
+            log_event(f"{label} rate-limited {waited:.0f}s", worker=wid)
 
     for attempt in range(1, 4):
         t0 = time.monotonic()
@@ -1200,7 +1176,7 @@ def build_page_prompt(ark_id: str, page_num: int, total_pages: int,
 
 def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
                  pass12_prompt, pass3_prompt, api_key,
-                 rate_limiter=None, cost_tracker=None):
+                 rate_limiter=None, cost_tracker=None, worker_slot=""):
     """
     Correct a single page using tiered Claude models.
 
@@ -1211,6 +1187,7 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 
     Returns dict: text, markdown, stats, status.
     """
+    wid = worker_slot or f"p{page_num:02d}"
     abbyy_text = get_abbyy_page_text(issue_fname, page_num)
     portal_ocr = get_portal_ocr_text(issue_fname, page_num)
 
@@ -1225,7 +1202,8 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 
     est = EST_INPUT_TOKENS_PASS12 if has_image else 5_000
 
-    p_label = f"p{page_num:02d} pass1-2"
+    log_event(f"p{page_num:02d} pass 1-2", worker=wid)
+    p_label = f"{wid} pass1-2"
     try:
         pass12_raw, _ = claude_api_call(
             {"model": MODEL_INITIAL, "max_tokens": MAX_OUTPUT_TOKENS,
@@ -1234,14 +1212,12 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
             api_key, rate_limiter, est_tokens=est,
             cost_tracker=cost_tracker, label=p_label)
     except Exception as e:
-        log_event(f"pass 1-2 FAILED  {e}", "error",
-                  worker=f"p{page_num:02d}")
+        log_event(f"p{page_num:02d} pass 1-2 FAILED: {e}", "error", worker=wid)
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": str(e)}
 
     if not pass12_raw.strip():
-        log_event(f"pass 1-2 empty response", "error",
-                  worker=f"p{page_num:02d}")
+        log_event(f"p{page_num:02d} pass 1-2 empty response", "error", worker=wid)
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": "empty pass 1-2 response"}
 
@@ -1259,7 +1235,8 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
         "Resolve all gaps: add [guess], cnf, region_ocr. "
         "Promote cnf >= 0.95 to plain text.")
 
-    p3_label = f"p{page_num:02d} pass3"
+    log_event(f"p{page_num:02d} pass 3", worker=wid)
+    p3_label = f"{wid} pass3"
     try:
         raw, _ = claude_api_call(
             {"model": MODEL_RESOLVE, "max_tokens": MAX_OUTPUT_TOKENS,
@@ -1268,8 +1245,7 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
             api_key, rate_limiter, est_tokens=EST_INPUT_TOKENS_PASS3,
             cost_tracker=cost_tracker, label=p3_label)
     except Exception as e:
-        log_event(f"pass 3 FAILED  {e} (using pass 1-2)",
-                  "error", worker=f"p{page_num:02d}")
+        log_event(f"p{page_num:02d} pass 3 FAILED (using pass 1-2)", "error", worker=wid)
         raw = pass12_raw
 
     if not raw.strip():
@@ -1813,16 +1789,27 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     if not pages_todo:
         tprint(f"  All pages already corrected", worker=worker_id, level=1)
     else:
+        # Worker slot pool: w1, w2, w3 etc. Reused as pages complete.
+        _slot_lock = threading.Lock()
+        _free_slots = list(range(api_workers, 0, -1))  # [3,2,1] → pop gives 1,2,3
+
         def _correct_one(pg):
             """Correct a single page (runs in thread pool)."""
             if _interrupted:
                 return pg, {"status": "interrupted", "text": ""}
             if cost_tracker and cost_tracker.would_exceed_budget():
                 return pg, {"status": "budget", "text": ""}
-            result = correct_page(
-                ark_id, pg, actual_pages, newspaper, date, fname,
-                pass12_prompt, pass3_prompt, api_key,
-                rate_limiter, cost_tracker)
+            with _slot_lock:
+                slot = _free_slots.pop() if _free_slots else pg
+            wid = f"w{slot}"
+            try:
+                result = correct_page(
+                    ark_id, pg, actual_pages, newspaper, date, fname,
+                    pass12_prompt, pass3_prompt, api_key,
+                    rate_limiter, cost_tracker, worker_slot=wid)
+            finally:
+                with _slot_lock:
+                    _free_slots.append(slot)
             return pg, result
 
         pages_done = 0
@@ -1832,7 +1819,7 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
 
         for pg, result in page_results:
             if isinstance(result, Exception):
-                log_event(f"p{pg:02d} {ark_id}  {result}", "error")
+                log_event(f"p{pg:02d} FAILED: {result}", "error")
                 corrected_pages[pg] = (
                     f"[CORRECTION FAILED: {result}]")
                 continue
@@ -1840,23 +1827,19 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
             _, res = result
             pages_done += 1
             page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
-            wid = f"p{pg:02d}"
             if res["status"] == "ok":
                 corrected_pages[pg] = res["text"]
                 page_md_path.write_text(
                     res["markdown"], encoding="utf-8")
-                log_event(f"COMPLETE {ark_id} "
-                          f"{len(res['text'])} chars", "ok",
-                          worker=wid)
+                log_event(f"p{pg:02d} done  {len(res['text'])} chars",
+                          "ok")
             elif res["status"] == "no_image":
-                log_event(f"{ark_id} no image", "skip", worker=wid)
-                corrected_pages[pg] = ""
+                log_event(f"p{pg:02d} no image", "skip")
             elif res["status"] in ("budget", "interrupted"):
-                log_event(f"{ark_id} {res['status']}", "skip",
-                          worker=wid)
+                log_event(f"p{pg:02d} {res['status']}", "skip")
             else:
-                log_event(f"{ark_id} {res.get('error', 'unknown')}",
-                          "error", worker=wid)
+                log_event(f"p{pg:02d} {res.get('error', 'unknown')}",
+                          "error")
                 corrected_pages[pg] = (
                     f"[CORRECTION FAILED: "
                     f"{res.get('error', 'unknown')}]")
