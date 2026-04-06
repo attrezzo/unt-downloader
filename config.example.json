@@ -2,5 +2,5 @@
   "anthropic_api_key": "YOUR_ANTHROPIC_API_KEY",
   "claude_model": "claude-sonnet-4-6",
   "tier": "default",
-  "skill_path": "fraktur-ocr skill"
+  "skill_path": "initial-ocr skill"
 }
