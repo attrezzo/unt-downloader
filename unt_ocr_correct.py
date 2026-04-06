@@ -189,11 +189,13 @@ class WorkerDashboard:
         self._last_render = 0
 
     def set_context(self, total_pages=0, cost_tracker=None,
-                    rate_limiter=None, issue_label=""):
+                    rate_limiter=None, issue_label="",
+                    steps_per_page=None):
         with self._lock:
             if total_pages:
                 self._total_pages = total_pages
-                self._total_steps = total_pages * self.STEPS_PER_PAGE
+                spp = steps_per_page if steps_per_page else self.STEPS_PER_PAGE
+                self._total_steps = total_pages * spp
             if cost_tracker:
                 self._cost_tracker = cost_tracker
         self._do_render()
@@ -2201,6 +2203,12 @@ def _refine_text_page(page_file, cnf_min, cnf_max, include_resolved,
                 and (g["fragments"] or g["region_ocr"])]
 
     if not eligible:
+        if gaps:
+            cnf_vals = [f"{g['cnf']:.2f}" for g in gaps[:5]]
+            tprint(f"  {page_file.parent.name}/{page_file.name}: "
+                   f"{len(gaps)} gaps but 0 eligible "
+                   f"(cnf {cnf_min}-{cnf_max}, "
+                   f"sample: {', '.join(cnf_vals)})", level=1)
         return 0, 0, 0
 
     log_event(f"{page_file.parent.name}/{page_file.name}: "
@@ -2248,11 +2256,10 @@ def refine_text(issues, config, collection_dir, api_key,
                 cnf_min=0.0, cnf_max=0.79, include_resolved=False,
                 rate_limiter=None, cost_tracker=None, model=None,
                 api_workers=3):
-    """Text-only refinement pass across all matching gaps (parallelized)."""
+    """Text-only refinement pass across all matching gaps."""
     model = model or MODEL_RESOLVE
     prompt = build_text_refine_prompt()
 
-    # Collect all page files
     page_files = []
     for issue in issues:
         ai_dir = AI_OCR_DIR / issue["ark_id"]
@@ -2263,22 +2270,53 @@ def refine_text(issues, config, collection_dir, api_key,
         print("No ai_ocr/ pages found.")
         return 0
 
+    if _dashboard:
+        _dashboard.set_context(total_pages=len(page_files),
+                               cost_tracker=cost_tracker,
+                               steps_per_page=1)
+
     total_updated = total_promoted = total_unchanged = 0
+    pages_done = 0
 
-    def _run_text(pf):
-        return _refine_text_page(
-            pf, cnf_min, cnf_max, include_resolved,
-            model, prompt, api_key, rate_limiter, cost_tracker)
-
-    results = run_parallel(_run_text, page_files,
-                           max_workers=api_workers, label="pages")
-    for pf, res in results:
-        if isinstance(res, Exception):
-            continue
-        u, p, uc = res
-        total_updated += u
-        total_promoted += p
-        total_unchanged += uc
+    global _interrupted
+    ex = ThreadPoolExecutor(max_workers=api_workers)
+    futures = {
+        ex.submit(_refine_text_page, pf, cnf_min, cnf_max,
+                  include_resolved, model, prompt, api_key,
+                  rate_limiter, cost_tracker): pf
+        for pf in page_files
+    }
+    try:
+        while futures and not _interrupted:
+            done_batch = [f for f in futures if f.done()]
+            if not done_batch:
+                try:
+                    time.sleep(0.3)
+                except KeyboardInterrupt:
+                    _interrupted = True
+                    break
+                continue
+            for fut in done_batch:
+                pf = futures.pop(fut)
+                pages_done += 1
+                try:
+                    u, p, uc = fut.result(timeout=0)
+                except Exception:
+                    continue
+                total_updated += u
+                total_promoted += p
+                total_unchanged += uc
+                if _dashboard:
+                    _dashboard.page_done()
+                if cost_tracker:
+                    cost_tracker.record_page()
+                print_status(cost_tracker, progress_total=len(page_files))
+    except KeyboardInterrupt:
+        _interrupted = True
+    if _interrupted:
+        for f in futures:
+            f.cancel()
+    ex.shutdown(wait=False)
 
     print(f"\nText refinement: {total_promoted} promoted, "
           f"{total_updated} updated, {total_unchanged} unchanged")
@@ -2302,6 +2340,16 @@ def _refine_image_page(page_file, ark_id, cnf_min, cnf_max,
                          and g["cnf"] == 0.0)]
 
     if not eligible:
+        pg_match = re.search(r'page_(\d+)', page_file.stem)
+        pg_num = int(pg_match.group(1)) if pg_match else 0
+        if gaps:
+            cnf_vals = [f"{g['cnf']:.2f}" for g in gaps[:5]]
+            statuses = set(g["status"] for g in gaps if g["status"])
+            tprint(f"  {ark_id}/p{pg_num}: {len(gaps)} gaps but 0 eligible "
+                   f"(cnf range {cnf_min}-{cnf_max}, "
+                   f"sample cnf: {', '.join(cnf_vals)}"
+                   f"{', status: ' + ', '.join(statuses) if statuses else ''})",
+                   level=1)
         return 0, 0
 
     pg_match = re.search(r'page_(\d+)', page_file.stem)
@@ -2382,11 +2430,10 @@ def refine_image(issues, config, collection_dir, api_key,
                  cnf_min=0.01, cnf_max=0.60, include_resolved=False,
                  rate_limiter=None, cost_tracker=None, model=None,
                  api_workers=3):
-    """Image-assisted refinement with bbox cropping and batching (parallelized)."""
+    """Image-assisted refinement with bbox cropping and batching."""
     model = model or MODEL_REFINE
     prompt = build_image_refine_prompt()
 
-    # Collect all (page_file, ark_id) pairs
     page_items = []
     for issue in issues:
         ark_id = issue["ark_id"]
@@ -2399,22 +2446,52 @@ def refine_image(issues, config, collection_dir, api_key,
         print("No ai_ocr/ pages found.")
         return 0
 
+    if _dashboard:
+        _dashboard.set_context(total_pages=len(page_items),
+                               cost_tracker=cost_tracker,
+                               steps_per_page=1)
+
     total_updated = total_promoted = 0
+    pages_done = 0
 
-    def _run_img(item):
-        pf, aid = item
-        return _refine_image_page(
-            pf, aid, cnf_min, cnf_max, include_resolved,
-            model, prompt, api_key, rate_limiter, cost_tracker)
-
-    results = run_parallel(_run_img, page_items,
-                           max_workers=api_workers, label="pages")
-    for item, res in results:
-        if isinstance(res, Exception):
-            continue
-        u, p = res
-        total_updated += u
-        total_promoted += p
+    global _interrupted
+    ex = ThreadPoolExecutor(max_workers=api_workers)
+    futures = {
+        ex.submit(_refine_image_page, pf, aid, cnf_min, cnf_max,
+                  include_resolved, model, prompt, api_key,
+                  rate_limiter, cost_tracker): (pf, aid)
+        for pf, aid in page_items
+    }
+    try:
+        while futures and not _interrupted:
+            done_batch = [f for f in futures if f.done()]
+            if not done_batch:
+                try:
+                    time.sleep(0.3)
+                except KeyboardInterrupt:
+                    _interrupted = True
+                    break
+                continue
+            for fut in done_batch:
+                pf, aid = futures.pop(fut)
+                pages_done += 1
+                try:
+                    u, p = fut.result(timeout=0)
+                except Exception:
+                    continue
+                total_updated += u
+                total_promoted += p
+                if _dashboard:
+                    _dashboard.page_done()
+                if cost_tracker:
+                    cost_tracker.record_page()
+                print_status(cost_tracker, progress_total=len(page_items))
+    except KeyboardInterrupt:
+        _interrupted = True
+    if _interrupted:
+        for f in futures:
+            f.cancel()
+    ex.shutdown(wait=False)
 
     print(f"\nImage refinement: {total_promoted} promoted, "
           f"{total_updated} updated")
