@@ -1238,6 +1238,36 @@ def build_page_prompt(ark_id: str, page_num: int, total_pages: int,
 # PAGE CORRECTION — MAIN AI CALL
 # ============================================================================
 
+def _ensure_gap_cnf(text: str) -> str:
+    """Ensure every gap tag has a cnf score and [guess].
+
+    Pass 1-2 gaps: {{ gap | est=NN | imgbbox="x,y,w,h" }}
+    → adds cnf="0.50" and [?] if missing after pass 3.
+
+    Pass 3 gaps without cnf (Claude forgot):
+    → adds cnf="0.50".
+    """
+    # Pattern for gaps missing cnf entirely (no cnf= field before [guess])
+    text = re.sub(
+        r'(\{\{\s*gap\s*\|\s*est=\d+\s*\|\s*imgbbox="[^"]*")'
+        r'(\s*\|\s*fragments="[^"]*")?'
+        r'(\s*\|\s*region_ocr="[^"]*")?'
+        r'\s*\}\}',  # closes WITHOUT [guess]
+        r'\1 | cnf="0.50"\2\3 [?] }}',
+        text
+    )
+    # Pattern for gaps with [guess] but no cnf
+    text = re.sub(
+        r'(\{\{\s*gap\s*\|\s*est=\d+\s*\|\s*imgbbox="[^"]*")'
+        r'(?!\s*\|\s*cnf=)'  # negative lookahead: no cnf
+        r'(\s*(?:\|[^[]*)?)'  # optional other fields
+        r'(\[[^\]]*\]\s*\}\})',  # [guess] }}
+        r'\1 | cnf="0.50"\2\3',
+        text
+    )
+    return text
+
+
 def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
                  pass12_prompt, pass3_prompt, api_key,
                  rate_limiter=None, cost_tracker=None, worker_slot=""):
@@ -1318,6 +1348,9 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 
     if not raw.strip():
         raw = pass12_raw
+
+    # Safety net: ensure all gaps have cnf and [guess]
+    raw = _ensure_gap_cnf(raw)
 
     clean_text = extract_clean_text(raw)
     stats = extract_stats(raw)
@@ -2255,7 +2288,7 @@ def _refine_text_page(page_file, cnf_min, cnf_max, include_resolved,
 def refine_text(issues, config, collection_dir, api_key,
                 cnf_min=0.0, cnf_max=0.79, include_resolved=False,
                 rate_limiter=None, cost_tracker=None, model=None,
-                api_workers=3):
+                api_workers=3, page_filter=None):
     """Text-only refinement pass across all matching gaps."""
     model = model or MODEL_RESOLVE
     prompt = build_text_refine_prompt()
@@ -2265,6 +2298,10 @@ def refine_text(issues, config, collection_dir, api_key,
         ai_dir = AI_OCR_DIR / issue["ark_id"]
         if ai_dir.exists():
             page_files.extend(sorted(ai_dir.glob("page_*.md")))
+    if page_filter:
+        page_files = [pf for pf in page_files
+                      if int(re.search(r'page_(\d+)', pf.stem).group(1))
+                      in page_filter]
 
     if not page_files:
         print("No ai_ocr/ pages found.")
@@ -2429,7 +2466,7 @@ def _refine_image_page(page_file, ark_id, cnf_min, cnf_max,
 def refine_image(issues, config, collection_dir, api_key,
                  cnf_min=0.01, cnf_max=0.60, include_resolved=False,
                  rate_limiter=None, cost_tracker=None, model=None,
-                 api_workers=3):
+                 api_workers=3, page_filter=None):
     """Image-assisted refinement with bbox cropping and batching."""
     model = model or MODEL_REFINE
     prompt = build_image_refine_prompt()
@@ -2440,6 +2477,10 @@ def refine_image(issues, config, collection_dir, api_key,
         ai_dir = AI_OCR_DIR / ark_id
         if ai_dir.exists():
             for pf in sorted(ai_dir.glob("page_*.md")):
+                if page_filter:
+                    pg_m = re.search(r'page_(\d+)', pf.stem)
+                    if pg_m and int(pg_m.group(1)) not in page_filter:
+                        continue
                 page_items.append((pf, ark_id))
 
     if not page_items:
@@ -2496,6 +2537,206 @@ def refine_image(issues, config, collection_dir, api_key,
     print(f"\nImage refinement: {total_promoted} promoted, "
           f"{total_updated} updated")
     return total_promoted + total_updated
+
+
+# ---------------------------------------------------------------------------
+# FULL-PAGE REVIEW REFINEMENT
+# ---------------------------------------------------------------------------
+
+def build_full_review_prompt(config: dict) -> str:
+    """System prompt for full-page review. Sends entire image + ai_ocr text."""
+    header = _build_collection_header(config)
+    fraktur_errors = load_reference("fraktur-errors.md")
+    texas_german = load_reference("texas-german.md")
+
+    return f"""You are an expert OCR specialist for 19th-century German Fraktur
+newspaper text scanned from microfilm.
+
+{header}
+
+REFERENCE: FRAKTUR ERROR PATTERNS
+===================================
+{fraktur_errors}
+
+REFERENCE: TEXAS GERMAN VOCABULARY & ORTHOGRAPHY
+==================================================
+{texas_german}
+
+YOUR TASK: FULL-PAGE REVIEW AND CORRECTION
+=============================================
+
+You receive the FULL PAGE IMAGE and the current AI OCR transcription
+(with {{{{ gap }}}} markers). Review the ENTIRE transcription against the
+image — not just the gaps.
+
+INSTRUCTIONS:
+1. Read the full page image carefully, comparing against the provided text
+2. Fix any errors in the plain text (misspellings, wrong characters, missing
+   words, column interleaving)
+3. For each existing {{{{ gap }}}} tag:
+   - Re-examine the image at that location
+   - Update the guess and cnf if you can improve them
+   - Promote to plain text (remove gap tag) if cnf >= 0.95
+4. If you find NEW uncertain regions that should be gaps, add them with
+   proper {{{{ gap }}}} tags including est, imgbbox, cnf, fragments, region_ocr
+5. EVERY gap tag MUST have a cnf score and [guess]. No exceptions.
+6. Verify column boundaries — text in column 1 should not merge with column 2
+
+CRITICAL:
+- Transcribe EVERY word. Never summarize or describe text.
+- Preserve Texas German dialect, pre-1901 spellings, English loanwords
+- Do NOT translate
+- Large damaged regions: use gap tags with large est, not descriptions
+- The fragments field is character-level (use ~ for unreadable chars)
+
+OUTPUT: Return the COMPLETE corrected text in the same format as input.
+Include the LAYOUT/COLUMNS/DAMAGE header, --- delimiters, and STATS block.
+Update STATS to reflect any changes."""
+
+
+def _refine_full_page(page_file, ark_id, config, model, prompt,
+                      api_key, rate_limiter, cost_tracker):
+    """Full-page review of one page. Returns (changed: bool)."""
+    if _interrupted or (cost_tracker and cost_tracker.would_exceed_budget()):
+        return False
+
+    pg_match = re.search(r'page_(\d+)', page_file.stem)
+    if not pg_match:
+        return False
+    pg_num = int(pg_match.group(1))
+
+    text = page_file.read_text(encoding="utf-8")
+    img_bytes, img_type = fetch_page_image(ark_id, pg_num)
+    if not img_bytes:
+        tprint(f"  {ark_id}/p{pg_num}: no image, skipping", level=1)
+        return False
+
+    # Build content: image + current ai_ocr text
+    content = [
+        {"type": "image", "source": {
+            "type": "base64",
+            "media_type": img_type or "image/jpeg",
+            "data": base64.standard_b64encode(img_bytes).decode("ascii"),
+        }},
+        {"type": "text", "text": (
+            f"Current AI OCR transcription for page {pg_num}:\n"
+            f"```\n{text}\n```\n\n"
+            "Review and correct the full transcription against the image. "
+            "Return the complete corrected text."
+        )},
+    ]
+
+    label = f"p{pg_num:02d}"
+    log_event(f"p{pg_num:02d} full review", worker=label)
+
+    try:
+        result, _ = claude_api_call(
+            {"model": model, "max_tokens": MAX_OUTPUT_TOKENS,
+             "system": prompt,
+             "messages": [{"role": "user", "content": content}]},
+            api_key, rate_limiter,
+            est_tokens=EST_INPUT_TOKENS_PASS12 + 10_000,
+            cost_tracker=cost_tracker, label=label)
+    except Exception as e:
+        tprint(f"  {ark_id}/p{pg_num}: error: {e}", level=1)
+        return False
+
+    if result and result.strip() and result.strip() != text.strip():
+        page_file.write_text(result.strip() + "\n", encoding="utf-8")
+        log_event(f"p{pg_num:02d} updated  {len(result)} chars",
+                  worker=label)
+        return True
+    else:
+        log_event(f"p{pg_num:02d} unchanged", worker=label)
+        return False
+
+
+def refine_full(issues, config, collection_dir, api_key,
+                rate_limiter=None, cost_tracker=None, model=None,
+                api_workers=1, page_filter=None):
+    """Full-page review: sends complete image + ai_ocr to model."""
+    model = model or MODEL_REFINE
+    prompt = build_full_review_prompt(config)
+
+    page_items = []
+    for issue in issues:
+        ark_id = issue["ark_id"]
+        ai_dir = AI_OCR_DIR / ark_id
+        if ai_dir.exists():
+            for pf in sorted(ai_dir.glob("page_*.md")):
+                if page_filter:
+                    pg_m = re.search(r'page_(\d+)', pf.stem)
+                    if pg_m and int(pg_m.group(1)) not in page_filter:
+                        continue
+                page_items.append((pf, ark_id))
+
+    if not page_items:
+        print("No ai_ocr/ pages found.")
+        return 0
+
+    if _dashboard:
+        _dashboard.set_context(total_pages=len(page_items),
+                               cost_tracker=cost_tracker,
+                               steps_per_page=1)
+
+    changed_count = 0
+    global _interrupted
+    # Full review is expensive — default to serial (1 worker)
+    ex = ThreadPoolExecutor(max_workers=api_workers)
+    futures = {
+        ex.submit(_refine_full_page, pf, aid, config, model, prompt,
+                  api_key, rate_limiter, cost_tracker): (pf, aid)
+        for pf, aid in page_items
+    }
+    try:
+        while futures and not _interrupted:
+            done_batch = [f for f in futures if f.done()]
+            if not done_batch:
+                try:
+                    time.sleep(0.3)
+                except KeyboardInterrupt:
+                    _interrupted = True
+                    break
+                continue
+            for fut in done_batch:
+                pf, aid = futures.pop(fut)
+                try:
+                    changed = fut.result(timeout=0)
+                except Exception:
+                    changed = False
+                if changed:
+                    changed_count += 1
+                if _dashboard:
+                    _dashboard.page_done()
+                if cost_tracker:
+                    cost_tracker.record_page()
+                print_status(cost_tracker, progress_total=len(page_items))
+    except KeyboardInterrupt:
+        _interrupted = True
+    if _interrupted:
+        for f in futures:
+            f.cancel()
+    ex.shutdown(wait=False)
+
+    print(f"\nFull review: {changed_count}/{len(page_items)} pages updated")
+    return changed_count
+
+
+# ---------------------------------------------------------------------------
+# Page filtering helper for refinement
+# ---------------------------------------------------------------------------
+
+def _filter_page_items(page_items, page_filter):
+    """Filter (page_file, ...) tuples by page number."""
+    if not page_filter:
+        return page_items
+    filtered = []
+    for item in page_items:
+        pf = item[0] if isinstance(item, tuple) else item
+        pg_m = re.search(r'page_(\d+)', pf.stem)
+        if pg_m and int(pg_m.group(1)) in page_filter:
+            filtered.append(item)
+    return filtered
 
 
 # COMPILE — READABLE MARKDOWN OUTPUT
@@ -2985,14 +3226,22 @@ def main():
     p.add_argument("--refine-image",   action="store_true",
                    help="Image-assisted refinement of gaps using bbox "
                         "cropping (uses Opus by default)")
+    p.add_argument("--refine-full",    action="store_true",
+                   help="Full-page review: sends complete image + ai_ocr "
+                        "to Opus for comprehensive correction (not just gaps)")
     p.add_argument("--cnf-min",        type=float, default=None,
                    help="Minimum cnf for refinement (default: 0.0 text, "
                         "0.01 image)")
     p.add_argument("--cnf-max",        type=float, default=None,
                    help="Maximum cnf for refinement (default: 0.79 text, "
                         "0.60 image)")
+    p.add_argument("--all-gaps",       action="store_true",
+                   help="Refine ALL gaps (cnf 0-1, include resolved)")
     p.add_argument("--include-resolved", action="store_true",
                    help="Include auto-resolved gaps in refinement")
+    p.add_argument("--page",           type=int, action="append", default=None,
+                   help="Refine specific page(s) only (repeatable: "
+                        "--page 1 --page 3)")
     p.add_argument("--budget",         type=float, default=None,
                    help="Max dollar amount to spend (stops before exceeding)")
     p.add_argument("--model-initial",  default=None,
@@ -3116,10 +3365,17 @@ def main():
                     resume=not args.force)
         return
 
-    if args.refine_text or args.refine_image:
+    if args.refine_text or args.refine_image or getattr(args, 'refine_full', False):
         effective_workers = 1 if args.serial else args.api_workers
         rate_limiter = (limiter_from_tier(args.tier)
                         if ClaudeRateLimiter else None)
+        page_filter = set(args.page) if args.page else None
+
+        # --all-gaps overrides cnf range and include-resolved
+        if getattr(args, 'all_gaps', False):
+            args.cnf_min = 0.0
+            args.cnf_max = 1.0
+            args.include_resolved = True
 
         # Let user change models before refinement
         if not args.skip_estimate:
@@ -3165,7 +3421,8 @@ def main():
                                 rate_limiter=rate_limiter,
                                 cost_tracker=cost_tracker,
                                 model=model,
-                                api_workers=effective_workers)
+                                api_workers=effective_workers,
+                                page_filter=page_filter)
                     print(f"  {cost_tracker.summary()}")
 
         if args.refine_image:
@@ -3205,7 +3462,47 @@ def main():
                                  rate_limiter=rate_limiter,
                                  cost_tracker=cost_tracker,
                                  model=model,
-                                 api_workers=effective_workers)
+                                 api_workers=effective_workers,
+                                 page_filter=page_filter)
+                    print(f"  {cost_tracker.summary()}")
+
+        if getattr(args, 'refine_full', False):
+            model = args.model_refine or MODEL_REFINE
+
+            # Count pages
+            total_pages = 0
+            for issue in issues:
+                ai_dir = AI_OCR_DIR / issue["ark_id"]
+                if ai_dir.exists():
+                    for pf in sorted(ai_dir.glob("page_*.md")):
+                        if page_filter:
+                            pg_m = re.search(r'page_(\d+)', pf.stem)
+                            if pg_m and int(pg_m.group(1)) not in page_filter:
+                                continue
+                        total_pages += 1
+
+            print(f"\nFull review: {total_pages} pages (model: {model})")
+
+            if total_pages == 0:
+                print("  No pages to review.")
+            else:
+                if not args.skip_estimate:
+                    est, _ = show_cost_estimate(
+                        "FULL-PAGE REVIEW", total_pages, "pages",
+                        EST_INPUT_TOKENS_PASS12 + 10_000, 8_000,
+                        model, args.budget)
+
+                if confirm_or_abort(
+                        f"Proceed with full-page review?",
+                        skip=args.yes):
+                    cost_tracker = CostTracker(model, budget=args.budget)
+                    refine_full(issues, config, collection_dir, api_key,
+                                rate_limiter=rate_limiter,
+                                cost_tracker=cost_tracker,
+                                model=model,
+                                api_workers=1 if args.serial else
+                                    min(args.api_workers, 2),
+                                page_filter=page_filter)
                     print(f"  {cost_tracker.summary()}")
 
         # Regenerate readable/ from updated ai_ocr/

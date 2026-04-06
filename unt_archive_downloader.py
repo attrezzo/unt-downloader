@@ -1843,12 +1843,18 @@ def main():
                    help="Text-only refinement of low-confidence gaps (Sonnet)")
     p.add_argument("--refine-image",   action="store_true",
                    help="Image-assisted refinement with bbox cropping (Opus)")
+    p.add_argument("--refine-full",    action="store_true",
+                   help="Full-page review: complete image + OCR to Opus")
     p.add_argument("--cnf-min",        type=float, default=None,
                    help="Min cnf for refinement filtering")
     p.add_argument("--cnf-max",        type=float, default=None,
                    help="Max cnf for refinement filtering")
+    p.add_argument("--all-gaps",       action="store_true",
+                   help="Refine ALL gaps (cnf 0-1, include resolved)")
     p.add_argument("--include-resolved", action="store_true",
                    help="Include auto-resolved gaps in refinement")
+    p.add_argument("--page",           type=int, action="append", default=None,
+                   help="Refine specific page(s) (repeatable: --page 1 --page 3)")
     p.add_argument("--skip-estimate",  action="store_true",
                    help="Skip cost estimates (budget checks still apply)")
     p.add_argument("--translate",      action="store_true",
@@ -1917,6 +1923,7 @@ def main():
     if not any([args.configure, args.update_skill, args.discover, args.download_ocr,
                 args.clean_ocr, args.download_pdf, args.preload_images, args.correct,
                 args.compile, args.refine_text, args.refine_image,
+                getattr(args, 'refine_full', False),
                 args.translate, args.status, args.render_pdf]):
         p.print_help()
         return
@@ -2041,10 +2048,12 @@ def main():
         if args.date_to:   compile_args += ["--date-to", args.date_to]
         run_worker("unt_ocr_correct.py", compile_args)
 
-    if args.refine_text or args.refine_image:
+    if args.refine_text or args.refine_image or getattr(args, 'refine_full', False):
         refine_args = ["--config-path", str(config_path)]
         if args.refine_text:   refine_args.append("--refine-text")
         if args.refine_image:  refine_args.append("--refine-image")
+        if getattr(args, 'refine_full', False):
+            refine_args.append("--refine-full")
         if resolved_api_key:   refine_args += ["--api-key", resolved_api_key]
         if args.ark:           refine_args += ["--ark", args.ark]
         if args.date_from:     refine_args += ["--date-from", args.date_from]
@@ -2053,8 +2062,13 @@ def main():
             refine_args += ["--cnf-min", str(args.cnf_min)]
         if args.cnf_max is not None:
             refine_args += ["--cnf-max", str(args.cnf_max)]
+        if getattr(args, 'all_gaps', False):
+            refine_args.append("--all-gaps")
         if args.include_resolved:
             refine_args.append("--include-resolved")
+        if args.page:
+            for pg in args.page:
+                refine_args += ["--page", str(pg)]
         if args.budget is not None:
             refine_args += ["--budget", str(args.budget)]
         if args.tier:
