@@ -213,25 +213,35 @@ class WorkerDashboard:
                 self._skipped += 1
 
     def render(self, force=False):
-        """Redraw the dashboard. Throttled to every 2s unless force=True."""
+        """Redraw the dashboard.
+
+        force=True  → full dashboard (progress + cost + rate + workers).
+                      Used on page completion milestones.
+        force=False → progress bar only, overwritten in-place via \\r.
+                      Throttled to every 2s.
+        """
         now = time.monotonic()
         if not force and (now - self._last_render) < 2.0:
             return
         with self._lock:
             self._last_render = now
-            lines = self._build_lines(now)
+            if force:
+                lines = self._build_lines(now)
+            else:
+                # Lightweight: just the progress bar on one line via \r
+                lines = None
+                bar_line = self._build_progress_line(now)
 
-        # Try ANSI overwrite (works on modern terminals, not old PowerShell)
-        if self._render_lines > 0:
-            try:
-                sys.stdout.write(f"\033[{self._render_lines}A\033[J")
-            except Exception:
-                pass  # ANSI not supported, just print below
-
-        output = "\n".join(lines)
-        sys.stdout.write(output + "\n")
-        sys.stdout.flush()
-        self._render_lines = len(lines)
+        if force:
+            # End the \r progress line before printing full block
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            output = "\n".join(lines)
+            sys.stdout.write(output + "\n")
+            sys.stdout.flush()
+        else:
+            # Overwrite single line in place
+            sys.stdout.write("\r" + bar_line)
+            sys.stdout.flush()
 
     def _fmt_time(self, secs):
         if secs < 60:
@@ -239,27 +249,31 @@ class WorkerDashboard:
         m, s = divmod(int(secs), 60)
         return f"{m}m {s:02d}s"
 
-    def _build_lines(self, now):
-        lines = []
+    def _build_progress_line(self, now):
+        """Single-line progress bar for \r overwrite."""
         elapsed = now - self._start_time
-
-        # ── Progress bar + stats ──────────────────────────────────
         done = self._completed + self._errors + self._skipped
         total = max(self._total_pages, 1)
         pct = min(100, done / total * 100)
         bar_len = 35
         filled = int(bar_len * done / total)
         bar = "#" * filled + "-" * (bar_len - filled)
-
-        # ETA
         if self._completed > 0 and elapsed > 5:
             avg_per_page = elapsed / self._completed
             remaining = (total - done) * avg_per_page
             eta_str = f"ETA {self._fmt_time(remaining)}"
         else:
             eta_str = self._fmt_time(elapsed)
+        # Pad to 80 chars to overwrite previous content
+        line = f"  [{bar}] {done}/{total} ({pct:.0f}%)  {eta_str}"
+        return line.ljust(80)
 
-        lines.append(f"  [{bar}] {done}/{total} ({pct:.0f}%)  {eta_str}")
+    def _build_lines(self, now):
+        lines = []
+        elapsed = now - self._start_time
+
+        # ── Progress bar + stats ──────────────────────────────────
+        lines.append(self._build_progress_line(now).rstrip())
         lines.append("")
 
         # ── Cost + tokens ─────────────────────────────────────────
@@ -302,16 +316,17 @@ class WorkerDashboard:
             age_str = f"[{age:.0f}s]" if age >= 1 else ""
             lines.append(f"  > {wid:<6} {w['current']:<50} {age_str}")
             for old in w["history"]:
+                if "waiting for rate limiter" in old:
+                    continue
                 lines.append(f"    {'':6} {old}")
 
         lines.append("")
         return lines
 
     def final_summary(self):
-        """Print non-overwriting final summary."""
-        if self._render_lines > 0:
-            sys.stdout.write(f"\033[{self._render_lines}A\033[J")
-            self._render_lines = 0
+        """Print final summary."""
+        # Clear the \r progress line
+        sys.stdout.write("\r" + " " * 80 + "\r")
         elapsed = time.monotonic() - self._start_time
         ct = self._cost_tracker
         cost_str = f"  Cost: ${ct.total_cost:.2f}" if ct else ""
