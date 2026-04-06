@@ -198,10 +198,56 @@ def configure_global(existing: dict = None) -> dict:
     if tier not in ("default", "build", "custom"):
         tier = "default"
 
+    # ── Fraktur OCR skill ────────────────────────────────────────────────
+    print()
+    print("─" * 72)
+    print("FRAKTUR OCR SKILL")
+    print("─" * 72)
+    print("The fraktur-ocr skill provides reference data for OCR correction")
+    print("(error patterns, Texas German vocabulary, markup specification).\n")
+
+    default_skill = e.get("skill_path", "")
+    if not default_skill:
+        # Auto-detect skill directory
+        candidates = [
+            Path(__file__).parent / "fraktur-ocr skill",
+            Path(__file__).parent / "fraktur-ocr-skill",
+        ]
+        for c in candidates:
+            if c.exists() and (c / "SKILL.md").exists():
+                default_skill = str(c)
+                print(f"  Auto-detected: {c}/")
+                break
+
+    if default_skill:
+        skill_path = ask("Skill directory path", default_skill)
+    else:
+        print("  No skill directory found. You can set this later in config.json.")
+        skill_path = ask("Skill directory path (leave blank to skip)", "")
+
+    if skill_path:
+        sp = Path(skill_path)
+        if sp.exists() and (sp / "SKILL.md").exists():
+            # Sync reference files to references/
+            refs_dir = Path(__file__).parent / "references"
+            refs_dir.mkdir(exist_ok=True)
+            synced = 0
+            for ref_name in ["fraktur-errors.md", "texas-german.md", "markup-spec.md"]:
+                src = sp / ref_name
+                dst = refs_dir / ref_name
+                if src.exists():
+                    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+                    synced += 1
+            print(f"  Synced {synced} reference file(s) from skill → references/")
+        else:
+            print(f"  ⚠ Skill directory not found or missing SKILL.md: {skill_path}")
+            skill_path = ""
+
     config = {
         "anthropic_api_key": api_key,
         "claude_model":      chosen_model,
         "tier":              tier,
+        "skill_path":        skill_path,
     }
 
     # Preserve any extra keys the user may have added manually
@@ -216,6 +262,7 @@ def configure_global(existing: dict = None) -> dict:
     print(f"  API key  : {'...' + api_key[-6:] if len(api_key) > 6 else '(not set)'}")
     print(f"  Model    : {chosen_model}")
     print(f"  Tier     : {tier}")
+    print(f"  Skill    : {skill_path or '(not set)'}")
     print()
 
     confirm = ask("Save global settings?", "yes")
@@ -1280,6 +1327,334 @@ def find_config_path(config_dir_arg: str | None) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Skill vocabulary update
+# ---------------------------------------------------------------------------
+
+def _extract_words_from_text(text: str) -> set:
+    """Extract unique words > 4 chars from plain text, skipping markup."""
+    # Strip file header (everything up to === separator)
+    parts = re.split(r'^={10,}.*$', text, maxsplit=1, flags=re.M)
+    body = parts[-1] if len(parts) > 1 else text
+
+    # Strip page markers, correction markers, gap/infill tags
+    body = re.sub(r'^--- Page \d+ of \d+ ---$', '', body, flags=re.M)
+    body = re.sub(r'\[CORRECTION FAILED[^\]]*\]', '', body)
+    body = re.sub(r'\[unleserlich[^\]]*\]', '', body)
+    body = re.sub(r'\{\{(?:gap|infill)[^}]*\}\}', '', body)
+    body = re.sub(r'<!--[^>]*-->', '', body)
+    body = re.sub(r'\^(?:HIGH|MED|LOW|VLOW)\^', '', body)
+
+    # Extract word-like tokens (letters including German chars, hyphens)
+    tokens = re.findall(r'[A-Za-zÄÖÜäöüßſ][A-Za-zÄÖÜäöüßſ\-]{3,}', body)
+
+    # Filter: skip pure-ASCII short common English, keep everything else
+    words = set()
+    for w in tokens:
+        # Skip if it's all the same character repeated
+        if len(set(w.replace('-', ''))) <= 1:
+            continue
+        words.add(w)
+    return words
+
+
+def extract_vocabulary(corrected_dirs: list, text_dirs: list = None) -> list:
+    """
+    Extract unique words > 4 chars from corrected OCR files and optional
+    user-provided text directories. Returns sorted list.
+    """
+    all_words = set()
+
+    for cdir in corrected_dirs:
+        cdir = Path(cdir)
+        if not cdir.exists():
+            continue
+        for f in sorted(cdir.glob("*.txt")):
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+                all_words |= _extract_words_from_text(text)
+            except Exception:
+                continue
+
+    if text_dirs:
+        for td in text_dirs:
+            td = Path(td)
+            if not td.exists():
+                print(f"  Warning: --text-dir not found: {td}")
+                continue
+            for f in sorted(td.rglob("*.txt")):
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace")
+                    all_words |= _extract_words_from_text(text)
+                except Exception:
+                    continue
+
+    return sorted(all_words)
+
+
+VOCAB_ANALYSIS_PROMPT = """\
+You are a German linguistics expert specializing in Texas German dialect \
+(Texasdeutsch), 19th-century German orthography, and English-German language \
+contact in immigrant communities.
+
+You will receive:
+1. A WORD LIST extracted from OCR-corrected 1890s German-Texan newspapers
+2. The EXISTING reference file (texas-german.md) that already documents known vocabulary
+
+YOUR TASK:
+Analyze the word list and identify words that should be ADDED to the reference \
+file. Focus on:
+
+A. TEXAS GERMAN DIALECT — words unique to or characteristic of Texasdeutsch \
+   that are not in standard modern German dictionaries
+B. ENGLISH LOANWORDS — English words used in German newspaper context with \
+   German grammar (articles, case endings, plurals)
+C. PRE-1901 SPELLINGS — period-correct forms that modern readers might \
+   mistake for OCR errors (th→t, -iren→-ieren, etc.)
+D. ARCHAIC/REGIONAL GERMAN — words used in 1890s German that are uncommon \
+   or obsolete in modern standard German
+E. HYBRID COMPOUNDS — German-English compound words (e.g. Countysitz, \
+   Schultrustee, Farmerei)
+
+RULES:
+- Only add words NOT already covered in the existing reference
+- Skip common standard German words that any modern speaker would recognize
+- Skip obvious OCR errors that slipped through correction
+- Skip proper nouns (person names, specific business names) unless they \
+  are also common nouns (e.g. "Turnverein" is both)
+- Group additions by category (matching the existing file structure)
+- For each word, provide: the word as printed, standard German equivalent \
+  (if applicable), English meaning, and brief notes
+
+OUTPUT FORMAT:
+Return ONLY a markdown section that can be appended to the existing file. \
+Use this exact structure:
+
+## Additions from Corpus Analysis
+
+### New English Loanwords
+| As printed | Standard German equivalent | English | Notes |
+|-----------|--------------------------|---------|-------|
+| word | equivalent | meaning | note |
+
+### New Texas German Terms
+| Texas German | Standard German | English | Notes |
+|-------------|----------------|---------|-------|
+| word | equivalent | meaning | note |
+
+### New Period Spellings
+| 1891 spelling | Modern spelling | Notes |
+|--------------|----------------|-------|
+| word | modern | note |
+
+### New Archaic/Regional Terms
+| Term | Modern equivalent | English | Notes |
+|------|------------------|---------|-------|
+| word | modern | meaning | note |
+
+If a category has no additions, omit it entirely. \
+If there are no additions at all, return: <!-- No new vocabulary found -->"""
+
+
+def analyze_vocabulary_with_claude(words: list, existing_ref: str,
+                                  api_key: str, model: str) -> str:
+    """Send word list to Claude for Texas German vocabulary analysis."""
+    import urllib.request as ureq
+
+    word_block = "\n".join(words)
+    user_msg = (
+        f"WORD LIST ({len(words)} unique words from corrected OCR corpus):\n"
+        f"```\n{word_block}\n```\n\n"
+        f"EXISTING REFERENCE (texas-german.md):\n"
+        f"```\n{existing_ref}\n```\n\n"
+        f"Analyze the word list and return additions as specified."
+    )
+
+    payload = {
+        "model": model,
+        "max_tokens": 8000,
+        "system": VOCAB_ANALYSIS_PROMPT,
+        "messages": [{"role": "user", "content": user_msg}],
+    }
+
+    req_data = json.dumps(payload).encode("utf-8")
+    for attempt in range(1, 4):
+        try:
+            req = ureq.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=req_data,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
+            with ureq.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+            usage = result.get("usage", {})
+            in_tok = usage.get("input_tokens", 0)
+            out_tok = usage.get("output_tokens", 0)
+            print(f"  Claude: {in_tok:,} input + {out_tok:,} output tokens")
+            for block in result.get("content", []):
+                if block.get("type") == "text":
+                    return block["text"].strip()
+            return ""
+        except Exception as e:
+            if attempt < 3:
+                print(f"  Retry {attempt}/3: {e}")
+                time.sleep(10 * attempt)
+            else:
+                raise
+    return ""
+
+
+def run_update_skill(global_config: dict, args):
+    """
+    Full --update-skill flow:
+    1. Locate skill directory and sync reference files
+    2. Extract vocabulary from corrected/ files and --text-dir sources
+    3. Analyze with Claude to find new Texas German vocabulary
+    4. Append findings to texas-german.md
+    """
+    # ── Step 1: Locate skill directory ────────────────────────────────────
+    skill_path = global_config.get("skill_path", "")
+    if not skill_path:
+        candidates = [
+            Path(__file__).parent / "fraktur-ocr skill",
+            Path(__file__).parent / "fraktur-ocr-skill",
+        ]
+        for c in candidates:
+            if c.exists() and (c / "SKILL.md").exists():
+                skill_path = str(c)
+                break
+    if not skill_path:
+        print("Error: No skill directory configured. Run --configure first,")
+        print("or set skill_path in config.json.")
+        sys.exit(1)
+    sp = Path(skill_path)
+    if not sp.exists() or not (sp / "SKILL.md").exists():
+        print(f"Error: Skill directory not found: {skill_path}")
+        sys.exit(1)
+
+    # Sync base reference files first
+    refs_dir = Path(__file__).parent / "references"
+    refs_dir.mkdir(exist_ok=True)
+    synced = 0
+    for ref_name in ["fraktur-errors.md", "texas-german.md", "markup-spec.md"]:
+        src = sp / ref_name
+        dst = refs_dir / ref_name
+        if src.exists():
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            synced += 1
+    print(f"  Synced {synced} reference file(s) from skill directory")
+
+    if not global_config.get("skill_path"):
+        global_config["skill_path"] = skill_path
+        save_global_config(global_config)
+
+    # ── Step 2: Extract vocabulary ────────────────────────────────────────
+    print("\n  Extracting vocabulary from corrected OCR files ...")
+
+    # Find all corrected/ directories (current collection + any in CWD)
+    corrected_dirs = []
+    # Check if --config-dir or auto-detected collection has corrected/
+    config_path = find_config_path(getattr(args, 'config_dir', None))
+    if config_path.exists():
+        collection_dir = config_path.parent
+        cd = collection_dir / "corrected"
+        if cd.exists():
+            corrected_dirs.append(cd)
+    # Also scan CWD for any other collection dirs with corrected/
+    for d in Path(".").iterdir():
+        if d.is_dir():
+            cd = d / "corrected"
+            if cd.exists() and cd not in corrected_dirs:
+                corrected_dirs.append(cd)
+
+    if not corrected_dirs and not args.text_dir:
+        print("  No corrected/ directories or --text-dir found.")
+        print("  Run --correct first to build a corpus, or provide --text-dir.")
+        return
+
+    text_dirs = args.text_dir or []
+    sources = []
+    for cd in corrected_dirs:
+        n = len(list(cd.glob("*.txt")))
+        if n:
+            sources.append(f"{cd} ({n} files)")
+    for td in text_dirs:
+        tp = Path(td)
+        if tp.exists():
+            n = len(list(tp.rglob("*.txt")))
+            sources.append(f"{td} ({n} files)")
+
+    if sources:
+        print(f"  Sources:")
+        for s in sources:
+            print(f"    {s}")
+
+    words = extract_vocabulary(corrected_dirs, text_dirs)
+    print(f"  Extracted {len(words):,} unique words (> 4 chars)")
+
+    if len(words) < 20:
+        print("  Too few words for meaningful analysis. Process more pages first.")
+        return
+
+    # Save word list for reference
+    wordlist_path = refs_dir / "corpus_wordlist.txt"
+    wordlist_path.write_text("\n".join(words), encoding="utf-8")
+    print(f"  Word list saved: {wordlist_path}")
+
+    # ── Step 3: Analyze with Claude ───────────────────────────────────────
+    api_key = (
+        getattr(args, 'api_key', None)
+        or os.environ.get("ANTHROPIC_API_KEY", "")
+        or global_config.get("anthropic_api_key", "")
+    )
+    if not api_key:
+        print("\n  Error: API key required for vocabulary analysis.")
+        print("  Set in config.json, ANTHROPIC_API_KEY env, or --api-key flag.")
+        print(f"  Word list saved to {wordlist_path} for manual analysis.")
+        return
+
+    model = global_config.get("claude_model", "claude-sonnet-4-6")
+    existing_ref = (refs_dir / "texas-german.md").read_text(encoding="utf-8")
+
+    print(f"\n  Analyzing vocabulary with {model} ...")
+    print(f"  ({len(words):,} words vs existing texas-german.md)")
+
+    additions = analyze_vocabulary_with_claude(words, existing_ref, api_key, model)
+
+    if not additions or "No new vocabulary found" in additions:
+        print("  No new vocabulary identified.")
+        return
+
+    # ── Step 4: Append to texas-german.md ─────────────────────────────────
+    # Clean up any markdown fences Claude might have wrapped
+    additions = re.sub(r'^```(?:markdown)?\s*', '', additions, flags=re.M)
+    additions = re.sub(r'\s*```\s*$', '', additions, flags=re.M)
+
+    # Append to both references/ and skill directory
+    separator = "\n\n---\n\n"
+    datestamp = time.strftime("%Y-%m-%d")
+    header = f"<!-- Corpus additions {datestamp} -->\n"
+
+    for target in [refs_dir / "texas-german.md", sp / "texas-german.md"]:
+        if target.exists():
+            current = target.read_text(encoding="utf-8")
+            target.write_text(
+                current.rstrip() + separator + header + additions + "\n",
+                encoding="utf-8")
+            print(f"  Updated: {target}")
+
+    # Count additions
+    table_rows = len(re.findall(r'^\|[^|]+\|', additions, re.M)) - \
+                 len(re.findall(r'^\|[-\s|]+\|', additions, re.M))
+    print(f"\n  Added ~{max(0, table_rows)} vocabulary entries from corpus analysis.")
+    print(f"  Review the additions in references/texas-german.md")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1303,6 +1678,12 @@ def main():
     # Pipeline steps
     p.add_argument("--configure",      action="store_true",
                    help="Run the collection configuration wizard (required on first use)")
+    p.add_argument("--update-skill",   action="store_true",
+                   help="Scan corrected OCR + user texts to update skill reference "
+                        "files with newly discovered vocabulary (uses Claude API)")
+    p.add_argument("--text-dir",       action="append", default=None,
+                   help="Directory of user-provided .txt files for --update-skill "
+                        "vocabulary extraction (can be repeated)")
     p.add_argument("--discover",       action="store_true",
                    help="Scan ARK range to find all issues")
     p.add_argument("--download-ocr",   action="store_true",
@@ -1315,6 +1696,8 @@ def main():
                    help="Download all page images to local cache (run before --correct)")
     p.add_argument("--correct",        action="store_true",
                    help="Correct OCR errors using Claude vision API")
+    p.add_argument("--compile",        action="store_true",
+                   help="Compile readable markdown from corrected OCR (no API calls)")
     p.add_argument("--translate",      action="store_true",
                    help="Translate to English using Claude vision API")
     p.add_argument("--render-pdf",     action="store_true",
@@ -1345,6 +1728,10 @@ def main():
                    help="Seconds between issues")
     p.add_argument("--retry-failed",   action="store_true",
                    help="(--correct only) Retry pages marked as failed")
+    p.add_argument("--force",          action="store_true",
+                   help="(--correct only) Reprocess all pages, ignoring existing output")
+    p.add_argument("--budget",         type=float, default=None,
+                   help="(--correct only) Max dollar amount to spend on API calls")
     p.add_argument("--columns",        type=int, default=5,
                    help="Newspaper columns for --render-pdf (default: 5)")
     p.add_argument("--max-output-tokens", type=int, default=32000,
@@ -1373,8 +1760,9 @@ def main():
         args.discover    = True
         args.download_ocr = True
 
-    if not any([args.configure, args.discover, args.download_ocr, args.download_pdf,
-                args.preload_images, args.correct, args.translate, args.status]):
+    if not any([args.configure, args.update_skill, args.discover, args.download_ocr,
+                args.download_pdf, args.preload_images, args.correct, args.compile,
+                args.translate, args.status, args.render_pdf]):
         p.print_help()
         return
 
@@ -1382,6 +1770,12 @@ def main():
     # Global config (API key, model, tier — shared across collections)
     # -----------------------------------------------------------------------
     global_config = load_global_config()
+
+    # ── --update-skill: sync references + vocabulary analysis ─────────────
+    if args.update_skill:
+        run_update_skill(global_config, args)
+        if not args.configure:
+            return
 
     if args.configure:
         global_config = configure_global(global_config)
@@ -1472,7 +1866,20 @@ def main():
         correct_args = list(worker_args)
         if args.retry_failed:
             correct_args.append("--retry-failed")
+        if args.force:
+            correct_args.append("--force")
+        if args.budget is not None:
+            correct_args += ["--budget", str(args.budget)]
         run_worker("unt_ocr_correct.py", correct_args)
+
+    if args.compile:
+        compile_args = ["--config-path", str(config_path), "--compile"]
+        if args.resume:    compile_args.append("--resume")
+        if args.force:     compile_args.append("--force")
+        if args.ark:       compile_args += ["--ark", args.ark]
+        if args.date_from: compile_args += ["--date-from", args.date_from]
+        if args.date_to:   compile_args += ["--date-to", args.date_to]
+        run_worker("unt_ocr_correct.py", compile_args)
 
     if args.translate:
         run_worker("unt_translate.py", worker_args)

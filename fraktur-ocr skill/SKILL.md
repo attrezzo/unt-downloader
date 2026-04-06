@@ -21,119 +21,125 @@ A three-pass pipeline for extracting readable text from 19th-century German-lang
 - Optionally: existing OCR text (e.g., ABBYY output from Portal to Texas History)
 - The user should specify the newspaper name, date, and page number if known
 
-## Output Format
+## Output
 
-The pipeline produces **Markdown** with inline metadata tags. See `references/markup-spec.md` for the full tag specification.
+A single final document in Markdown with inline metadata tags. The three passes happen internally — only the merged result is returned. See `references/markup-spec.md` for the full tag specification.
 
-**Key principle:** Every character in the output is either HIGH CONFIDENCE (unmarked) or tagged with metadata explaining its provenance and confidence level. Future AI passes can target only the tagged regions for refinement without re-processing the entire page.
+**Key principle:** Most text on the page should be high-confidence plain text with no tags. Only uncertain regions get `{{ gap }}` tags. If cross-referencing pushes confidence to cnf >= 0.95, the gap is promoted to plain text and the tag is removed.
 
 ---
 
 ## The Three Passes
 
-### PASS 1 — Direct Fraktur OCR
+All three passes happen in sequence. Return only the final merged result.
 
-Read the uploaded page image directly. Work section by section (masthead, then columns left to right, top to bottom).
+### PASS 1 — Direct Fraktur OCR (high-confidence extraction)
 
-**Instructions:**
-1. Identify the page layout: masthead, column count, any center-page features (advertisements, program announcements)
-2. Read each section in Fraktur, writing the text in standard Latin characters
-3. Where text is **confidently readable**, write it directly — no tags needed
-4. Where text is **illegible or uncertain**, insert a gap marker:
-   ```
-   {{gap|est=NN}}
-   ```
-   where `NN` is your best estimate of the character count of the missing text.
-5. Do NOT guess at illegible text in this pass. Guessing comes in Pass 3.
-6. Preserve paragraph and article boundaries with blank lines
-7. Mark article headlines with `##` and subheads with `###`
-8. Preserve any visible datelines (city, date) at the start of news items in **bold**
+Read the page image directly. This is where most of the text gets captured as plain, untagged, high-confidence output.
 
-**Before reading**, consult `references/fraktur-errors.md` to prime yourself on systematic Fraktur OCR failure modes. Apply these corrections as you read — e.g., when you see what looks like "b" but context demands "d", use "d".
-
-**Texas German awareness:** Consult `references/texas-german.md` before reading. Do NOT normalize Texas German vocabulary to standard Hochdeutsch. Preserve English loanwords, hybrid compounds, period spellings, and Germanized place names exactly as printed.
-
-**Output this pass as:**
-```
-## PASS 1 — Direct OCR
-### Metadata
-- Newspaper: [name]
-- Date: [date]
-- Page: [N] of [total]
-- Source image: [filename]
-
-### Text
-[transcribed text with {{gap|est=NN}} markers]
-```
-
----
-
-### PASS 2 — Gap Inventory
-
-Review your Pass 1 output. For each `{{gap}}` marker:
-
-1. Examine the image again at that location
-2. Refine the character count estimate
-3. Note what partial letterforms or fragments you can see
-4. Note contextual constraints (what kind of word is expected: noun, verb, place name, etc.)
-
-**Output this pass as an update** — replace each `{{gap|est=NN}}` with an enriched marker:
-
-```
-{{gap|est=NN|fragments="partial_text"|context="description"}}
-```
-
-For example:
-```
-{{gap|est=25|fragments="Ber...lung"|context="likely a noun, follows 'zur'"}}
-```
-
----
-
-### PASS 3 — Cross-Reference and Infill
-
-This pass requires the existing ABBYY OCR (or other traditional OCR) if available. If no reference OCR exists, work from the image alone using contextual inference.
+**Before reading**, internalize:
+- `references/fraktur-errors.md` — systematic Fraktur OCR failure modes
+- `references/texas-german.md` — Texas German vocabulary, loanwords, period spelling
 
 **Instructions:**
-
-1. For each `{{gap}}` marker, examine:
-   - The original image at that location (re-examine carefully)
-   - The corresponding region in the ABBYY OCR (if provided)
-   - Surrounding context in both your Pass 1 text and the ABBYY text
-   - Your knowledge of 1890s German, Texas German dialect, and the topic at hand
-
-2. Apply the Fraktur error correction table from `references/fraktur-errors.md` to decode the ABBYY fragments
-
-3. Produce a best-guess reconstruction and wrap it in a metadata tag:
-
-```
-{{infill|est=NN|confidence=LOW|region_ocr="raw_abbyy_text"|guess="your reconstruction"}}
-```
-
-**Confidence levels:**
-- `HIGH` — Multiple sources agree, context strongly constrains, result is near-certain
-- `MED` — Reasonable inference from partial letterforms + context, probably right
-- `LOW` — Educated guess based primarily on context, could easily be wrong
-- `VLOW` — Speculative fill to maintain readability, treat as placeholder
-
-4. When writing the final output, render infilled text inside brackets with a superscript confidence marker:
-
-```
-[reconstructed text]^MED^
-```
-
-The full metadata tag is preserved as an HTML comment immediately after:
-```
-[reconstructed text]^MED^ <!-- {{infill|est=32|confidence=MED|region_ocr="ber Vcrfamm"|guess="der Versammlung"}} -->
-```
-
-This way the output is **human-readable** (you see bracketed text with confidence) AND **machine-parseable** (the HTML comment contains full metadata for future passes).
+1. Identify the page layout: masthead, column count, center-page features (ads, programs, large headlines), visible damage
+2. Read each section in Fraktur, transcribing to Latin characters
+3. Apply Fraktur error corrections as you read (Tier 1 aggressively, Tiers 2-5 with context)
+4. Where text is **confidently readable**, write it directly — no tags needed. This should be the majority of the page.
+5. Where text is **illegible or uncertain**, mark with a gap. Do NOT guess yet — just record location and estimated size:
+   ```
+   {{ gap | est=NN | imgbbox="x,y,w,h" }}
+   ```
+   `est` = estimated character count. `imgbbox` = approximate pixel bounding box (x,y = top-left, w,h = size). Be generous with the box.
+6. Mark images, illustrations, or engravings:
+   ```
+   {{ Img | bbox="x,y,w,h" | desc="brief description" }}
+   ```
+7. Wrap each article/news item/notice in a numbered Column tag:
+   ```
+   {{ Column001 }}
+   ## Headline
+   **Dateline,** Date. Article body...
+   {{ /Column }}
+   ```
+8. Wrap each advertisement in a numbered Ad tag:
+   ```
+   {{ Ad001 }}
+   Business name. Products/services. Address.
+   {{ /Ad }}
+   ```
+9. Number Column and Ad tags sequentially per page (001, 002, 003...)
+10. Headlines: `##` | Subheads: `###` | Datelines: **bold**
+11. Do NOT correct Texas German dialect words or pre-1901 spellings
+12. Do NOT translate English loanwords to German
 
 ---
 
-## Final Output Assembly
+### PASS 2 — Gap Inventory (observation only)
 
-After all three passes, produce the final document:
+Review your Pass 1 output. For each `{{ gap }}` marker, re-examine the image at that location.
+
+1. Refine the character count estimate and bounding box
+2. Note what partial letterforms, ascenders, descenders, or fragments you can see
+3. Do NOT guess yet — just record what you observe
+
+Update each gap with fragments:
+```
+{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" }}
+```
+
+Example:
+```
+{{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" }}
+```
+
+---
+
+### PASS 3 — Cross-Reference, Guess, and Confidence
+
+This is where guessing happens. For every gap, produce a best guess and assign a confidence score.
+
+**Instructions:**
+
+1. For each `{{ gap }}` marker, examine:
+   - The original image at that location (one more careful look)
+   - The corresponding region in the ABBYY/portal OCR (if provided)
+   - Surrounding context
+   - Your knowledge of 1890s German, Texas German dialect, and the article topic
+
+2. Apply the Fraktur error correction table to decode the ABBYY fragments
+
+3. Assign a confidence score and produce your best guess:
+
+   **If cnf >= 0.95 — PROMOTE TO PLAIN TEXT.** Remove the gap tag entirely. The text is confident enough to stand as untagged output, just like the text from Pass 1. This happens when your reading and the ABBYY OCR strongly agree, context tightly constrains the word, and/or it's a common word with clear fragments.
+
+   **If cnf 0.80–0.94 — auto-resolved gap.** Keep the gap tag with `status=auto-resolved`. Future refinement passes skip these by default:
+   ```
+   {{ gap | est=12 | imgbbox="450,1200,280,45" | cnf="0.85" | status=auto-resolved | fragments="Verfa...ung" | region_ocr="Bcrfaffung" [Verfassung] }}
+   ```
+
+   **If cnf < 0.80 — open gap.** Needs future review:
+   ```
+   {{ gap | est=22 | imgbbox="820,2100,400,50" | cnf="0.25" | fragments="cidrd" | region_ocr="cidrd Rationalitätcn" [verschiedenen Nationalitäten] }}
+   ```
+
+4. **Confidence scale (`cnf`):**
+   - `0.95–0.99` — Promote to plain text. Remove the gap tag.
+   - `0.80–0.94` — High. Add `status=auto-resolved`. Rarely needs review.
+   - `0.70–0.79` — Moderate. Fragments match, context fits. Worth reviewing.
+   - `0.40–0.69` — Low. Context-based, fragments ambiguous. Should be reviewed.
+   - `0.01–0.39` — Speculative. Mostly guessing from context.
+   - `0.00` — Pure educated guess. No evidence beyond sentence structure and topic.
+
+5. `region_ocr` MUST contain the exact raw OCR text for this region, uncorrected. This is the most valuable field for future refinement.
+
+6. Every gap that remains MUST have a `[guess]` and a `cnf` score. Never leave a gap without a guess. Even `cnf="0.00"` with a wild guess is more useful than nothing.
+
+---
+
+## Final Output
+
+Return a single document with this structure:
 
 ```markdown
 # [Newspaper Name] — [Date] — Page [N]
@@ -143,23 +149,18 @@ After all three passes, produce the final document:
 - Source image: [filename]
 - Reference OCR: [source, e.g. "UNT Portal to Texas History / ABBYY"]
 - Processing date: [today]
-- Pass 1 confidence: [estimated % of text read confidently]
-- Total gaps: [count]
-- Gaps filled: [count filled in Pass 3]
-- Remaining unfilled: [count]
+- Total gaps remaining: [count]
 
 ### Statistics
 - Estimated total characters on page: [N]
-- Characters read with high confidence: [N] ([%])
-- Characters infilled at HIGH confidence: [N] ([%])
-- Characters infilled at MED confidence: [N] ([%])
-- Characters infilled at LOW confidence: [N] ([%])
-- Characters infilled at VLOW confidence: [N] ([%])
-- Characters unrecoverable: [N] ([%])
+- Characters with no gap tag: [N] ([%])
+- Characters in gaps cnf >= 0.80: [N] ([%])
+- Characters in gaps cnf 0.40-0.79: [N] ([%])
+- Characters in gaps cnf < 0.40: [N] ([%])
 
 ---
 
-[Final merged text with inline tags as described above]
+[Final merged text — mostly plain text, with {{ gap }} tags only where uncertain]
 ```
 
 ---
