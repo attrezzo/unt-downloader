@@ -198,14 +198,10 @@ Project-level config, git-ignored. Copy `config.example.json` → `config.json`.
 
 ```python
 # unt_ocr_correct.py
-ILLEGIBLE = "[unleserlich]"                    # THE canonical marker
-TESS_CONF_MIN = 40                             # below = always disputed
-TESS_PSM_A = "--psm 6 --oem 1 --dpi 300"      # uniform text block
-TESS_PSM_B = "--psm 4 --oem 1 --dpi 300"      # single column
-TESS_LANG_PRIORITY = ["deu_frak+deu", "deu_frak", "deu", "eng"]
-CLAUDE_MODEL = "claude-sonnet-4-6"             # overridden by collection.json
-CROP_BUFFER_PX = 20                            # ±px overlap on column crops
-CALIBRATION_VERSION = 2                        # bump to invalidate stale cache
+ILLEGIBLE = "[unleserlich]"                    # deprecated — kept for legacy file parsing
+MODEL_INITIAL = "claude-haiku-4-5"             # Pass 1-2: image transcription
+MODEL_RESOLVE = "claude-sonnet-4-6"            # Pass 3: cross-reference + guess
+MODEL_REFINE  = "claude-opus-4-6"              # refinement passes
 
 # unt_translate.py
 BUDGET_EXCEEDED_PREFIX = "[BUDGET EXCEEDED: PAGE "

@@ -1438,16 +1438,26 @@ def group_gaps_by_bbox(gaps: list, proximity_px: int = 100) -> list:
 
 
 def crop_image(image_bytes: bytes, bbox: tuple) -> bytes:
-    """Crop a JPEG image to the given (x,y,w,h) bounding box. Returns JPEG bytes."""
-    from PIL import Image
+    """Crop a JPEG image to the given (x,y,w,h) bounding box. Returns JPEG bytes.
+    Requires PIL/Pillow: pip install pillow"""
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError(
+            "PIL/Pillow required for image cropping: pip install pillow")
     import io
-    img = Image.open(io.BytesIO(image_bytes))
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+    except Exception as e:
+        raise RuntimeError(f"Failed to open image for cropping: {e}")
     x, y, w, h = bbox
     # Clamp to image bounds
     x2 = min(x + w, img.width)
     y2 = min(y + h, img.height)
     x = max(0, x)
     y = max(0, y)
+    if x2 <= x or y2 <= y:
+        raise RuntimeError(f"Invalid crop region: ({x},{y},{x2},{y2})")
     cropped = img.crop((x, y, x2, y2))
     buf = io.BytesIO()
     cropped.save(buf, format="JPEG", quality=95)

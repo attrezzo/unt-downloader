@@ -148,59 +148,69 @@ class TestOcrCorrectPureFunctions:
         assert 1 in pages
         assert 2 in pages
 
-    def test_tag_illegible_with_bbox(self):
-        from unt_ocr_correct import _tag_illegible_with_bbox, ILLEGIBLE
-        text = f"Some text {ILLEGIBLE} and more {ILLEGIBLE} here."
-        disputes = [
-            {"provisional": ILLEGIBLE, "confs": {"tess_a": 0},
-             "page_left": 100, "page_top": 200, "page_right": 150, "page_bottom": 220},
-            {"provisional": ILLEGIBLE, "confs": {"tess_a": 0},
-             "page_left": 300, "page_top": 400, "page_right": 380, "page_bottom": 425},
-        ]
-        result = _tag_illegible_with_bbox(text, disputes)
-        assert "[unleserlich bbox=100,200,50,20]" in result
-        assert "[unleserlich bbox=300,400,80,25]" in result
-        assert "[unleserlich]" not in result
-
-    def test_tag_illegible_no_coords_stays_bare(self):
-        from unt_ocr_correct import _tag_illegible_with_bbox, ILLEGIBLE
-        text = f"Text {ILLEGIBLE} here."
-        # Dispute with no page coords — marker stays bare
-        disputes = [{"provisional": ILLEGIBLE, "confs": {"tess_a": 0},
-                     "page_left": 0, "page_top": 0}]
-        result = _tag_illegible_with_bbox(text, disputes)
-        assert "[unleserlich]" in result
-        assert "bbox=" not in result
-
-    def test_tag_illegible_empty_disputes(self):
-        from unt_ocr_correct import _tag_illegible_with_bbox, ILLEGIBLE
-        text = f"Text {ILLEGIBLE} here."
-        result = _tag_illegible_with_bbox(text, [])
-        assert "[unleserlich]" in result
-
-    def test_local_segment_simple_page(self):
-        from unt_ocr_correct import _local_segment_page
-        # Simple page with no clear article breaks → single article
-        text = "This is a simple page of text.\nIt continues here.\nAnd here."
-        result = _local_segment_page(1, text)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["type"] == "article"
-
-    def test_local_segment_complex_page_defers(self):
-        from unt_ocr_correct import _local_segment_page
-        # Complex page with multiple headline-like breaks → defer to Claude
-        text = (
-            "First article text.\n"
-            "\n"
-            "BREAKING NEWS HEADLINE\n"
-            "Article body here.\n"
-            "\n"
-            "Berlin, 3. Sept.\n"
-            "Another article body.\n"
-            "\n"
-            "ANOTHER HEADLINE\n"
-            "More text.\n"
+    def test_extract_clean_text_strips_gap_to_guess(self):
+        from unt_ocr_correct import extract_clean_text
+        raw = (
+            "LAYOUT: test\nCOLUMNS: 1\nDAMAGE: none\n\n---\n\n"
+            'Die {{ gap | est=12 | imgbbox="0,0,100,30" | cnf="0.85" '
+            '| status=auto-resolved [Verfassung] }} wurde beschlossen.\n\n'
+            "---\n\nSTATS:\n- estimated_chars: 40\n"
         )
-        result = _local_segment_page(3, text)
-        assert result is None  # defers to Claude
+        result = extract_clean_text(raw)
+        assert "Verfassung" in result
+        assert "{{ gap" not in result
+        assert "imgbbox" not in result
+
+    def test_extract_clean_text_strips_structural_tags(self):
+        from unt_ocr_correct import extract_clean_text
+        raw = (
+            "LAYOUT: test\nCOLUMNS: 1\nDAMAGE: none\n\n---\n\n"
+            "{{ Column001 }}\n## Headline\nText here.\n{{ /Column }}\n"
+            "{{ Ad001 }}\nAd text.\n{{ /Ad }}\n"
+            '{{ Img | bbox="0,0,100,100" | desc="photo" }}\n'
+            "\n---\n\nSTATS:\n- estimated_chars: 30\n"
+        )
+        result = extract_clean_text(raw)
+        assert "Headline" in result
+        assert "Ad text" in result
+        assert "{{ Column" not in result
+        assert "{{ Ad" not in result
+        assert "{{ Img" not in result
+
+    def test_parse_gaps(self):
+        from unt_ocr_correct import parse_gaps
+        text = (
+            'Before {{ gap | est=10 | imgbbox="100,200,50,30" '
+            '| cnf="0.45" | fragments="Ver...ung" '
+            '| region_ocr="Bcrfamm" [Versammlung] }} after.'
+        )
+        gaps = parse_gaps(text)
+        assert len(gaps) == 1
+        assert gaps[0]["est"] == 10
+        assert gaps[0]["cnf"] == 0.45
+        assert gaps[0]["fragments"] == "Ver...ung"
+        assert gaps[0]["region_ocr"] == "Bcrfamm"
+        assert gaps[0]["guess"] == "Versammlung"
+
+    def test_parse_bbox_and_merge(self):
+        from unt_ocr_correct import parse_bbox, merge_bboxes
+        assert parse_bbox("100,200,50,30") == (100, 200, 50, 30)
+        merged = merge_bboxes([(100, 200, 50, 30), (120, 250, 60, 30)],
+                              padding=10)
+        assert merged[0] == 90   # x_min - padding
+        assert merged[1] == 190  # y_min - padding
+        assert merged[2] > 50    # wider than single box
+        assert merged[3] > 30    # taller than single box
+
+    def test_group_gaps_by_bbox(self):
+        from unt_ocr_correct import group_gaps_by_bbox
+        # Two nearby gaps (within 100px) and one far away
+        gaps = [
+            {"imgbbox": "100,200,50,30"},
+            {"imgbbox": "100,220,50,30"},  # 20px below first
+            {"imgbbox": "100,800,50,30"},  # 550px below → new group
+        ]
+        groups = group_gaps_by_bbox(gaps, proximity_px=100)
+        assert len(groups) == 2
+        assert len(groups[0]) == 2  # first two grouped
+        assert len(groups[1]) == 1  # third alone
