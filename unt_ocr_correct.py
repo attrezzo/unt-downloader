@@ -1941,7 +1941,8 @@ def preload_images(issues, resume=True, retry_failed=False, workers=4):
 
 def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                   resume, force, rate_limiter=None,
-                  cost_tracker=None, worker_id="", api_workers=3):
+                  cost_tracker=None, worker_id="", api_workers=3,
+                  page_filter=None):
     """Process one newspaper issue through the AI OCR pipeline."""
     ark_id = issue["ark_id"]
     vol    = str(issue.get("volume", "?")).zfill(2)
@@ -1954,7 +1955,8 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     ai_ocr_dir = AI_OCR_DIR / ark_id
 
     # Resume check — skip if ai_ocr/ dir has all pages
-    if resume and not force and ai_ocr_dir.exists():
+    # (but not when --page filter is set — user wants to reprocess specific pages)
+    if resume and not force and not page_filter and ai_ocr_dir.exists():
         existing_md = set(ai_ocr_dir.glob("page_*.md"))
         if len(existing_md) >= int(issue.get("pages", 8)):
             tprint(f"  SKIP {fname} (already complete)",
@@ -1990,8 +1992,10 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     # Build list of pages that need processing (skip existing ai_ocr pages)
     pages_todo = []
     for pg in range(1, actual_pages + 1):
+        if page_filter and pg not in page_filter:
+            continue
         page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
-        if (not force and page_md_path.exists()
+        if (not force and not page_filter and page_md_path.exists()
                 and page_md_path.stat().st_size > 100):
             tprint(f"  p{pg:02d} SKIP (exists)", worker=worker_id, level=2)
             continue
@@ -3741,7 +3745,8 @@ def main():
             compile_all(issues, config, collection_dir, resume=False)
         return
 
-    # Count pages to process (respecting --resume/--force)
+    # Count pages to process (respecting --resume/--force/--page)
+    page_filter = set(args.page) if args.page else None
     pages_to_process = 0
     for issue in issues:
         ark_id = issue["ark_id"]
@@ -3751,11 +3756,14 @@ def main():
         fname = f"{ark_id}_vol{vol}_no{num}_{date}.txt"
         ai_dir = AI_OCR_DIR / ark_id
 
-        if args.resume and not args.force and ai_dir.exists():
+        if args.resume and not args.force and not page_filter and ai_dir.exists():
             existing_md = set(ai_dir.glob("page_*.md"))
             if len(existing_md) >= int(issue.get("pages", 8)):
                 continue
-        pages_to_process += int(issue.get("pages", 8))
+        if page_filter:
+            pages_to_process += len(page_filter)
+        else:
+            pages_to_process += int(issue.get("pages", 8))
 
     if pages_to_process == 0:
         print("\nNothing to process -- all files already complete.")
@@ -3833,7 +3841,8 @@ def main():
             rate_limiter=rate_limiter,
             cost_tracker=cost_tracker,
             worker_id="",
-            api_workers=effective_workers)
+            api_workers=effective_workers,
+            page_filter=page_filter)
 
         with log_lock:
             log.append({"ark_id": ark_id, "status": status})
