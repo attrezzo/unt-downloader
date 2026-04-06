@@ -151,7 +151,10 @@ def log_debug(msg: str, level: int = 2):
 
 
 def log_event(msg: str, status: str = "info"):
-    """Record an event in the activity log (for display) and file log."""
+    """Record an event: always prints to stdout, adds to activity log,
+    and writes to file log if enabled."""
+    icon = {"ok": "+", "error": "X", "skip": "-"}.get(status, " ")
+    print(f"  {icon} {msg}", flush=True)
     if _activity_log:
         _activity_log.add(msg, status)
     if _file_logger:
@@ -159,14 +162,19 @@ def log_event(msg: str, status: str = "info"):
 
 
 def tprint(*args, worker: str = "", level: int = 1, **kwargs):
-    """Legacy debug print — routes to file logger. Kept for compatibility."""
+    """Print to stdout (level 1) and/or file log (all levels).
+    Level 1 always prints. Level 2+ only prints to file."""
+    msg = ' '.join(str(a) for a in args)
+    prefix = f"[{worker}] " if worker else ""
+    full = f"{prefix}{msg}"
+    # Level 1: always show on stdout
+    if level <= 1:
+        print(f"  {full}", flush=True)
+        if _activity_log:
+            _activity_log.add(msg, "info")
+    # All levels: write to file if logging enabled
     if _file_logger and level <= LOG_LEVEL:
-        prefix = f"[{worker}] " if worker else ""
-        _file_logger.debug(f"{prefix}{' '.join(str(a) for a in args)}")
-    # level 1 messages also go to activity log for display
-    if level <= 1 and _activity_log:
-        msg = ' '.join(str(a) for a in args)
-        _activity_log.add(msg, "info")
+        _file_logger.debug(full)
 
 
 def print_status(cost_tracker=None, step_name="OCR Correction",
@@ -2301,6 +2309,51 @@ def show_revised_estimate(cost_tracker, units_remaining, unit_label="pages"):
     print()
 
 
+def prompt_model_selection(skip=False):
+    """Let user change model assignments before a batch starts.
+    Returns True if models were changed."""
+    global MODEL_INITIAL, MODEL_RESOLVE, MODEL_REFINE
+    if skip:
+        return False
+
+    print(f"  Current model assignments:")
+    print(f"    1. Pass 1-2 (image):     {MODEL_INITIAL}")
+    print(f"    2. Pass 3 (text):        {MODEL_RESOLVE}")
+    print(f"    3. Refinement:           {MODEL_REFINE}")
+    print()
+    raw = input("  Change models? Enter number to edit, "
+                "or press Enter to continue: ").strip()
+    if not raw:
+        return False
+
+    changed = False
+    while raw:
+        if raw == "1":
+            new = input(f"    Pass 1-2 model [{MODEL_INITIAL}]: ").strip()
+            if new:
+                MODEL_INITIAL = new
+                changed = True
+        elif raw == "2":
+            new = input(f"    Pass 3 model [{MODEL_RESOLVE}]: ").strip()
+            if new:
+                MODEL_RESOLVE = new
+                changed = True
+        elif raw == "3":
+            new = input(f"    Refinement model [{MODEL_REFINE}]: ").strip()
+            if new:
+                MODEL_REFINE = new
+                changed = True
+        raw = input("  Edit another (1/2/3) or Enter to continue: ").strip()
+
+    if changed:
+        print(f"\n  Updated models:")
+        print(f"    Pass 1-2: {MODEL_INITIAL}")
+        print(f"    Pass 3:   {MODEL_RESOLVE}")
+        print(f"    Refine:   {MODEL_REFINE}")
+        print()
+    return changed
+
+
 def confirm_or_abort(prompt_msg, skip=False):
     """Prompt user for y/N confirmation. Returns True to proceed."""
     if skip:
@@ -2533,6 +2586,10 @@ def main():
         rate_limiter = (limiter_from_tier(args.tier)
                         if ClaudeRateLimiter else None)
 
+        # Let user change models before refinement
+        if not args.skip_estimate:
+            prompt_model_selection(skip=args.yes)
+
         if args.refine_text:
             cnf_min = args.cnf_min if args.cnf_min is not None else 0.0
             cnf_max = args.cnf_max if args.cnf_max is not None else 0.79
@@ -2641,10 +2698,17 @@ def main():
         print("\nNothing to process -- all files already complete.")
         return
 
-    # Cost estimate
+    # Cost estimate and model selection
     if not args.skip_estimate:
         est_cost, per_page = show_correction_estimate(
             pages_to_process, args.budget)
+
+        # Let user change models before committing
+        if prompt_model_selection(skip=args.yes):
+            # Re-estimate with new models
+            est_cost, per_page = show_correction_estimate(
+                pages_to_process, args.budget)
+
         # Abort if initial estimate exceeds budget
         if args.budget is not None and est_cost > args.budget:
             print(f"  Initial estimate ${est_cost:.2f} exceeds budget "
