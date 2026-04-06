@@ -186,6 +186,7 @@ class WorkerDashboard:
         self._errors = 0
         self._start_time = time.monotonic()
         self._cost_tracker = None
+        self._last_render = 0
 
     def set_context(self, total_pages=0, cost_tracker=None,
                     rate_limiter=None, issue_label=""):
@@ -195,6 +196,7 @@ class WorkerDashboard:
                 self._total_steps = total_pages * self.STEPS_PER_PAGE
             if cost_tracker:
                 self._cost_tracker = cost_tracker
+        self._do_render()
 
     def step(self, worker_id: str = ""):
         """Record one step completed and render."""
@@ -219,12 +221,20 @@ class WorkerDashboard:
                 self._errors += 1
                 w["history"].append(f"ERR {msg}")
 
+    def render_throttled(self):
+        """Render if >5s since last render. For worker state changes."""
+        now = time.monotonic()
+        if now - self._last_render < 5.0:
+            return
+        self._do_render()
+
     def render(self, force=False):
         """Render the dashboard block. Called on milestones."""
         if force:
             self._do_render()
 
     def _do_render(self):
+        self._last_render = time.monotonic()
         with self._lock:
             lines = self._build_lines(time.monotonic())
         print("\n".join(lines), flush=True)
@@ -328,6 +338,7 @@ def log_event(msg: str, status: str = "info", worker: str = ""):
     """Record an event: updates dashboard, writes to file log."""
     if _dashboard and worker:
         _dashboard.update(worker, msg, status)
+        _dashboard.render_throttled()
     elif _dashboard:
         # No worker specified — just print directly
         icon = {"ok": "+", "error": "X", "skip": "-"}.get(status, " ")
