@@ -46,50 +46,68 @@ _interrupted = False
 
 
 def _handle_sigint(sig, frame):
-    """Set interrupt flag on Ctrl+C so threads can exit cleanly."""
+    """Handle Ctrl+C. First press sets flag, second press force-exits."""
     global _interrupted
     if _interrupted:
-        # Second Ctrl+C — force exit
+        # Second Ctrl+C — force exit immediately
         print("\n  Force quit.", flush=True)
+        # os._exit works even when threads are blocked
         os._exit(1)
     _interrupted = True
-    print("\n  Interrupt received — finishing current API calls, "
-          "then stopping...", flush=True)
+    print("\n  Ctrl+C — stopping after current API calls finish...",
+          flush=True)
 
 
-# Install handler at import time
+# Install handler — works on Windows and Unix
 signal.signal(signal.SIGINT, _handle_sigint)
 
 
 def run_parallel(fn, items, max_workers=3, label="items"):
     """Run fn over items with a thread pool. Handles Ctrl+C cleanly.
-    fn(item) -> result. Returns list of (item, result) pairs."""
+    fn(item) -> result. Returns list of (item, result) pairs.
+
+    On Windows, Ctrl+C can't interrupt blocked threads (urllib etc).
+    We poll futures with a short timeout so the main thread can check
+    the _interrupted flag regularly."""
     global _interrupted
     _interrupted = False
     results = []
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    ex = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = {ex.submit(fn, item): item for item in items}
-        try:
-            for fut in as_completed(futures):
-                if _interrupted:
-                    # Cancel pending futures
-                    for f in futures:
-                        f.cancel()
-                    print(f"  Stopped. {len(results)}/{len(items)} "
-                          f"{label} completed.", flush=True)
-                    break
+        pending = set(futures.keys())
+
+        while pending and not _interrupted:
+            # Poll with short timeout so Ctrl+C can fire between polls
+            done_batch = set()
+            for fut in list(pending):
+                if fut.done():
+                    done_batch.add(fut)
+            if not done_batch:
+                # Nothing ready — sleep briefly to let signals fire
                 try:
-                    results.append((futures[fut], fut.result()))
+                    time.sleep(0.3)
+                except KeyboardInterrupt:
+                    _interrupted = True
+                    break
+                continue
+            for fut in done_batch:
+                pending.discard(fut)
+                try:
+                    results.append((futures[fut], fut.result(timeout=0)))
                 except Exception as e:
                     results.append((futures[fut], e))
-        except KeyboardInterrupt:
-            _interrupted = True
-            for f in futures:
-                f.cancel()
-            print(f"\n  Stopped. {len(results)}/{len(items)} "
-                  f"{label} completed.", flush=True)
+    except KeyboardInterrupt:
+        _interrupted = True
 
+    if _interrupted:
+        for f in futures:
+            f.cancel()
+        print(f"  Stopped. {len(results)}/{len(items)} "
+              f"{label} completed.", flush=True)
+
+    ex.shutdown(wait=False)
     return results
 
 
