@@ -851,12 +851,13 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
 
 def claude_api_call(payload: dict, api_key: str,
                     rate_limiter=None, est_tokens: int = 8000,
-                    cost_tracker=None, label: str = ""):
+                    cost_tracker=None, label: str = "",
+                    force_stream: bool = False):
     """Make a Claude API call with retry/rate-limit. Returns (text, usage).
-    Uses streaming when LOG_LEVEL >= 4 for progress feedback.
+    Uses streaming when LOG_LEVEL >= 4 or force_stream=True.
     label format: 'p01 pass1-2' — first token used as worker ID."""
     model = payload.get("model", "?")
-    use_streaming = LOG_LEVEL >= 4
+    use_streaming = LOG_LEVEL >= 4 or force_stream
     # Extract worker ID from label (e.g. "p01" from "p01 pass1-2")
     wid = label.split()[0] if label else ""
     log_debug(f"API call: model={model} max_tokens={payload.get('max_tokens')} "
@@ -2637,7 +2638,8 @@ def _refine_full_page(page_file, ark_id, config, model, prompt,
              "messages": [{"role": "user", "content": content}]},
             api_key, rate_limiter,
             est_tokens=EST_INPUT_TOKENS_PASS12 + 10_000,
-            cost_tracker=cost_tracker, label=label)
+            cost_tracker=cost_tracker, label=label,
+            force_stream=True)
     except Exception as e:
         tprint(f"  {ark_id}/p{pg_num}: error: {e}", level=1)
         return False
