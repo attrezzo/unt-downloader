@@ -93,12 +93,33 @@ def init_paths(collection_dir: Path):
 # ============================================================================
 
 REFERENCES_DIR = Path(__file__).parent / "references"
+SKILL_DIR      = Path(__file__).parent / "fraktur-ocr skill"
+
+# Additional skill path from global config (set during init)
+_configured_skill_dir = None
+
+
+def init_skill_dir(global_config: dict):
+    """Set skill directory from global config if available."""
+    global _configured_skill_dir
+    sp = global_config.get("skill_path", "")
+    if sp:
+        p = Path(sp)
+        if p.exists() and (p / "SKILL.md").exists():
+            _configured_skill_dir = p
 
 
 def load_reference(filename: str) -> str:
-    p = REFERENCES_DIR / filename
-    if p.exists():
-        return p.read_text(encoding="utf-8")
+    """Load reference file. Checks references/, then configured skill dir,
+    then default skill dir."""
+    search = [REFERENCES_DIR]
+    if _configured_skill_dir:
+        search.append(_configured_skill_dir)
+    search.append(SKILL_DIR)
+    for d in search:
+        p = d / filename
+        if p.exists():
+            return p.read_text(encoding="utf-8")
     return ""
 
 
@@ -388,7 +409,8 @@ def claude_api_call(payload: dict, api_key: str,
 # ============================================================================
 
 def build_system_prompt(config: dict) -> str:
-    """Build comprehensive system prompt with all reference data."""
+    """Build comprehensive system prompt with reference data from the
+    fraktur-ocr skill and collection metadata."""
     title      = config.get("title_name", "")
     publisher  = config.get("publisher", "")
     location   = config.get("pub_location", "Texas")
@@ -414,7 +436,8 @@ def build_system_prompt(config: dict) -> str:
     if places:    ctx += f"\nPLACE NAMES (preserve exactly): {places}"
     if orgs:      ctx += f"\nORGANIZATIONS (preserve exactly): {orgs}"
 
-    return f"""You are an expert OCR specialist for 19th-century German Fraktur newspaper text.
+    return f"""You are an expert OCR specialist running the fraktur-ocr pipeline
+for 19th-century German Fraktur newspaper text scanned from microfilm.
 
 COLLECTION: {title}
 Publisher: {publisher} | Location: {location} | Period: {date_range}
@@ -422,48 +445,71 @@ Language: {language} | Typeface: {typeface} | Source: {source}
 {"LCCN: " + lccn if lccn else ""}
 {ctx}
 
-FRAKTUR ERROR CORRECTION TABLE
-===============================
+REFERENCE: FRAKTUR ERROR PATTERNS
+===================================
 {fraktur_errors}
 
-TEXAS GERMAN VOCABULARY & ORTHOGRAPHY
-======================================
+REFERENCE: TEXAS GERMAN VOCABULARY & ORTHOGRAPHY
+==================================================
 {texas_german}
 
-OUTPUT MARKUP SPECIFICATION
-============================
+REFERENCE: METADATA MARKUP SPECIFICATION
+==========================================
 {markup_spec}
 
-YOUR TASK
-=========
+THE THREE-PASS PIPELINE
+========================
 
 You receive a newspaper page image and optionally ABBYY/portal OCR text.
-Produce a complete, corrected transcription following this process:
+Execute all three passes and return a single combined result.
 
 PASS 1 - DIRECT FRAKTUR OCR:
-1. Examine the page image carefully
-2. Identify layout: masthead, columns, ads, headlines
-3. Read each section: masthead, center features, columns left-to-right top-to-bottom
-4. Transcribe the Fraktur text to Latin characters
-5. Apply Fraktur corrections (Tiers 1-5) automatically as you read
-6. Do NOT correct Texas German dialect words or pre-1901 spellings
-7. Do NOT translate English loanwords
-8. Mark illegible text with {{{{gap|est=NN}}}} where NN is estimated character count
-9. Mark article boundaries with <!-- {{{{article|type="TYPE"|topic="brief description"}}}} -->
+1. Identify the page layout: masthead, column count, center-page features
+   (advertisements, program announcements, large headlines), damage
+2. Read each section in order: masthead, center features, columns
+   left-to-right top-to-bottom
+3. Transcribe the Fraktur text to Latin characters
+4. Apply Fraktur error corrections (Tiers 1-5) automatically as you read:
+   - Tier 1 aggressively (b/d, f/s swaps are almost always correct)
+   - Tier 2 with context checking (capital letter confusions)
+   - Tiers 3-5 case by case (ligature breaks, number/letter, hyphenation)
+5. Where text is confidently readable, write it directly with no tags
+6. Where text is illegible or uncertain, insert: {{{{gap|est=NN}}}}
+7. Do NOT correct Texas German dialect words or pre-1901 spellings
+8. Do NOT translate English loanwords to German
+9. Mark article boundaries with:
+   <!-- {{{{article|type="TYPE"|dateline="CITY, DATE"|topic="brief description"}}}} -->
+   Types: international, national, texas, local, program, advertisement,
+   editorial, obituary, masthead, notice, poetry
+10. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
 
-PASS 2 - GAP REFINEMENT:
-For each gap, re-examine the image for fragments and context.
-Enrich: {{{{gap|est=NN|fragments="visible"|context="notes"}}}}
+PASS 2 - GAP INVENTORY:
+For each {{{{gap}}}} from Pass 1:
+1. Re-examine the image at that location
+2. Note partial letterforms, ascenders, descenders, dots, fragments
+3. Note grammatical role (noun, verb, name, etc.) and contextual constraints
+4. Replace with enriched marker:
+   {{{{gap|est=NN|fragments="visible_fragments"|context="notes"}}}}
 
-PASS 3 - CROSS-REFERENCE (when ABBYY/portal OCR provided):
-For each gap:
-1. Find the corresponding text in the reference OCR
-2. Apply Fraktur error corrections to the raw OCR fragment
-3. Cross-reference with your reading and context
-4. If reconstructable, replace the gap with:
+PASS 3 - CROSS-REFERENCE AND INFILL:
+For each enriched gap:
+1. If ABBYY/portal OCR is provided, find the corresponding region
+2. Apply the Fraktur error correction table to decode the raw OCR fragment
+3. Cross-reference: your reading + OCR fragment + context + 1890s German +
+   article topic (international news = more Hochdeutsch, local = more dialect)
+4. Produce a reconstruction with confidence level:
+   - HIGH: Multiple sources agree, context tightly constrains, common word
+   - MED: Partial letterforms match, context fits, reasonable inference
+   - LOW: Primarily context-based, OCR fragments ambiguous, multiple readings
+   - VLOW: Little evidence, filled mainly for readability, treat as placeholder
+5. Replace the gap with infill (human-readable + machine-parseable):
    [reconstructed text]^CONFIDENCE^
-   <!-- {{{{infill|est=NN|confidence=LEVEL|region_ocr="raw_ocr"|guess="clean_text"|notes="reasoning"}}}} -->
-5. Confidence levels: HIGH, MED, LOW, VLOW
+   <!-- {{{{infill|est=NN|confidence=LEVEL|region_ocr="raw_ocr_text"|guess="clean_text"|notes="reasoning"}}}} -->
+   The region_ocr field MUST contain the exact raw OCR text, uncorrected.
+6. If you cannot reconstruct even speculatively, leave as:
+   {{{{gap|est=NN|fragments="..."|context="..."|status=unresolved}}}}
+7. For non-gap corrections where the fix is ambiguous or changes meaning, add:
+   corrected_word <!-- {{{{corrected|original="ocr_reading"|rule="rule_name"}}}} -->
 
 OUTPUT FORMAT - return this exact structure:
 
@@ -473,7 +519,7 @@ DAMAGE: <brief damage notes or "none">
 
 ---
 
-<corrected text with all markup tags>
+<final corrected text with all inline markup tags>
 
 ---
 
@@ -489,17 +535,16 @@ STATS:
 - gaps_filled: <N>
 - gaps_remaining: <N>
 
-RULES:
-- Use {ILLEGIBLE} for text genuinely unreadable even after all passes
-- Preserve pre-1901 German spellings (thun, Noth, Theil, etc.)
-- Preserve English loanwords as-is (Saloon, County, Farmer, etc.)
-- Preserve Texas German dialect forms
+CRITICAL RULES:
+- Use {ILLEGIBLE} for text genuinely unreadable after all three passes
+- Preserve pre-1901 German spellings (thun, Noth, Theil, Eigenthum, -iren)
+- Preserve English loanwords as-is (Saloon, County, Farmer, Sheriff, Receiver)
+- Preserve Texas German dialect and hybrid forms (Dry Goods Haus, Stadtmarshall)
+- If a word is only 1-2 characters off from plausible Texas German, prefer dialect
 - Do NOT translate - text stays in original language
-- Headlines: ## Headline text
-- Subheads: ### Subhead text
-- Datelines: **City, Date**
-- Mark article boundaries with <!-- {{{{article}}}} --> tags
-- If columns are interleaved, insert <!-- {{{{column_break|from=N|to=M}}}} -->"""
+- Do NOT modernize period orthography
+- Watch for column interleaving (sudden topic change mid-sentence) and mark with
+  <!-- {{{{column_break|from=N|to=M}}}} -->"""
 
 
 def build_page_prompt(ark_id: str, page_num: int, total_pages: int,
@@ -1310,6 +1355,9 @@ def main():
                 global_config_path.read_text(encoding="utf-8"))
         except Exception:
             pass
+
+    # Initialize skill directory from global config
+    init_skill_dir(global_config)
 
     global CLAUDE_MODEL
     if config.get("claude_model"):

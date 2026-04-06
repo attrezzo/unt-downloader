@@ -198,10 +198,56 @@ def configure_global(existing: dict = None) -> dict:
     if tier not in ("default", "build", "custom"):
         tier = "default"
 
+    # ── Fraktur OCR skill ────────────────────────────────────────────────
+    print()
+    print("─" * 72)
+    print("FRAKTUR OCR SKILL")
+    print("─" * 72)
+    print("The fraktur-ocr skill provides reference data for OCR correction")
+    print("(error patterns, Texas German vocabulary, markup specification).\n")
+
+    default_skill = e.get("skill_path", "")
+    if not default_skill:
+        # Auto-detect skill directory
+        candidates = [
+            Path(__file__).parent / "fraktur-ocr skill",
+            Path(__file__).parent / "fraktur-ocr-skill",
+        ]
+        for c in candidates:
+            if c.exists() and (c / "SKILL.md").exists():
+                default_skill = str(c)
+                print(f"  Auto-detected: {c}/")
+                break
+
+    if default_skill:
+        skill_path = ask("Skill directory path", default_skill)
+    else:
+        print("  No skill directory found. You can set this later in config.json.")
+        skill_path = ask("Skill directory path (leave blank to skip)", "")
+
+    if skill_path:
+        sp = Path(skill_path)
+        if sp.exists() and (sp / "SKILL.md").exists():
+            # Sync reference files to references/
+            refs_dir = Path(__file__).parent / "references"
+            refs_dir.mkdir(exist_ok=True)
+            synced = 0
+            for ref_name in ["fraktur-errors.md", "texas-german.md", "markup-spec.md"]:
+                src = sp / ref_name
+                dst = refs_dir / ref_name
+                if src.exists():
+                    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+                    synced += 1
+            print(f"  Synced {synced} reference file(s) from skill → references/")
+        else:
+            print(f"  ⚠ Skill directory not found or missing SKILL.md: {skill_path}")
+            skill_path = ""
+
     config = {
         "anthropic_api_key": api_key,
         "claude_model":      chosen_model,
         "tier":              tier,
+        "skill_path":        skill_path,
     }
 
     # Preserve any extra keys the user may have added manually
@@ -216,6 +262,7 @@ def configure_global(existing: dict = None) -> dict:
     print(f"  API key  : {'...' + api_key[-6:] if len(api_key) > 6 else '(not set)'}")
     print(f"  Model    : {chosen_model}")
     print(f"  Tier     : {tier}")
+    print(f"  Skill    : {skill_path or '(not set)'}")
     print()
 
     confirm = ask("Save global settings?", "yes")
@@ -1303,6 +1350,9 @@ def main():
     # Pipeline steps
     p.add_argument("--configure",      action="store_true",
                    help="Run the collection configuration wizard (required on first use)")
+    p.add_argument("--update-skill",   action="store_true",
+                   help="Update reference files from fraktur-ocr skill directory "
+                        "(use with --configure or standalone)")
     p.add_argument("--discover",       action="store_true",
                    help="Scan ARK range to find all issues")
     p.add_argument("--download-ocr",   action="store_true",
@@ -1377,8 +1427,9 @@ def main():
         args.discover    = True
         args.download_ocr = True
 
-    if not any([args.configure, args.discover, args.download_ocr, args.download_pdf,
-                args.preload_images, args.correct, args.translate, args.status]):
+    if not any([args.configure, args.update_skill, args.discover, args.download_ocr,
+                args.download_pdf, args.preload_images, args.correct, args.translate,
+                args.status, args.render_pdf]):
         p.print_help()
         return
 
@@ -1386,6 +1437,46 @@ def main():
     # Global config (API key, model, tier — shared across collections)
     # -----------------------------------------------------------------------
     global_config = load_global_config()
+
+    # ── --update-skill: sync reference files from skill directory ──────────
+    if args.update_skill:
+        skill_path = global_config.get("skill_path", "")
+        if not skill_path:
+            # Try auto-detect
+            candidates = [
+                Path(__file__).parent / "fraktur-ocr skill",
+                Path(__file__).parent / "fraktur-ocr-skill",
+            ]
+            for c in candidates:
+                if c.exists() and (c / "SKILL.md").exists():
+                    skill_path = str(c)
+                    break
+        if not skill_path:
+            print("Error: No skill directory configured. Run --configure first,")
+            print("or set skill_path in config.json.")
+            sys.exit(1)
+        sp = Path(skill_path)
+        if not sp.exists() or not (sp / "SKILL.md").exists():
+            print(f"Error: Skill directory not found: {skill_path}")
+            sys.exit(1)
+        refs_dir = Path(__file__).parent / "references"
+        refs_dir.mkdir(exist_ok=True)
+        synced = 0
+        for ref_name in ["fraktur-errors.md", "texas-german.md", "markup-spec.md"]:
+            src = sp / ref_name
+            dst = refs_dir / ref_name
+            if src.exists():
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+                synced += 1
+                print(f"  Updated: references/{ref_name}")
+        print(f"\nSynced {synced} reference file(s) from {skill_path}")
+        # Also update skill_path in global config if not set
+        if not global_config.get("skill_path"):
+            global_config["skill_path"] = skill_path
+            save_global_config(global_config)
+            print(f"  Saved skill_path to config.json")
+        if not args.configure:
+            return
 
     if args.configure:
         global_config = configure_global(global_config)
