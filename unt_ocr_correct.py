@@ -124,11 +124,11 @@ MODEL_INITIAL = "claude-haiku-4-5"     # Pass 1-2: image + transcription (cheap)
 MODEL_RESOLVE = "claude-sonnet-4-6"    # Pass 3: cross-reference + guess (text-only)
 MODEL_REFINE  = "claude-opus-4-6"      # Future refinement of low-cnf gaps
 
-# Token estimates
-EST_INPUT_TOKENS_PASS12  = 66_000  # image + system prompt + OCR text
-EST_OUTPUT_TOKENS_PASS12 = 4_500   # full page text with gap markers
-EST_INPUT_TOKENS_PASS3   = 10_000  # text-only: Pass 1-2 output + OCR + prompt
-EST_OUTPUT_TOKENS_PASS3  = 4_500   # same text with gaps filled
+# Token estimates (calibrated from real run: 8pp Bellville Wochenblatt)
+EST_INPUT_TOKENS_PASS12  = 15_000  # image (~1MB) + system prompt + OCR text
+EST_OUTPUT_TOKENS_PASS12 = 5_000   # full page text with gap markers
+EST_INPUT_TOKENS_PASS3   = 21_000  # Pass 1-2 output + OCR + system prompt
+EST_OUTPUT_TOKENS_PASS3  = 7_000   # full text with gap analysis + resolution
 MAX_OUTPUT_TOKENS        = 16_000
 
 PRELOAD_LOG_NAME = "preload_failures.json"
@@ -1087,9 +1087,13 @@ cnf scale: 0.95-0.99=promote to plain, 0.80-0.94=auto-resolved,
 0.70-0.79=moderate, 0.40-0.69=low, 0.01-0.39=speculative,
 0.00=pure context guess.
 
-OUTPUT: Return the complete text with gaps resolved. Use the same format
-as the input (LAYOUT/COLUMNS/DAMAGE header, --- delimiters, STATS block).
-Update the STATS to reflect resolved gaps.
+OUTPUT: Return ONLY the complete corrected text. No analysis, no
+reasoning, no commentary — start directly with the LAYOUT line.
+Use the same format as input (LAYOUT/COLUMNS/DAMAGE, --- delimiters,
+STATS block). Update STATS to reflect resolved gaps.
+
+IMPORTANT: Do NOT output gap-by-gap analysis before the text.
+Start your response with "LAYOUT:" immediately.
 
 RULES:
 - Preserve Texas German, period spellings, English loanwords
@@ -1192,11 +1196,7 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     if not has_image and not abbyy_text and not portal_ocr:
         return {"text": "", "markdown": "", "stats": {}, "status": "no_image"}
 
-    # For rate limiter: use output token estimate, not full input.
-    # Image tokens dominate input but don't consume the TPM rate window
-    # the same way text generation does. Using full input (66k) with
-    # default tier (40k TPM) would block 60+ seconds per page.
-    est = EST_OUTPUT_TOKENS_PASS12 + 2000 if has_image else 5_000
+    est = EST_INPUT_TOKENS_PASS12 if has_image else 5_000
 
     p_label = f"p{page_num:02d} pass1-2"
     try:
@@ -1268,6 +1268,12 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 
 def extract_clean_text(raw_response: str) -> str:
     """Extract clean corrected text from Claude's response, stripping markup."""
+    # Handle cases where Claude prefixes analysis before the formatted output
+    # Find the LAYOUT: line as the true start of structured output
+    layout_idx = raw_response.find("LAYOUT:")
+    if layout_idx > 0:
+        raw_response = raw_response[layout_idx:]
+
     # Find text between --- delimiters
     parts = raw_response.split("\n---\n")
     if len(parts) >= 3:
@@ -3136,11 +3142,9 @@ def main():
     pass3_prompt = build_pass3_prompt(config)
     rate_limiter = (limiter_from_tier(args.tier)
                     if ClaudeRateLimiter else None)
-    if args.tier == "default":
-        print("  Note: using 'default' rate tier (40k TPM). If you have"
-              " Build tier access,\n"
-              "  use --tier build for faster processing (80k TPM).",
-              flush=True)
+    if args.tier == "default" and LOG_LEVEL >= 2:
+        log_debug("Using default rate tier (40k TPM). "
+                  "Use --tier build for higher throughput.")
     cost_tracker = CostTracker(MODEL_RESOLVE, budget=args.budget)
 
     log = []
