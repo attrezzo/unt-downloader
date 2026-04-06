@@ -155,52 +155,116 @@ from collections import deque
 
 LOG_LEVEL = 1
 _file_logger = None
-_activity_log = None
+_dashboard = None
 
 
-class ActivityLog:
-    """Thread-safe rolling log of recent worker activity for CLI display."""
+class WorkerDashboard:
+    """Thread-safe per-worker status display. Redraws in-place."""
 
-    def __init__(self, max_items: int = 50):
+    def __init__(self):
         self._lock = threading.Lock()
-        self._items = deque(maxlen=max_items)
-        self._total = 0
-        self._ok = 0
-        self._err = 0
-        self._skip = 0
+        self._workers = {}  # worker_id -> {status, history}
+        self._completed = 0
+        self._errors = 0
+        self._skipped = 0
         self._start_time = time.monotonic()
+        self._total_pages = 0
+        self._cost_tracker = None
+        self._last_render = 0
+        self._render_lines = 0  # how many lines last render drew
 
-    def add(self, msg: str, status: str = "info"):
+    def set_context(self, total_pages, cost_tracker=None):
         with self._lock:
-            self._items.appendleft((time.monotonic(), msg, status))
-            self._total += 1
+            self._total_pages = total_pages
+            self._cost_tracker = cost_tracker
+
+    def update(self, worker_id: str, msg: str, status: str = "info"):
+        """Update a worker's current state."""
+        with self._lock:
+            if worker_id not in self._workers:
+                self._workers[worker_id] = {
+                    "current": "", "history": deque(maxlen=3)}
+            w = self._workers[worker_id]
+            if w["current"]:
+                w["history"].appendleft(w["current"])
+            w["current"] = msg
             if status == "ok":
-                self._ok += 1
+                self._completed += 1
             elif status == "error":
-                self._err += 1
+                self._errors += 1
             elif status == "skip":
-                self._skip += 1
+                self._skipped += 1
 
-    def recent(self, n: int = 5) -> list:
+    def render(self, force=False):
+        """Redraw the dashboard. Throttled to every 0.5s unless forced."""
+        now = time.monotonic()
+        if not force and (now - self._last_render) < 0.5:
+            return
         with self._lock:
-            return list(self._items)[:n]
+            self._last_render = now
+            lines = self._build_lines()
 
-    def stats(self) -> dict:
-        with self._lock:
-            elapsed = time.monotonic() - self._start_time
-            rate = self._ok / (elapsed / 60) if elapsed > 0 else 0
-            return {
-                "total": self._total, "ok": self._ok,
-                "err": self._err, "skip": self._skip,
-                "elapsed": elapsed, "rate": rate,
-            }
+        # Move cursor up to overwrite previous render
+        if self._render_lines > 0:
+            sys.stdout.write(f"\033[{self._render_lines}A\033[J")
+
+        output = "\n".join(lines)
+        sys.stdout.write(output + "\n")
+        sys.stdout.flush()
+        self._render_lines = len(lines)
+
+    def _build_lines(self):
+        lines = []
+        elapsed = time.monotonic() - self._start_time
+        rate = (self._completed / (elapsed / 60)) if elapsed > 60 else 0
+
+        # Progress bar
+        done = self._completed + self._errors + self._skipped
+        total = self._total_pages or 1
+        pct = min(100, done / total * 100)
+        bar_len = 30
+        filled = int(bar_len * done / total)
+        bar = "#" * filled + "-" * (bar_len - filled)
+
+        cost_str = ""
+        if self._cost_tracker:
+            cost_str = f" | ${self._cost_tracker.total_cost:.2f}"
+            if self._cost_tracker.budget:
+                cost_str += f"/${self._cost_tracker.budget:.2f}"
+
+        rate_str = f"{rate:.1f}/min" if rate > 0.1 else f"{elapsed:.0f}s"
+        lines.append(f"  [{bar}] {done}/{total} ({pct:.0f}%)  "
+                     f"ok:{self._completed} err:{self._errors} "
+                     f"skip:{self._skipped}  {rate_str}{cost_str}")
+        lines.append("")
+
+        # Per-worker state
+        for wid in sorted(self._workers.keys()):
+            w = self._workers[wid]
+            icon = ">"
+            lines.append(f"  {icon} {wid:<8} {w['current']}")
+            for old in w["history"]:
+                lines.append(f"    {'':8} {old}")
+
+        lines.append("")
+        return lines
+
+    def final_summary(self):
+        """Print non-overwriting final summary."""
+        # Clear the dashboard
+        if self._render_lines > 0:
+            sys.stdout.write(f"\033[{self._render_lines}A\033[J")
+            self._render_lines = 0
+        elapsed = time.monotonic() - self._start_time
+        print(f"  Completed: {self._completed}  Errors: {self._errors}  "
+              f"Skipped: {self._skipped}  Time: {elapsed:.0f}s", flush=True)
 
 
 def init_logging(collection_dir: Path, log_level: int):
-    """Initialize file logger and activity log."""
-    global _file_logger, _activity_log, LOG_LEVEL
+    """Initialize file logger and dashboard."""
+    global _file_logger, _dashboard, LOG_LEVEL
     LOG_LEVEL = log_level
-    _activity_log = ActivityLog()
+    _dashboard = WorkerDashboard()
 
     if log_level >= 2:
         log_dir = collection_dir / "logs"
@@ -224,79 +288,39 @@ def log_debug(msg: str, level: int = 2):
         _file_logger.debug(msg)
 
 
-def log_event(msg: str, status: str = "info"):
-    """Record an event: always prints to stdout, adds to activity log,
-    and writes to file log if enabled."""
-    icon = {"ok": "+", "error": "X", "skip": "-"}.get(status, " ")
-    print(f"  {icon} {msg}", flush=True)
-    if _activity_log:
-        _activity_log.add(msg, status)
+def log_event(msg: str, status: str = "info", worker: str = ""):
+    """Record an event: updates dashboard, writes to file log."""
+    if _dashboard and worker:
+        _dashboard.update(worker, msg, status)
+        _dashboard.render()
+    elif _dashboard:
+        # No worker specified — just print directly
+        icon = {"ok": "+", "error": "X", "skip": "-"}.get(status, " ")
+        print(f"  {icon} {msg}", flush=True)
     if _file_logger:
-        _file_logger.info(msg)
+        _file_logger.info(f"{worker} {msg}" if worker else msg)
 
 
 def tprint(*args, worker: str = "", level: int = 1, **kwargs):
-    """Print to stdout (level 1) and/or file log (all levels).
-    Level 1 always prints. Level 2+ only prints to file."""
+    """Print to stdout (level 1) and/or file log (all levels)."""
     msg = ' '.join(str(a) for a in args)
-    prefix = f"[{worker}] " if worker else ""
-    full = f"{prefix}{msg}"
-    # Level 1: always show on stdout
     if level <= 1:
-        print(f"  {full}", flush=True)
-        if _activity_log:
-            _activity_log.add(msg, "info")
-    # All levels: write to file if logging enabled
+        if _dashboard and worker:
+            _dashboard.update(worker, msg, "info")
+            _dashboard.render()
+        else:
+            print(f"  {msg}", flush=True)
     if _file_logger and level <= LOG_LEVEL:
-        _file_logger.debug(full)
+        prefix = f"[{worker}] " if worker else ""
+        _file_logger.debug(f"{prefix}{msg}")
 
 
 def print_status(cost_tracker=None, step_name="OCR Correction",
                  progress_current=0, progress_total=0):
-    """Print a clean status block to stdout."""
-    if not _activity_log:
-        return
-
-    s = _activity_log.stats()
-
-    lines = []
-    lines.append("")
-    lines.append(f"  {step_name}")
-
-    if progress_total > 0:
-        pct = progress_current / progress_total * 100
-        bar_len = 30
-        filled = int(bar_len * progress_current / progress_total)
-        bar = "#" * filled + "-" * (bar_len - filled)
-        lines.append(f"  [{bar}] {progress_current}/{progress_total} "
-                     f"({pct:.0f}%)")
-
-    cost_str = ""
-    if cost_tracker:
-        cost_str = f" | Cost: ${cost_tracker.total_cost:.2f}"
-        if cost_tracker.budget:
-            cost_str += f"/${cost_tracker.budget:.2f}"
-
-    rate_str = f"{s['rate']:.1f}/min" if s['rate'] > 0 else "--"
-    lines.append(f"  Done: {s['ok']}  Skip: {s['skip']}  "
-                 f"Err: {s['err']}  Rate: {rate_str}{cost_str}")
-    lines.append("")
-
-    recent = _activity_log.recent(5)
-    now = time.monotonic()
-    if recent:
-        lines.append("  Recent:")
-        for ts, msg, status in recent:
-            ago = now - ts
-            if ago < 60:
-                ago_str = f"{ago:.0f}s ago"
-            else:
-                ago_str = f"{ago/60:.0f}m ago"
-            icon = {"ok": "+", "error": "X", "skip": "-"}.get(status, " ")
-            lines.append(f"    {icon} {msg:<55} ({ago_str})")
-    lines.append("")
-
-    print("\n".join(lines), flush=True)
+    """Trigger a dashboard render with updated context."""
+    if _dashboard:
+        _dashboard.set_context(progress_total, cost_tracker)
+        _dashboard.render(force=True)
 
 
 def init_paths(collection_dir: Path):
@@ -690,9 +714,14 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
                     now = time.monotonic()
                     if now - last_report >= report_interval:
                         elapsed = now - t_start
-                        print(f"    {label} generating... "
-                              f"~{out_tokens} tok  {elapsed:.0f}s",
-                              flush=True)
+                        wid = label.split()[0] if label else ""
+                        msg = (f"generating ~{out_tokens} tok  "
+                               f"{elapsed:.0f}s")
+                        if _dashboard and wid:
+                            _dashboard.update(wid, msg, "info")
+                            _dashboard.render()
+                        else:
+                            print(f"    {label} {msg}", flush=True)
                         last_report = now
 
             elif etype == "message_start":
@@ -735,9 +764,12 @@ def claude_api_call(payload: dict, api_key: str,
                     rate_limiter=None, est_tokens: int = 8000,
                     cost_tracker=None, label: str = ""):
     """Make a Claude API call with retry/rate-limit. Returns (text, usage).
-    Uses streaming when LOG_LEVEL >= 4 for progress feedback."""
+    Uses streaming when LOG_LEVEL >= 4 for progress feedback.
+    label format: 'p01 pass1-2' — first token used as worker ID."""
     model = payload.get("model", "?")
     use_streaming = LOG_LEVEL >= 4
+    # Extract worker ID from label (e.g. "p01" from "p01 pass1-2")
+    wid = label.split()[0] if label else ""
     log_debug(f"API call: model={model} max_tokens={payload.get('max_tokens')} "
               f"est={est_tokens} stream={use_streaming} label={label}",
               level=3)
@@ -768,17 +800,17 @@ def claude_api_call(payload: dict, api_key: str,
     if rate_limiter:
         t_wait = time.monotonic()
         if label:
-            log_event(f"{label} waiting for rate limiter...")
+            log_event(f"{label} waiting for rate limiter...", worker=wid)
         rate_limiter.acquire(estimated_tokens=est_tokens)
         waited = time.monotonic() - t_wait
         if waited > 1.0 and label:
-            log_event(f"{label} rate limiter wait: {waited:.0f}s")
+            log_event(f"{label} rate limiter wait: {waited:.0f}s", worker=wid)
 
     for attempt in range(1, 4):
         t0 = time.monotonic()
         if label:
             mode = " (streaming)" if use_streaming else ""
-            log_event(f"{label} sending {req_mb:.1f}MB to {model}{mode}...")
+            log_event(f"{label} sending {req_mb:.1f}MB to {model}{mode}...", worker=wid)
         try:
             if use_streaming:
                 text, usage = _claude_call_streaming(
@@ -1108,12 +1140,14 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
             api_key, rate_limiter, est_tokens=est,
             cost_tracker=cost_tracker, label=p_label)
     except Exception as e:
-        log_event(f"p{page_num:02d} pass 1-2 FAILED  {e}", "error")
+        log_event(f"pass 1-2 FAILED  {e}", "error",
+                  worker=f"p{page_num:02d}")
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": str(e)}
 
     if not pass12_raw.strip():
-        log_event(f"p{page_num:02d} pass 1-2 empty response", "error")
+        log_event(f"pass 1-2 empty response", "error",
+                  worker=f"p{page_num:02d}")
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": "empty pass 1-2 response"}
 
@@ -1140,8 +1174,8 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
             api_key, rate_limiter, est_tokens=EST_INPUT_TOKENS_PASS3,
             cost_tracker=cost_tracker, label=p3_label)
     except Exception as e:
-        log_event(f"p{page_num:02d} pass 3 FAILED  {e} (using pass 1-2)",
-                  "error")
+        log_event(f"pass 3 FAILED  {e} (using pass 1-2)",
+                  "error", worker=f"p{page_num:02d}")
         raw = pass12_raw
 
     if not raw.strip():
@@ -1706,22 +1740,23 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
             _, res = result
             pages_done += 1
             page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
+            wid = f"p{pg:02d}"
             if res["status"] == "ok":
                 corrected_pages[pg] = res["text"]
                 page_md_path.write_text(
                     res["markdown"], encoding="utf-8")
-                log_event(
-                    f"p{pg:02d} COMPLETE  {ark_id}  "
-                    f"{len(res['text'])} chars", "ok")
+                log_event(f"COMPLETE {ark_id} "
+                          f"{len(res['text'])} chars", "ok",
+                          worker=wid)
             elif res["status"] == "no_image":
-                log_event(f"p{pg:02d} {ark_id}  no image", "skip")
+                log_event(f"{ark_id} no image", "skip", worker=wid)
                 corrected_pages[pg] = ""
             elif res["status"] in ("budget", "interrupted"):
-                log_event(f"p{pg:02d} {ark_id}  {res['status']}", "skip")
+                log_event(f"{ark_id} {res['status']}", "skip",
+                          worker=wid)
             else:
-                log_event(
-                    f"p{pg:02d} {ark_id}  "
-                    f"{res.get('error', 'unknown')}", "error")
+                log_event(f"{ark_id} {res.get('error', 'unknown')}",
+                          "error", worker=wid)
                 corrected_pages[pg] = (
                     f"[CORRECTION FAILED: "
                     f"{res.get('error', 'unknown')}]")
