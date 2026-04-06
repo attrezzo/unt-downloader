@@ -2584,7 +2584,7 @@ def refine_image(issues, config, collection_dir, api_key,
 # ---------------------------------------------------------------------------
 
 def build_full_review_prompt(config: dict) -> str:
-    """System prompt for full-page review. Sends entire image + ai_ocr text."""
+    """System prompt for full-page review. Returns change list, not full text."""
     header = _build_collection_header(config)
     fraktur_errors = load_reference("fraktur-errors.md")
     texas_german = load_reference("texas-german.md")
@@ -2602,56 +2602,151 @@ REFERENCE: TEXAS GERMAN VOCABULARY & ORTHOGRAPHY
 ==================================================
 {texas_german}
 
-YOUR TASK: FULL-PAGE REVIEW AND CORRECTION
-=============================================
+YOUR TASK: FULL-PAGE REVIEW
+=============================
 
 You receive the FULL PAGE IMAGE and the current AI OCR transcription
-(with {{{{ gap }}}} markers). Review the ENTIRE transcription against the
-image — not just the gaps.
+(with {{{{ gap }}}} markers and line numbers). Review the ENTIRE
+transcription against the image — not just the gaps.
 
-INSTRUCTIONS:
-1. Read the full page image carefully, comparing against the provided text
-2. Fix any errors in the plain text (misspellings, wrong characters, missing
-   words, column interleaving)
-3. For each existing {{{{ gap }}}} tag:
-   - Re-examine the image at that location
-   - Update the guess and cnf if you can improve them
-   - Promote to plain text (remove gap tag) if cnf >= 0.95
-4. If you find NEW uncertain regions that should be gaps, add them with
-   proper {{{{ gap }}}} tags including est, imgbbox, cnf, fragments, region_ocr
-5. EVERY gap tag MUST have a cnf score and [guess]. No exceptions.
-6. Verify column boundaries — text in column 1 should not merge with column 2
+IMPORTANT: The existing file is the source of truth. You are making
+surgical corrections, NOT rewriting the document. Most of the text
+is probably correct. Only report lines that need changes.
 
-CRITICAL:
-- Transcribe EVERY word. Never summarize or describe text.
-- Preserve Texas German dialect, pre-1901 spellings, English loanwords
-- Do NOT translate
-- Large damaged regions: use gap tags with large est, not descriptions
-- The fragments field is character-level (use ~ for unreadable chars)
+REVIEW CHECKLIST:
+1. Compare the image against the transcription line by line
+2. Look for: wrong characters, missing words, column interleaving,
+   Fraktur misreadings (ſ/s, n/u, cl/d, etc.)
+3. For {{{{ gap }}}} tags: re-examine the image, update guess and cnf
+4. Check that column boundaries are correct
+5. Preserve Texas German dialect, pre-1901 spellings, English loanwords
 
-OUTPUT: Return the COMPLETE corrected text in the same format as input.
-Include the LAYOUT/COLUMNS/DAMAGE header, --- delimiters, and STATS block.
-Update STATS to reflect any changes."""
+OUTPUT FORMAT — return ONLY a list of changes, one per block:
+
+For correcting plain text errors:
+```
+REPLACE line NN:
+OLD: exact text of the original line
+NEW: corrected text of the line
+```
+
+For updating a gap tag (improved guess or confidence):
+```
+REPLACE line NN:
+OLD: {{{{ gap | est=12 | imgbbox="..." | cnf="0.45" | fragments="..." | region_ocr="..." [old guess] }}}}
+NEW: {{{{ gap | est=12 | imgbbox="..." | cnf="0.85" | fragments="..." | region_ocr="..." [better guess] }}}}
+```
+
+For promoting a gap to plain text (cnf >= 0.95):
+```
+REPLACE line NN:
+OLD: {{{{ gap | est=8 | imgbbox="..." | cnf="0.60" | fragments="..." [Verfassung] }}}}
+NEW: Verfassung
+```
+
+For inserting a missing line:
+```
+INSERT after line NN:
+NEW: the missing text
+```
+
+RULES:
+- The OLD text must match the original EXACTLY (it's used for find-replace)
+- Never remove or skip sections — only fix errors you can verify in the image
+- Preserve ALL {{{{ gap }}}} tags unless promoting (cnf >= 0.95)
+- Preserve ALL {{{{ Column }}}}, {{{{ Ad }}}}, {{{{ Img }}}} markers
+- Every gap you modify MUST keep est, imgbbox, fragments, region_ocr intact
+- Only change cnf and [guess] in gap tags unless the bbox is clearly wrong
+- If the page looks correct, return: NO CHANGES NEEDED"""
+
+
+def _apply_full_review_changes(text: str, changes_text: str) -> tuple:
+    """Apply surgical changes from full-review response to original text.
+    Returns (new_text, num_applied, num_failed)."""
+    if "NO CHANGES NEEDED" in changes_text:
+        return text, 0, 0
+
+    lines = text.split("\n")
+    applied = 0
+    failed = 0
+    inserts = []  # (after_line, new_text) — applied in reverse order
+
+    # Parse REPLACE blocks
+    for m in re.finditer(
+            r'REPLACE line (\d+):\s*\nOLD:\s*(.+?)\s*\nNEW:\s*(.+?)(?=\n(?:REPLACE|INSERT|$))',
+            changes_text, re.S):
+        line_num = int(m.group(1))
+        old_text = m.group(2).strip()
+        new_text = m.group(3).strip()
+        idx = line_num - 1  # 0-indexed
+
+        if 0 <= idx < len(lines):
+            # Try exact match first
+            if lines[idx].strip() == old_text:
+                lines[idx] = new_text
+                applied += 1
+            else:
+                # Try fuzzy: find the old text anywhere in the file
+                found = False
+                for i, line in enumerate(lines):
+                    if line.strip() == old_text:
+                        lines[i] = new_text
+                        applied += 1
+                        found = True
+                        break
+                if not found:
+                    # Try substring match for gap tags
+                    for i, line in enumerate(lines):
+                        if old_text in line:
+                            lines[i] = line.replace(old_text, new_text, 1)
+                            applied += 1
+                            found = True
+                            break
+                if not found:
+                    failed += 1
+                    log_debug(f"  REPLACE failed line {line_num}: "
+                              f"OLD not found: {old_text[:80]}", level=2)
+        else:
+            failed += 1
+
+    # Parse INSERT blocks
+    for m in re.finditer(
+            r'INSERT after line (\d+):\s*\nNEW:\s*(.+?)(?=\n(?:REPLACE|INSERT|$))',
+            changes_text, re.S):
+        line_num = int(m.group(1))
+        new_text = m.group(2).strip()
+        inserts.append((line_num, new_text))
+        applied += 1
+
+    # Apply inserts in reverse order so line numbers stay valid
+    for line_num, new_text in sorted(inserts, reverse=True):
+        idx = min(line_num, len(lines))
+        lines.insert(idx, new_text)
+
+    return "\n".join(lines), applied, failed
 
 
 def _refine_full_page(page_file, ark_id, config, model, prompt,
                       api_key, rate_limiter, cost_tracker):
-    """Full-page review of one page. Returns (changed: bool)."""
+    """Full-page review of one page. Returns (applied, failed)."""
     if _interrupted or (cost_tracker and cost_tracker.would_exceed_budget()):
-        return False
+        return 0, 0
 
     pg_match = re.search(r'page_(\d+)', page_file.stem)
     if not pg_match:
-        return False
+        return 0, 0
     pg_num = int(pg_match.group(1))
 
     text = page_file.read_text(encoding="utf-8")
     img_bytes, img_type = fetch_page_image(ark_id, pg_num)
     if not img_bytes:
         tprint(f"  {ark_id}/p{pg_num}: no image, skipping", level=1)
-        return False
+        return 0, 0
 
-    # Build content: image + current ai_ocr text
+    # Send text with line numbers so Claude can reference specific lines
+    numbered = "\n".join(f"{i+1:4d}| {line}"
+                         for i, line in enumerate(text.split("\n")))
+
     content = [
         {"type": "image", "source": {
             "type": "base64",
@@ -2659,10 +2754,12 @@ def _refine_full_page(page_file, ark_id, config, model, prompt,
             "data": base64.standard_b64encode(img_bytes).decode("ascii"),
         }},
         {"type": "text", "text": (
-            f"Current AI OCR transcription for page {pg_num}:\n"
-            f"```\n{text}\n```\n\n"
-            "Review and correct the full transcription against the image. "
-            "Return the complete corrected text."
+            f"Current AI OCR transcription for page {pg_num} "
+            f"(line numbers for reference):\n"
+            f"```\n{numbered}\n```\n\n"
+            "Review against the image. Return ONLY the changes needed "
+            "(REPLACE/INSERT blocks with line numbers). "
+            "If the page is correct, return: NO CHANGES NEEDED"
         )},
     ]
 
@@ -2680,16 +2777,26 @@ def _refine_full_page(page_file, ark_id, config, model, prompt,
             force_stream=True)
     except Exception as e:
         tprint(f"  {ark_id}/p{pg_num}: error: {e}", level=1)
-        return False
+        return 0, 0
 
-    if result and result.strip() and result.strip() != text.strip():
-        page_file.write_text(result.strip() + "\n", encoding="utf-8")
-        log_event(f"p{pg_num:02d} updated  {len(result)} chars",
+    if not result or not result.strip():
+        log_event(f"p{pg_num:02d} empty response", worker=label)
+        return 0, 0
+
+    new_text, applied, failed = _apply_full_review_changes(text, result)
+
+    if applied > 0 and new_text != text:
+        page_file.write_text(new_text, encoding="utf-8")
+        log_event(f"p{pg_num:02d} {applied} changes applied"
+                  f"{f', {failed} failed' if failed else ''}",
                   worker=label)
-        return True
+    elif applied == 0:
+        log_event(f"p{pg_num:02d} no changes", worker=label)
     else:
-        log_event(f"p{pg_num:02d} unchanged", worker=label)
-        return False
+        log_event(f"p{pg_num:02d} {failed} changes failed to apply",
+                  worker=label)
+
+    return applied, failed
 
 
 def refine_full(issues, config, collection_dir, api_key,
@@ -2716,15 +2823,14 @@ def refine_full(issues, config, collection_dir, api_key,
         return 0
 
     if _dashboard:
-        # Estimate ~8000 output tokens per page for token-based progress
+        # Change lists are ~2000-4000 tokens per page (much less than full rewrite)
         _dashboard.set_context(total_pages=len(page_items),
                                cost_tracker=cost_tracker,
                                steps_per_page=1,
-                               est_output_tokens=8000 * len(page_items))
+                               est_output_tokens=3000 * len(page_items))
 
-    changed_count = 0
+    total_applied = total_failed = 0
     global _interrupted
-    # Full review is expensive — default to serial (1 worker)
     ex = ThreadPoolExecutor(max_workers=api_workers)
     futures = {
         ex.submit(_refine_full_page, pf, aid, config, model, prompt,
@@ -2744,11 +2850,11 @@ def refine_full(issues, config, collection_dir, api_key,
             for fut in done_batch:
                 pf, aid = futures.pop(fut)
                 try:
-                    changed = fut.result(timeout=0)
+                    applied, failed = fut.result(timeout=0)
                 except Exception:
-                    changed = False
-                if changed:
-                    changed_count += 1
+                    applied, failed = 0, 0
+                total_applied += applied
+                total_failed += failed
                 if _dashboard:
                     _dashboard.page_done()
                 if cost_tracker:
@@ -2761,8 +2867,10 @@ def refine_full(issues, config, collection_dir, api_key,
             f.cancel()
     ex.shutdown(wait=False)
 
-    print(f"\nFull review: {changed_count}/{len(page_items)} pages updated")
-    return changed_count
+    print(f"\nFull review: {total_applied} changes applied"
+          f"{f', {total_failed} failed' if total_failed else ''}"
+          f" across {len(page_items)} pages")
+    return total_applied
 
 
 # ---------------------------------------------------------------------------
