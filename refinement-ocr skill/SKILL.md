@@ -5,7 +5,7 @@ description: Refinement pipeline for improving low-confidence OCR gap tags produ
 
 # OCR Refinement Pipeline
 
-Two refinement modes for improving `{{ gap }}` tags from the initial OCR pipeline. Both modes update gap tags in-place in the `ai_ocr/` page files, then regenerate `corrected/` and `readable/` output.
+Two refinement modes for improving `{{ gap }}` tags from the initial OCR pipeline. Both modes update gap tags in-place in the `ai_ocr/` page files.
 
 ## When to Use
 
@@ -13,6 +13,37 @@ Two refinement modes for improving `{{ gap }}` tags from the initial OCR pipelin
 - After updating vocabulary references (`--update-skill`)
 - When you want to improve low-confidence gaps without re-processing entire pages
 - When new reference data (ABBYY XML, better Texas German vocabulary) is available
+
+---
+
+## Critical Rules (apply to ALL refinement modes)
+
+**NEVER summarize, describe, or skip text.** Every word must be transcribed. Writing "[illegible classified ads]" or "[damaged text]" is WRONG — use gap tags for parts you cannot read. Even badly degraded text usually has readable words between the damaged regions.
+
+**Every gap MUST use the standard format:**
+```
+{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="raw_chars" | region_ocr="raw_ocr" [best guess] }}
+```
+
+**Large gaps are valid.** If an entire line or paragraph is damaged, use a single gap tag with a large `est` value and the bbox covering the full region. Do not replace it with a description or placeholder. Record whatever fragments are visible and provide a best guess with appropriate low confidence.
+
+**The `fragments` field is a character-level reading** — what the individual letters literally look like, even if garbled. Use `~` for each unreadable character.
+- Good: `fragments="Ber~~~lung"`, `fragments="$ouft~~~b"`, `fragments="nid)t"`
+- Bad: `fragments="illegible text"`, `fragments="likely a name"`, `fragments="[damaged]"`
+
+**`region_ocr` MUST contain the exact raw OCR text**, uncorrected. Never clean, correct, or omit it.
+
+**Preserve all existing fields** when updating a gap. Only change `cnf`, `status`, and `[guess]`. Never drop `imgbbox`, `est`, `fragments`, or `region_ocr`.
+
+---
+
+## Newspaper Layout Awareness
+
+When examining gaps in context, be aware of 19th-century newspaper layout:
+
+- **Columns** run the full height of the page, top to bottom. A gap at the bottom of column 1 is contextually related to text above it in the same column, not to text in column 2.
+- **Advertisements** interrupt column flow. They use different fonts (bold, italic, non-Fraktur), decorative borders, centered text, or images. When an ad interrupts columns, column text continues above and below the ad.
+- **Column interleaving** is a common OCR failure — watch for sudden topic changes or grammatically disconnected sentences that suggest two columns were merged.
 
 ---
 
@@ -45,6 +76,12 @@ For each gap:
 - If cnf reaches >= 0.80 → add `status=auto-resolved`
 - If you can't improve on the existing guess → leave the gap unchanged
 - Preserve `imgbbox`, `est`, `fragments`, `region_ocr` — only change `cnf` and the `[guess]`
+
+**DO NOT:**
+- Replace gaps with descriptions or summaries
+- Drop any fields from gap tags
+- Correct Texas German dialect words or pre-1901 spellings
+- Translate English loanwords to German
 
 **Output format:**
 For each gap, return one of:
@@ -83,6 +120,8 @@ Multiple gaps in the same region of the page should be batched into a single API
 
 You receive a cropped region of a newspaper page image and one or more gap tags from that region, each with surrounding context.
 
+**CRITICAL:** Transcribe what you see. Never write descriptions like "[degraded text]" or "[unreadable]". If characters are visible, record them in fragments. If nothing is visible, set cnf="0.00" with your best context-based guess.
+
 For each gap:
 1. Examine the cropped image carefully at the gap location
 2. Look for letterforms, ascenders, descenders, dots, stroke patterns
@@ -94,6 +133,13 @@ For each gap:
 - cnf >= 0.95 → promote to plain text
 - cnf >= 0.80 → add `status=auto-resolved`
 - Can't improve → leave unchanged
+- Preserve all fields — only change `cnf`, `status`, and `[guess]`
+
+**DO NOT:**
+- Replace gaps with descriptions or summaries
+- Write "[illegible]" or "[damaged]" instead of using gap tags
+- Correct Texas German or pre-1901 spellings
+- Translate English loanwords
 
 **Output format:** Same as text refinement.
 
