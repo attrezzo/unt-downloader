@@ -23,8 +23,9 @@ USAGE:
 import os, sys, json, time, re, base64, argparse, threading
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 import urllib.request, urllib.error
+import signal
 
 try:
     from claude_rate_limiter import ClaudeRateLimiter, limiter_from_tier
@@ -36,6 +37,61 @@ try:
     from unt_cost_estimate import load_pricing
 except ImportError:
     load_pricing = None
+
+# ============================================================================
+# INTERRUPT HANDLING
+# ============================================================================
+
+_interrupted = False
+
+
+def _handle_sigint(sig, frame):
+    """Set interrupt flag on Ctrl+C so threads can exit cleanly."""
+    global _interrupted
+    if _interrupted:
+        # Second Ctrl+C — force exit
+        print("\n  Force quit.", flush=True)
+        os._exit(1)
+    _interrupted = True
+    print("\n  Interrupt received — finishing current API calls, "
+          "then stopping...", flush=True)
+
+
+# Install handler at import time
+signal.signal(signal.SIGINT, _handle_sigint)
+
+
+def run_parallel(fn, items, max_workers=3, label="items"):
+    """Run fn over items with a thread pool. Handles Ctrl+C cleanly.
+    fn(item) -> result. Returns list of (item, result) pairs."""
+    global _interrupted
+    _interrupted = False
+    results = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(fn, item): item for item in items}
+        try:
+            for fut in as_completed(futures):
+                if _interrupted:
+                    # Cancel pending futures
+                    for f in futures:
+                        f.cancel()
+                    print(f"  Stopped. {len(results)}/{len(items)} "
+                          f"{label} completed.", flush=True)
+                    break
+                try:
+                    results.append((futures[fut], fut.result()))
+                except Exception as e:
+                    results.append((futures[fut], e))
+        except KeyboardInterrupt:
+            _interrupted = True
+            for f in futures:
+                f.cancel()
+            print(f"\n  Stopped. {len(results)}/{len(items)} "
+                  f"{label} completed.", flush=True)
+
+    return results
+
 
 # ============================================================================
 # CONSTANTS
@@ -1457,9 +1513,10 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     else:
         def _correct_one(pg):
             """Correct a single page (runs in thread pool)."""
+            if _interrupted:
+                return pg, {"status": "interrupted", "text": ""}
             if cost_tracker and cost_tracker.would_exceed_budget():
                 return pg, {"status": "budget", "text": ""}
-            tprint(f"  p{pg:02d} correcting ...", worker=worker_id, level=1)
             result = correct_page(
                 ark_id, pg, actual_pages, newspaper, date, fname,
                 pass12_prompt, pass3_prompt, api_key,
@@ -1467,37 +1524,44 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
             return pg, result
 
         pages_done = 0
-        with ThreadPoolExecutor(max_workers=api_workers) as ex:
-            futures = {ex.submit(_correct_one, pg): pg for pg in pages_todo}
-            for fut in as_completed(futures):
-                pg, result = fut.result()
-                pages_done += 1
-                page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
-                if result["status"] == "ok":
-                    corrected_pages[pg] = result["text"]
-                    page_md_path.write_text(
-                        result["markdown"], encoding="utf-8")
-                    log_event(
-                        f"p{pg:02d} COMPLETE  {ark_id}  "
-                        f"{len(result['text'])} chars", "ok")
-                elif result["status"] == "no_image":
-                    log_event(f"p{pg:02d} {ark_id}  no image", "skip")
-                    corrected_pages[pg] = ""
-                elif result["status"] == "budget":
-                    log_event(f"p{pg:02d} {ark_id}  budget limit", "skip")
-                else:
-                    log_event(
-                        f"p{pg:02d} {ark_id}  "
-                        f"{result.get('error', 'unknown')}", "error")
-                    corrected_pages[pg] = (
-                        f"[CORRECTION FAILED: "
-                        f"{result.get('error', 'unknown')}]")
+        page_results = run_parallel(
+            _correct_one, pages_todo,
+            max_workers=api_workers, label="pages")
 
-                # Status display after each page
-                print_status(cost_tracker,
-                             step_name="AI OCR Correction",
-                             progress_current=pages_done,
-                             progress_total=actual_pages)
+        for pg, result in page_results:
+            if isinstance(result, Exception):
+                log_event(f"p{pg:02d} {ark_id}  {result}", "error")
+                corrected_pages[pg] = (
+                    f"[CORRECTION FAILED: {result}]")
+                continue
+            # result is (pg, dict) from _correct_one
+            _, res = result
+            pages_done += 1
+            page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
+            if res["status"] == "ok":
+                corrected_pages[pg] = res["text"]
+                page_md_path.write_text(
+                    res["markdown"], encoding="utf-8")
+                log_event(
+                    f"p{pg:02d} COMPLETE  {ark_id}  "
+                    f"{len(res['text'])} chars", "ok")
+            elif res["status"] == "no_image":
+                log_event(f"p{pg:02d} {ark_id}  no image", "skip")
+                corrected_pages[pg] = ""
+            elif res["status"] in ("budget", "interrupted"):
+                log_event(f"p{pg:02d} {ark_id}  {res['status']}", "skip")
+            else:
+                log_event(
+                    f"p{pg:02d} {ark_id}  "
+                    f"{res.get('error', 'unknown')}", "error")
+                corrected_pages[pg] = (
+                    f"[CORRECTION FAILED: "
+                    f"{res.get('error', 'unknown')}]")
+
+            print_status(cost_tracker,
+                         step_name="AI OCR Correction",
+                         progress_current=pages_done,
+                         progress_total=actual_pages)
 
     # Write corrected/ file
     out_lines = [header, ""]
@@ -1777,7 +1841,7 @@ def apply_refinement_results(page_text: str, gaps: list,
 def _refine_text_page(page_file, cnf_min, cnf_max, include_resolved,
                       model, prompt, api_key, rate_limiter, cost_tracker):
     """Refine one page's gaps (text-only). Returns (updated, promoted, unchanged)."""
-    if cost_tracker and cost_tracker.would_exceed_budget():
+    if _interrupted or (cost_tracker and cost_tracker.would_exceed_budget()):
         return 0, 0, 0
     text = page_file.read_text(encoding="utf-8")
     gaps = parse_gaps(text)
@@ -1790,8 +1854,8 @@ def _refine_text_page(page_file, cnf_min, cnf_max, include_resolved,
     if not eligible:
         return 0, 0, 0
 
-    tprint(f"  {page_file.parent.name}/{page_file.name}: "
-           f"{len(eligible)} gaps", level=1)
+    log_event(f"{page_file.parent.name}/{page_file.name}: "
+              f"{len(eligible)} gaps")
 
     batch_lines = []
     for i, g in enumerate(eligible, 1):
@@ -1852,19 +1916,20 @@ def refine_text(issues, config, collection_dir, api_key,
 
     total_updated = total_promoted = total_unchanged = 0
 
-    with ThreadPoolExecutor(max_workers=api_workers) as ex:
-        futures = {
-            ex.submit(
-                _refine_text_page, pf, cnf_min, cnf_max,
-                include_resolved, model, prompt,
-                api_key, rate_limiter, cost_tracker
-            ): pf for pf in page_files
-        }
-        for fut in as_completed(futures):
-            u, p, uc = fut.result()
-            total_updated += u
-            total_promoted += p
-            total_unchanged += uc
+    def _run_text(pf):
+        return _refine_text_page(
+            pf, cnf_min, cnf_max, include_resolved,
+            model, prompt, api_key, rate_limiter, cost_tracker)
+
+    results = run_parallel(_run_text, page_files,
+                           max_workers=api_workers, label="pages")
+    for pf, res in results:
+        if isinstance(res, Exception):
+            continue
+        u, p, uc = res
+        total_updated += u
+        total_promoted += p
+        total_unchanged += uc
 
     print(f"\nText refinement: {total_promoted} promoted, "
           f"{total_updated} updated, {total_unchanged} unchanged")
@@ -1876,7 +1941,7 @@ def _refine_image_page(page_file, ark_id, cnf_min, cnf_max,
                        api_key, rate_limiter, cost_tracker):
     """Refine one page's gaps with image cropping. Returns (updated, promoted).
     Groups within a page are processed sequentially (they modify same text)."""
-    if cost_tracker and cost_tracker.would_exceed_budget():
+    if _interrupted or (cost_tracker and cost_tracker.would_exceed_budget()):
         return 0, 0
     text = page_file.read_text(encoding="utf-8")
     gaps = parse_gaps(text)
@@ -1987,18 +2052,20 @@ def refine_image(issues, config, collection_dir, api_key,
 
     total_updated = total_promoted = 0
 
-    with ThreadPoolExecutor(max_workers=api_workers) as ex:
-        futures = {
-            ex.submit(
-                _refine_image_page, pf, ark_id, cnf_min, cnf_max,
-                include_resolved, model, prompt,
-                api_key, rate_limiter, cost_tracker
-            ): pf for pf, ark_id in page_items
-        }
-        for fut in as_completed(futures):
-            u, p = fut.result()
-            total_updated += u
-            total_promoted += p
+    def _run_img(item):
+        pf, aid = item
+        return _refine_image_page(
+            pf, aid, cnf_min, cnf_max, include_resolved,
+            model, prompt, api_key, rate_limiter, cost_tracker)
+
+    results = run_parallel(_run_img, page_items,
+                           max_workers=api_workers, label="pages")
+    for item, res in results:
+        if isinstance(res, Exception):
+            continue
+        u, p = res
+        total_updated += u
+        total_promoted += p
 
     print(f"\nImage refinement: {total_promoted} promoted, "
           f"{total_updated} updated")
@@ -2762,7 +2829,10 @@ def main():
                f"No.{issue.get('number', '?')}  "
                f"{issue.get('date', '')}", level=1)
 
-        # Budget check before starting issue
+        # Budget or interrupt check before starting issue
+        if _interrupted:
+            print("\n  Interrupted by user.", flush=True)
+            break
         if cost_tracker.would_exceed_budget():
             tprint(f"\nBUDGET LIMIT REACHED. {cost_tracker.summary()}",
                    level=1)
