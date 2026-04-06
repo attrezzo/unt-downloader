@@ -160,12 +160,24 @@ _file_logger = None
 _dashboard = None
 
 
-class WorkerDashboard:
-    """Thread-safe worker status display. Event-driven, PowerShell-safe.
+def _enable_ansi():
+    """Enable ANSI escape code processing on Windows."""
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # STD_OUTPUT_HANDLE = -11
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_ulong()
+            kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except Exception:
+            pass  # Fall back to scrolling output
 
-    Renders a compact block each time a step completes (pass 1-2 done,
-    pass 3 done) or a page finishes. Each render scrolls — no ANSI,
-    no \\r, no overwriting.
+
+class WorkerDashboard:
+    """Thread-safe worker status display with in-place ANSI updates.
 
     Layout:
         [########---------] 3/8 pages (38%)  $0.64  ETA 2m 10s
@@ -177,6 +189,7 @@ class WorkerDashboard:
     STEPS_PER_PAGE = 2
 
     def __init__(self):
+        _enable_ansi()
         self._lock = threading.Lock()
         self._workers = {}       # wid -> {current, t_start, history}
         self._steps_done = 0
