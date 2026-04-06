@@ -16,6 +16,7 @@ __pycache__/
 */confidence/
 */artifacts/
 */pdf/
+*/logs/
 # Ignore real configs (contain API keys) — use *.example.json as templates
 config.json
 collection.json
