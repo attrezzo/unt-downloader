@@ -1053,8 +1053,14 @@ def download_all_ocr(config: dict, resume: bool = True, workers: int = 8,
         out_path = OCR_DIR / fname
 
         if resume and out_path.exists() and out_path.stat().st_size > 200:
-            skipped += 1
-            continue
+            # Check if file contains download errors — re-download if so
+            content_sample = out_path.read_text(encoding="utf-8",
+                                                 errors="replace")[:2000]
+            if "[error:" in content_sample:
+                pass  # fall through to re-download
+            else:
+                skipped += 1
+                continue
 
         header = [
             f"=== {title.upper()} ===",
