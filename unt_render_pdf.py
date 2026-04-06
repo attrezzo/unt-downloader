@@ -45,9 +45,9 @@ PDF_DIR        = None
 
 def init_paths(collection_dir: Path):
     global TRANSLATED_DIR, IMAGES_DIR, PDF_DIR
-    TRANSLATED_DIR = collection_dir / "translated"
-    IMAGES_DIR     = collection_dir / "images"
-    PDF_DIR        = collection_dir / "pdf"
+    TRANSLATED_DIR = collection_dir / "output" / "translated"
+    IMAGES_DIR     = collection_dir / "sources" / "images"
+    PDF_DIR        = collection_dir / "output" / "pdf"
 
 
 # ---------------------------------------------------------------------------

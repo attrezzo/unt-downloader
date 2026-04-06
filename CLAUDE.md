@@ -67,19 +67,21 @@ All paths relative to collection root (e.g. `bellville_wochenblatt/`).
 
 ```
 collection.json
-metadata/all_issues.json
-ocr/{ark}_vol{v}_no{n}_{date}.txt           Raw portal HTML (preserved as-is)
-images/{ark_id}/page_01.jpg ... page_NN.jpg
-abbyy/{ark}_vol{v}_no{n}_{date}.xml         Optional ABBYY FineReader XML
-corrected/{ark}_vol{v}_no{n}_{date}.txt      Best OCR in source language
-articles/{ark_id}/{ark_id}_{date}_art{NNN}.txt  Segmented articles
-articles/{ark_id}/manifest.json
-translated/{ark}_vol{v}_no{n}_{date}.txt     English translations
-confidence/{ark_id}_page{NN}.json            Per-word confidence (0–100 integers)
-artifacts/                                   Batch pipeline working data
-    pipeline_log.jsonl  batch_summary.json  style_signatures.json
-    low_confidence/{ark_id}_page{NN}.json    Regions flagged for Pass B
-pdf/{ark}_vol{v}_no{n}_{date}.pdf
+sources/                                     Downloaded input data
+    metadata/all_issues.json
+    portal_ocr/{ark}_vol{v}_no{n}_{date}.txt Raw portal HTML (preserved as-is)
+    images/{ark_id}/page_01.jpg ... page_NN.jpg
+    abbyy/{ark}_vol{v}_no{n}_{date}.xml     Optional ABBYY FineReader XML
+output/                                      Generated pipeline output
+    ai_ocr/{ark_id}/page_01.md ... page_NN.md  Per-page markup with gap tags
+    corrected/{ark}_vol{v}_no{n}_{date}.txt  Best OCR in source language
+    articles/{ark_id}/{ark_id}_{date}_art{NNN}.txt  Segmented articles
+    articles/{ark_id}/manifest.json
+    translated/{ark}_vol{v}_no{n}_{date}.txt English translations
+    readable/{ark}_vol{v}_no{n}_{date}.md    Compiled human-readable markdown
+    pdf/{ark}_vol{v}_no{n}_{date}.pdf
+logs/                                        Debug/run log files
+    ocr_YYYYMMDD_HHMMSS.log
 ```
 
 Issue filenames: `{ark_id}_vol{vv}_no{nn}_{date}.txt`

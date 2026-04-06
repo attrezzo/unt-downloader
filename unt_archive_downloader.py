@@ -79,12 +79,14 @@ def init_paths(collection_dir: Path):
     global OUTPUT_DIR, METADATA_DIR, OCR_DIR, PDF_DIR
     global CORRECTED_DIR, TRANSLATED_DIR, IMAGES_DIR, CONFIG_PATH
     OUTPUT_DIR     = collection_dir
-    METADATA_DIR   = collection_dir / "metadata"
-    OCR_DIR        = collection_dir / "ocr"
-    PDF_DIR        = collection_dir / "pdf"
-    CORRECTED_DIR  = collection_dir / "corrected"
-    TRANSLATED_DIR = collection_dir / "translated"
-    IMAGES_DIR     = collection_dir / "images"
+    # sources/
+    METADATA_DIR   = collection_dir / "sources" / "metadata"
+    OCR_DIR        = collection_dir / "sources" / "portal_ocr"
+    IMAGES_DIR     = collection_dir / "sources" / "images"
+    # output/
+    CORRECTED_DIR  = collection_dir / "output" / "corrected"
+    TRANSLATED_DIR = collection_dir / "output" / "translated"
+    PDF_DIR        = collection_dir / "output" / "pdf"
     CONFIG_PATH    = collection_dir / "collection.json"
 
 # ---------------------------------------------------------------------------
@@ -1223,11 +1225,11 @@ def show_status(config: dict):
     stages = [
         ("Raw OCR",       OCR_DIR),
         ("Images cached", IMAGES_DIR),
-        ("ABBYY XML",     OUTPUT_DIR / "abbyy"),
+        ("ABBYY XML",     OUTPUT_DIR / "sources" / "abbyy"),
         ("Corrected OCR", CORRECTED_DIR),
-        ("Articles",      OUTPUT_DIR / "articles"),
+        ("Articles",      OUTPUT_DIR / "output" / "articles"),
         ("Translated",    TRANSLATED_DIR),
-        ("PDFs",          OUTPUT_DIR / "pdf"),
+        ("PDFs",          OUTPUT_DIR / "output" / "pdf"),
     ]
 
     for label, folder in stages:
@@ -1280,7 +1282,7 @@ def show_status(config: dict):
         steps.append(f"  python {script} --preload-images")
     if not any(CORRECTED_DIR.glob("*.txt") if CORRECTED_DIR.exists() else []):
         steps.append(f"  python {script} --correct --resume")
-    articles_dir = OUTPUT_DIR / "articles"
+    articles_dir = OUTPUT_DIR / "output" / "articles"
     articles_done = sum(1 for d in articles_dir.iterdir()
                         if d.is_dir() and any(d.glob("*_art*.txt"))) \
                     if articles_dir.exists() else 0
@@ -1288,7 +1290,7 @@ def show_status(config: dict):
         steps.append(f"  python {script} --correct --resume  # also generates articles/")
     if not any(TRANSLATED_DIR.glob("*.txt") if TRANSLATED_DIR.exists() else []):
         steps.append(f"  python {script} --translate --resume")
-    pdf_dir = OUTPUT_DIR / "pdf"
+    pdf_dir = OUTPUT_DIR / "output" / "pdf"
     if not any(pdf_dir.glob("*.pdf") if pdf_dir.exists() else []):
         steps.append(f"  python {script} --render-pdf --resume")
     for s in steps:

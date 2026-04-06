@@ -2,22 +2,24 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Collection output directories — these contain downloaded/generated data
-# that should not be committed (images alone can be hundreds of MB).
-# Each collection lives in its own directory (e.g. bellville_wochenblatt/).
+# Collection data directories — each collection (e.g. bellville_wochenblatt/)
+# contains sources/ (downloaded), output/ (generated), and logs/.
+# None of these should be committed.
+*/sources/
+*/output/
+*/logs/
+# Legacy flat layout (pre-restructure)
 */metadata/
-*/ocr/
 */images/
+*/ocr/
 */abbyy/
 */corrected/
 */articles/
 */translated/
-*/confidence/
-*/artifacts/
-*/pdf/
 */ai_ocr/
 */readable/
-*/logs/
+*/pdf/
+
 # Ignore real configs (contain API keys) — use *.example.json as templates
 config.json
 collection.json

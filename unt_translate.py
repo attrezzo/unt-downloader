@@ -92,10 +92,10 @@ TRANSLATED_DIR= None
 
 def init_paths(collection_dir: Path):
     global METADATA_DIR, OCR_DIR, CORRECTED_DIR, TRANSLATED_DIR
-    METADATA_DIR   = collection_dir / "metadata"
-    OCR_DIR        = collection_dir / "ocr"
-    CORRECTED_DIR  = collection_dir / "corrected"
-    TRANSLATED_DIR = collection_dir / "translated"
+    METADATA_DIR   = collection_dir / "sources" / "metadata"
+    OCR_DIR        = collection_dir / "sources" / "portal_ocr"
+    CORRECTED_DIR  = collection_dir / "output" / "corrected"
+    TRANSLATED_DIR = collection_dir / "output" / "translated"
 
 
 # ---------------------------------------------------------------------------

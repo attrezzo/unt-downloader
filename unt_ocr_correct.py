@@ -137,13 +137,16 @@ PRELOAD_LOG_NAME = "preload_failures.json"
 # GLOBALS
 # ============================================================================
 
+# sources/
 METADATA_DIR  = None
-OCR_DIR       = None
-CORRECTED_DIR = None
+PORTAL_OCR_DIR = None
 IMAGES_DIR    = None
 ABBYY_DIR     = None
-ARTICLES_DIR  = None
+# output/
+CORRECTED_DIR = None
 AI_OCR_DIR    = None
+ARTICLES_DIR  = None
+READABLE_DIR  = None
 
 
 # ============================================================================
@@ -391,16 +394,19 @@ def print_status(cost_tracker=None, step_name="OCR Correction",
 
 
 def init_paths(collection_dir: Path):
-    global METADATA_DIR, OCR_DIR, CORRECTED_DIR, IMAGES_DIR
-    global ABBYY_DIR, ARTICLES_DIR, AI_OCR_DIR
-    METADATA_DIR  = collection_dir / "metadata"
-    OCR_DIR       = collection_dir / "ocr"
-    CORRECTED_DIR = collection_dir / "corrected"
-    IMAGES_DIR    = collection_dir / "images"
-    ABBYY_DIR     = collection_dir / "abbyy"
-    ARTICLES_DIR  = collection_dir / "articles"
-    AI_OCR_DIR    = collection_dir / "ai_ocr"
-    for d in [CORRECTED_DIR, ARTICLES_DIR, AI_OCR_DIR]:
+    global METADATA_DIR, PORTAL_OCR_DIR, IMAGES_DIR, ABBYY_DIR
+    global CORRECTED_DIR, AI_OCR_DIR, ARTICLES_DIR, READABLE_DIR
+    # sources/
+    METADATA_DIR   = collection_dir / "sources" / "metadata"
+    PORTAL_OCR_DIR = collection_dir / "sources" / "portal_ocr"
+    IMAGES_DIR     = collection_dir / "sources" / "images"
+    ABBYY_DIR      = collection_dir / "sources" / "abbyy"
+    # output/
+    CORRECTED_DIR  = collection_dir / "output" / "corrected"
+    AI_OCR_DIR     = collection_dir / "output" / "ai_ocr"
+    ARTICLES_DIR   = collection_dir / "output" / "articles"
+    READABLE_DIR   = collection_dir / "output" / "readable"
+    for d in [CORRECTED_DIR, AI_OCR_DIR, ARTICLES_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -580,7 +586,7 @@ def get_abbyy_page_text(issue_fname: str, page_num: int):
 
 def get_portal_ocr_text(issue_fname: str, page_num: int):
     """Get portal OCR text for a specific page, stripping HTML."""
-    ocr_path = OCR_DIR / issue_fname
+    ocr_path = PORTAL_OCR_DIR / issue_fname
     if not ocr_path.exists():
         return None
     raw = ocr_path.read_text(encoding="utf-8", errors="replace")
@@ -1736,10 +1742,10 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     fname  = f"{ark_id}_vol{vol}_no{num}_{date}.txt"
     newspaper = issue.get("full_title", issue.get("title", ""))
 
-    ocr_path   = OCR_DIR / fname
+    ocr_path   = PORTAL_OCR_DIR / fname
     corr_path  = CORRECTED_DIR / fname
     ark_dir    = ARTICLES_DIR / ark_id
-    ai_ocr_dir = AI_OCR_DIR / ark_id
+    ai_ocr_dir = AI_PORTAL_OCR_DIR / ark_id
 
     # Resume check
     if resume and not force and corr_path.exists() and corr_path.stat().st_size > 500:
@@ -2191,7 +2197,7 @@ def refine_text(issues, config, collection_dir, api_key,
     # Collect all page files
     page_files = []
     for issue in issues:
-        ai_dir = collection_dir / "ai_ocr" / issue["ark_id"]
+        ai_dir = AI_OCR_DIR / issue["ark_id"]
         if ai_dir.exists():
             page_files.extend(sorted(ai_dir.glob("page_*.md")))
 
@@ -2326,7 +2332,7 @@ def refine_image(issues, config, collection_dir, api_key,
     page_items = []
     for issue in issues:
         ark_id = issue["ark_id"]
-        ai_dir = collection_dir / "ai_ocr" / ark_id
+        ai_dir = AI_OCR_DIR / ark_id
         if ai_dir.exists():
             for pf in sorted(ai_dir.glob("page_*.md")):
                 page_items.append((pf, ark_id))
@@ -2359,7 +2365,7 @@ def refine_image(issues, config, collection_dir, api_key,
 
 def regenerate_corrected(issues, config, collection_dir):
     """Regenerate corrected/ and readable/ from updated ai_ocr/ files."""
-    corrected_dir = collection_dir / "corrected"
+    corrected_dir = CORRECTED_DIR
     corrected_dir.mkdir(exist_ok=True)
 
     for issue in issues:
@@ -2368,7 +2374,7 @@ def regenerate_corrected(issues, config, collection_dir):
         num = str(issue.get("number", "?")).zfill(2)
         date = re.sub(r"[^\w\-]", "-", issue.get("date", "unknown"))
         fname = f"{ark_id}_vol{vol}_no{num}_{date}.txt"
-        ai_dir = collection_dir / "ai_ocr" / ark_id
+        ai_dir = AI_OCR_DIR / ark_id
 
         if not ai_dir.exists():
             continue
@@ -2404,7 +2410,7 @@ def regenerate_corrected(issues, config, collection_dir):
         corr_path.write_text("\n".join(out_lines), encoding="utf-8")
 
     # Also regenerate readable/ if it exists
-    readable_dir = collection_dir / "readable"
+    readable_dir = READABLE_DIR
     if readable_dir.exists():
         compile_all(issues, config, collection_dir, resume=False)
 # COMPILE — READABLE MARKDOWN OUTPUT
@@ -2468,8 +2474,8 @@ def compile_issue(issue: dict, config: dict, collection_dir: Path):
     fname  = f"{ark_id}_vol{vol}_no{num}_{date}"
     newspaper = config.get("title_name", "")
 
-    ai_ocr_dir = collection_dir / "ai_ocr" / ark_id
-    readable_dir = collection_dir / "readable"
+    ai_ocr_dir = AI_OCR_DIR / ark_id
+    readable_dir = READABLE_DIR
     readable_dir.mkdir(parents=True, exist_ok=True)
 
     if not ai_ocr_dir.exists():
@@ -2551,7 +2557,7 @@ def compile_issue(issue: dict, config: dict, collection_dir: Path):
 def compile_all(issues: list, config: dict, collection_dir: Path,
                 resume: bool = True):
     """Compile readable markdown for all issues."""
-    readable_dir = collection_dir / "readable"
+    readable_dir = READABLE_DIR
     readable_dir.mkdir(parents=True, exist_ok=True)
 
     compiled = 0
@@ -2819,7 +2825,7 @@ def count_refinement_gaps(issues, collection_dir, cnf_min, cnf_max,
     total_gaps = 0
     total_pages_with_gaps = 0
     for issue in issues:
-        ai_dir = collection_dir / "ai_ocr" / issue["ark_id"]
+        ai_dir = AI_OCR_DIR / issue["ark_id"]
         if not ai_dir.exists():
             continue
         for pf in ai_dir.glob("page_*.md"):
