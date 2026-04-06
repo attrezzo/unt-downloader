@@ -124,6 +124,9 @@ MODEL_INITIAL = "claude-haiku-4-5"     # Pass 1-2: image + transcription (cheap)
 MODEL_RESOLVE = "claude-sonnet-4-6"    # Pass 3: cross-reference + guess (text-only)
 MODEL_REFINE  = "claude-opus-4-6"      # Future refinement of low-cnf gaps
 
+# Section delimiter — must never appear in 19th-century newspaper text
+SECTION_DELIM = "~~<<-->>~~"
+
 # Token estimates (calibrated from real run: 8pp Bellville Wochenblatt)
 EST_INPUT_TOKENS_PASS12  = 15_000  # image (~1MB) + system prompt + OCR text
 EST_OUTPUT_TOKENS_PASS12 = 5_000   # full page text with gap markers
@@ -1126,11 +1129,11 @@ LAYOUT: <one-line description>
 COLUMNS: <number>
 DAMAGE: <notes or "none">
 
----
+{SECTION_DELIM}
 
 <transcribed text with gap markers — mostly plain text, gaps for uncertain regions>
 
----
+{SECTION_DELIM}
 
 STATS:
 - estimated_chars: <N>
@@ -1209,8 +1212,9 @@ cnf scale: 0.95-0.99=promote to plain, 0.80-0.94=auto-resolved,
 
 OUTPUT: Return ONLY the complete corrected text. No analysis, no
 reasoning, no commentary — start directly with the LAYOUT line.
-Use the same format as input (LAYOUT/COLUMNS/DAMAGE, --- delimiters,
+Use the same format as input (LAYOUT/COLUMNS/DAMAGE, {SECTION_DELIM} delimiters,
 STATS block). Update STATS to reflect resolved gaps.
+IMPORTANT: Use {SECTION_DELIM} as section delimiters, NOT ---.
 
 IMPORTANT: Do NOT output gap-by-gap analysis before the text.
 Start your response with "LAYOUT:" immediately.
@@ -1424,31 +1428,37 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 
 
 def _extract_body(raw_response: str) -> str:
-    """Extract body text between first --- and STATS: section.
+    """Extract body text between section delimiters.
 
-    The body may contain its own --- dividers (e.g., between a farm ad
-    and column text). We take everything from after the FIRST --- to
-    before STATS:, not just between the first two --- markers.
+    Tries SECTION_DELIM first, falls back to --- for old-format files.
+    Takes everything from after the FIRST delimiter to before STATS:.
     """
     # Find LAYOUT: start
     layout_idx = raw_response.find("LAYOUT:")
     if layout_idx > 0:
         raw_response = raw_response[layout_idx:]
 
-    # Find the first --- after LAYOUT/COLUMNS/DAMAGE header
-    first_delim = raw_response.find("\n---\n")
-    if first_delim < 0:
-        return raw_response
-
-    body_start = first_delim + 5  # skip past "\n---\n"
+    # Try new delimiter first, fall back to ---
+    delim = f"\n{SECTION_DELIM}\n"
+    first_delim = raw_response.find(delim)
+    if first_delim >= 0:
+        body_start = first_delim + len(delim)
+    else:
+        # Fallback: old --- format
+        first_delim = raw_response.find("\n---\n")
+        if first_delim < 0:
+            return raw_response
+        body_start = first_delim + 5
 
     # Find STATS: section (the end marker)
     stats_idx = raw_response.find("\nSTATS:", body_start)
     if stats_idx > 0:
-        # Also strip any trailing --- before STATS
         body = raw_response[body_start:stats_idx]
-        if body.rstrip().endswith("---"):
-            body = body.rstrip()[:-3]
+        # Strip trailing delimiter
+        for d in [SECTION_DELIM, "---"]:
+            if body.rstrip().endswith(d):
+                body = body.rstrip()[:-len(d)]
+                break
     else:
         body = raw_response[body_start:]
 
@@ -1525,9 +1535,9 @@ def build_page_markdown(newspaper, date, page_num, source_image,
     header += "### Statistics\n"
     for key, val in stats.items():
         header += f"- {key}: {val}\n"
-    header += "\n---\n\n"
+    header += f"\n{SECTION_DELIM}\n\n"
 
-    # Extract text body from raw response (between first --- and STATS)
+    # Extract text body from raw response
     text_body = _extract_body(raw_response)
 
     return header + text_body + "\n"
