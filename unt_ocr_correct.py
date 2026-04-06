@@ -132,7 +132,8 @@ EST_INPUT_TOKENS_PASS12  = 15_000  # image (~1MB) + system prompt + OCR text
 EST_OUTPUT_TOKENS_PASS12 = 5_000   # full page text with gap markers
 EST_INPUT_TOKENS_PASS3   = 21_000  # Pass 1-2 output + OCR + system prompt
 EST_OUTPUT_TOKENS_PASS3  = 7_000   # full text with gap analysis + resolution
-MAX_OUTPUT_TOKENS        = 16_000
+MAX_OUTPUT_TOKENS        = 32_000
+MAX_OUTPUT_TOKENS_RETRY  = 64_000  # retry limit for truncated responses
 
 PRELOAD_LOG_NAME = "preload_failures.json"
 
@@ -877,6 +878,10 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
                                   f"{usage['input_tokens']}", level=5)
 
             elif etype == "message_delta":
+                delta = event.get("delta", {})
+                sr = delta.get("stop_reason")
+                if sr:
+                    usage["stop_reason"] = sr
                 u = event.get("usage", {})
                 if u:
                     usage["output_tokens"] = u.get("output_tokens", 0)
@@ -960,6 +965,7 @@ def claude_api_call(payload: dict, api_key: str,
             else:
                 result = _claude_call_standard(req_data, api_key)
                 usage = result.get("usage", {})
+                usage["stop_reason"] = result.get("stop_reason", "end_turn")
                 text = ""
                 for block in result.get("content", []):
                     if block.get("type") == "text":
@@ -1356,7 +1362,7 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     log_event(f"p{page_num:02d} pass 1-2", worker=wid)
     p_label = f"{wid} pass1-2"
     try:
-        pass12_raw, _ = claude_api_call(
+        pass12_raw, p12_usage = claude_api_call(
             {"model": MODEL_INITIAL, "max_tokens": MAX_OUTPUT_TOKENS,
              "system": pass12_prompt,
              "messages": [{"role": "user", "content": content}]},
@@ -1368,6 +1374,27 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
                 "status": "failed", "error": str(e)}
     if _dashboard:
         _dashboard.step()
+
+    # Detect truncation on pass 1-2 and retry with higher limit
+    if p12_usage.get("stop_reason") == "max_tokens":
+        log_event(f"p{page_num:02d} pass 1-2 TRUNCATED at {MAX_OUTPUT_TOKENS} "
+                  f"tokens — retrying with {MAX_OUTPUT_TOKENS_RETRY}", "warn",
+                  worker=wid)
+        try:
+            pass12_raw, p12_usage = claude_api_call(
+                {"model": MODEL_INITIAL, "max_tokens": MAX_OUTPUT_TOKENS_RETRY,
+                 "system": pass12_prompt,
+                 "messages": [{"role": "user", "content": content}]},
+                api_key, rate_limiter, est_tokens=est,
+                cost_tracker=cost_tracker, label=f"{wid} pass1-2-retry")
+        except Exception as e:
+            log_event(f"p{page_num:02d} pass 1-2 retry FAILED: {e}", "error",
+                      worker=wid)
+        if _dashboard:
+            _dashboard.step()
+        if p12_usage.get("stop_reason") == "max_tokens":
+            log_event(f"p{page_num:02d} pass 1-2 STILL TRUNCATED after retry",
+                      "warn", worker=wid)
 
     if not pass12_raw.strip():
         log_event(f"p{page_num:02d} pass 1-2 empty response", "error", worker=wid)
@@ -1391,7 +1418,7 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     log_event(f"p{page_num:02d} pass 3", worker=wid)
     p3_label = f"{wid} pass3"
     try:
-        raw, _ = claude_api_call(
+        raw, p3_usage = claude_api_call(
             {"model": MODEL_RESOLVE, "max_tokens": MAX_OUTPUT_TOKENS,
              "system": pass3_prompt,
              "messages": [{"role": "user", "content": pass3_user}]},
@@ -1400,8 +1427,32 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     except Exception as e:
         log_event(f"p{page_num:02d} pass 3 FAILED (using pass 1-2)", "error", worker=wid)
         raw = pass12_raw
+        p3_usage = {}
     if _dashboard:
         _dashboard.step()
+
+    # Detect truncation on pass 3 and retry with higher limit
+    if p3_usage.get("stop_reason") == "max_tokens":
+        log_event(f"p{page_num:02d} pass 3 TRUNCATED at {MAX_OUTPUT_TOKENS} "
+                  f"tokens — retrying with {MAX_OUTPUT_TOKENS_RETRY}", "warn",
+                  worker=wid)
+        try:
+            raw, p3_usage = claude_api_call(
+                {"model": MODEL_RESOLVE, "max_tokens": MAX_OUTPUT_TOKENS_RETRY,
+                 "system": pass3_prompt,
+                 "messages": [{"role": "user", "content": pass3_user}]},
+                api_key, rate_limiter, est_tokens=EST_INPUT_TOKENS_PASS3,
+                cost_tracker=cost_tracker, label=f"{wid} pass3-retry")
+        except Exception as e:
+            log_event(f"p{page_num:02d} pass 3 retry FAILED (using pass 1-2)",
+                      "error", worker=wid)
+            raw = pass12_raw
+            p3_usage = {}
+        if _dashboard:
+            _dashboard.step()
+        if p3_usage.get("stop_reason") == "max_tokens":
+            log_event(f"p{page_num:02d} pass 3 STILL TRUNCATED after retry "
+                      f"— output may be incomplete", "warn", worker=wid)
 
     if not raw.strip():
         raw = pass12_raw
@@ -1430,7 +1481,10 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 def _extract_body(raw_response: str) -> str:
     """Extract body text between ~~<<-->>~~ section delimiters.
 
-    Takes everything from after the FIRST delimiter to before STATS:.
+    Expected format:  LAYOUT: ... \\n~~<<-->>~~\\n [body] \\n~~<<-->>~~\\n STATS: ...
+    Takes everything from after the FIRST delimiter to before the LAST STATS:
+    that follows a closing delimiter.  Using rfind prevents premature truncation
+    when the model emits per-column stats or the newspaper text contains "STATS:".
     """
     # Find LAYOUT: start
     layout_idx = raw_response.find("LAYOUT:")
@@ -1440,18 +1494,31 @@ def _extract_body(raw_response: str) -> str:
     delim = f"\n{SECTION_DELIM}\n"
     first_delim = raw_response.find(delim)
     if first_delim < 0:
+        log_event("_extract_body: no section delimiter found in response "
+                  f"({len(raw_response)} chars)", "warn")
         return raw_response
 
     body_start = first_delim + len(delim)
 
-    # Find STATS: section (the end marker)
-    stats_idx = raw_response.find("\nSTATS:", body_start)
-    if stats_idx > 0:
-        body = raw_response[body_start:stats_idx]
-        if body.rstrip().endswith(SECTION_DELIM):
-            body = body.rstrip()[:-len(SECTION_DELIM)]
+    # Look for the CLOSING delimiter first — it's more reliable than bare STATS:
+    second_delim = raw_response.find(delim, body_start)
+    if second_delim > 0:
+        body = raw_response[body_start:second_delim]
     else:
-        body = raw_response[body_start:]
+        # No closing delimiter — fall back to LAST \nSTATS: (rfind, not find)
+        stats_idx = raw_response.rfind("\nSTATS:", body_start)
+        if stats_idx > 0:
+            body = raw_response[body_start:stats_idx]
+        else:
+            body = raw_response[body_start:]
+
+    # Strip trailing delimiter remnant if present
+    if body.rstrip().endswith(SECTION_DELIM):
+        body = body.rstrip()[:-len(SECTION_DELIM)]
+
+    log_event(f"_extract_body: raw={len(raw_response)} chars, "
+              f"body_start={body_start}, body={len(body.strip())} chars",
+              "debug")
 
     return body.strip()
 
@@ -1874,7 +1941,8 @@ def preload_images(issues, resume=True, retry_failed=False, workers=4):
 
 def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                   resume, force, rate_limiter=None,
-                  cost_tracker=None, worker_id="", api_workers=3):
+                  cost_tracker=None, worker_id="", api_workers=3,
+                  page_filter=None):
     """Process one newspaper issue through the AI OCR pipeline."""
     ark_id = issue["ark_id"]
     vol    = str(issue.get("volume", "?")).zfill(2)
@@ -1887,7 +1955,8 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     ai_ocr_dir = AI_OCR_DIR / ark_id
 
     # Resume check — skip if ai_ocr/ dir has all pages
-    if resume and not force and ai_ocr_dir.exists():
+    # (but not when --page filter is set — user wants to reprocess specific pages)
+    if resume and not force and not page_filter and ai_ocr_dir.exists():
         existing_md = set(ai_ocr_dir.glob("page_*.md"))
         if len(existing_md) >= int(issue.get("pages", 8)):
             tprint(f"  SKIP {fname} (already complete)",
@@ -1923,8 +1992,10 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     # Build list of pages that need processing (skip existing ai_ocr pages)
     pages_todo = []
     for pg in range(1, actual_pages + 1):
+        if page_filter and pg not in page_filter:
+            continue
         page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
-        if (not force and page_md_path.exists()
+        if (not force and not page_filter and page_md_path.exists()
                 and page_md_path.stat().st_size > 100):
             tprint(f"  p{pg:02d} SKIP (exists)", worker=worker_id, level=2)
             continue
@@ -3674,7 +3745,8 @@ def main():
             compile_all(issues, config, collection_dir, resume=False)
         return
 
-    # Count pages to process (respecting --resume/--force)
+    # Count pages to process (respecting --resume/--force/--page)
+    page_filter = set(args.page) if args.page else None
     pages_to_process = 0
     for issue in issues:
         ark_id = issue["ark_id"]
@@ -3684,11 +3756,14 @@ def main():
         fname = f"{ark_id}_vol{vol}_no{num}_{date}.txt"
         ai_dir = AI_OCR_DIR / ark_id
 
-        if args.resume and not args.force and ai_dir.exists():
+        if args.resume and not args.force and not page_filter and ai_dir.exists():
             existing_md = set(ai_dir.glob("page_*.md"))
             if len(existing_md) >= int(issue.get("pages", 8)):
                 continue
-        pages_to_process += int(issue.get("pages", 8))
+        if page_filter:
+            pages_to_process += len(page_filter)
+        else:
+            pages_to_process += int(issue.get("pages", 8))
 
     if pages_to_process == 0:
         print("\nNothing to process -- all files already complete.")
@@ -3766,7 +3841,8 @@ def main():
             rate_limiter=rate_limiter,
             cost_tracker=cost_tracker,
             worker_id="",
-            api_workers=effective_workers)
+            api_workers=effective_workers,
+            page_filter=page_filter)
 
         with log_lock:
             log.append({"ark_id": ark_id, "status": status})
