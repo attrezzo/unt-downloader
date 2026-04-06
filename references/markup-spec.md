@@ -33,7 +33,7 @@ The universal tag for any text that is not 100% confident. Covers everything fro
 
 **With optional fields:**
 ```
-{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial_text" | region_ocr="raw_ocr" [best guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | status=auto-resolved | fragments="partial_text" | region_ocr="raw_ocr" [best guess] }}
 ```
 
 **Fields:**
@@ -46,15 +46,16 @@ The universal tag for any text that is not 100% confident. Covers everything fro
   - `0.01–0.39` — Speculative. Mostly guessing from context. Treat as placeholder.
   - `0.00` — Pure educated guess. No fragments, no OCR source. Derived entirely from context.
   - `1.00` — Never used. Perfect OCR wouldn't be in a gap tag.
+- `status` (auto-set): `auto-resolved` when cnf >= 0.80. Indicates the gap is considered resolved and will be skipped by default in future refinement passes. Lower-confidence gaps have no status field and are always candidates for refinement.
 - `fragments` (optional): Any partial letterforms visible, as best-guess Latin characters
 - `region_ocr` (optional): The raw ABBYY/portal OCR text for this region, exactly as it appears — garbled and all. Critical for future refinement.
 - `[best guess]` (required): Always present. The current best prediction in square brackets.
 
 **Examples:**
 ```
-Die {{ gap | est=12 | imgbbox="450,1200,280,45" | cnf="0.85" | fragments="Verfa...ung" | region_ocr="Bcrfaffung" [Verfassung] }} wurde gestern abgehalten.
+Die {{ gap | est=12 | imgbbox="450,1200,280,45" | cnf="0.85" | status=auto-resolved | fragments="Verfa...ung" | region_ocr="Bcrfaffung" [Verfassung] }} wurde gestern abgehalten.
 
-Der {{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" [aus] }} einem großen Umzuge.
+Der {{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" | status=auto-resolved [aus] }} einem großen Umzuge.
 
 Im {{ gap | est=8 | imgbbox="100,950,180,40" | cnf="0.15" [Gasthof] }} an der Hauptstraße fand die Sitzung statt.
 
@@ -190,7 +191,7 @@ veranstaltet von den deutschen Vereinen in Austin County.
 
 ### PROGRAMM:
 
-Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend {{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" [aus] }}
+Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend {{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" | status=auto-resolved [aus] }}
 
 ### geschmückten Wagen,
 
@@ -198,7 +199,7 @@ darstellend Begebenheiten aus der deutschen Geschichte, oder der {{ gap | est=30
 {{ /Column }}
 
 {{ Column002 }}
-**Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry {{ gap | est=5 | imgbbox="950,1400,100,35" | cnf="0.92" | region_ocr="Try" [Goods] }} Haus, Ecke 14 u. Main Str. an der Arbeit wären.
+**Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry {{ gap | est=5 | imgbbox="950,1400,100,35" | cnf="0.92" | status=auto-resolved | region_ocr="Try" [Goods] }} Haus, Ecke 14 u. Main Str. an der Arbeit wären.
 
 Die {{ gap | est=15 | imgbbox="820,1460,280,40" | cnf="0.10" [Polizeibeamten] }} kamen sofort zur Stelle.
 {{ /Column }}
@@ -225,7 +226,7 @@ For programmatic extraction, tags follow these regex patterns:
 
 ```
 # Gap markers (unified — all uncertain text)
-\{\{\s*gap\s*\|\s*est=(\d+)\s*\|\s*imgbbox="([^"]*)"\s*\|\s*cnf="([^"]*)"(?:\s*\|\s*fragments="([^"]*)")?(?:\s*\|\s*region_ocr="([^"]*)")?\s*\[([^\]]*)\]\s*\}\}
+\{\{\s*gap\s*\|\s*est=(\d+)\s*\|\s*imgbbox="([^"]*)"\s*\|\s*cnf="([^"]*)"(?:\s*\|\s*status=(\S+))?(?:\s*\|\s*fragments="([^"]*)")?(?:\s*\|\s*region_ocr="([^"]*)")?\s*\[([^\]]*)\]\s*\}\}
 
 # Image markers
 \{\{\s*Img\s*\|\s*bbox="([^"]*)"\s*\|\s*desc="([^"]*)"\s*\}\}
@@ -245,7 +246,7 @@ For programmatic extraction, tags follow these regex patterns:
 
 To refine tagged output in a future pass:
 
-1. Extract all `{{ gap }}` tags, prioritizing low `cnf` values
+1. Extract all `{{ gap }}` tags without `status=auto-resolved`, prioritizing low `cnf` values
 2. For each, crop the source image using `imgbbox` (saves ~95% token cost vs full page)
 3. Provide the future AI with:
    - The cropped image region

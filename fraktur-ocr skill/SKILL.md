@@ -137,6 +137,11 @@ This pass requires the existing ABBYY OCR (or other traditional OCR) if availabl
 
 4. `region_ocr` MUST contain the exact raw OCR text for this region, uncorrected. This is the most valuable field for future refinement.
 
+5. When cnf >= 0.80, add `status=auto-resolved` to the gap tag. This tells future refinement passes to skip it by default:
+```
+{{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" | status=auto-resolved [aus] }}
+```
+
 **IMPORTANT:** Never leave text blank or use `[unleserlich]`. Every gap gets a best guess and a `cnf` score. Even `cnf="0.00"` with a wild guess is more useful than nothing.
 
 ---

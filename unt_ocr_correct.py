@@ -531,6 +531,7 @@ For each gap:
 
 cnf scale: 0.90-0.99=high, 0.70-0.89=moderate, 0.40-0.69=low,
 0.01-0.39=speculative, 0.00=pure context guess. Never 1.00.
+When cnf >= 0.80, add status=auto-resolved to the gap tag.
 
 OUTPUT FORMAT - return this exact structure:
 
