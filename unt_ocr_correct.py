@@ -1466,10 +1466,12 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                 rate_limiter, cost_tracker)
             return pg, result
 
+        pages_done = 0
         with ThreadPoolExecutor(max_workers=api_workers) as ex:
             futures = {ex.submit(_correct_one, pg): pg for pg in pages_todo}
             for fut in as_completed(futures):
                 pg, result = fut.result()
+                pages_done += 1
                 page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
                 if result["status"] == "ok":
                     corrected_pages[pg] = result["text"]
@@ -1490,6 +1492,12 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                     corrected_pages[pg] = (
                         f"[CORRECTION FAILED: "
                         f"{result.get('error', 'unknown')}]")
+
+                # Status display after each page
+                print_status(cost_tracker,
+                             step_name="AI OCR Correction",
+                             progress_current=pages_done,
+                             progress_total=actual_pages)
 
     # Write corrected/ file
     out_lines = [header, ""]
@@ -2780,10 +2788,11 @@ def main():
         else:
             ctr["err"] += 1
 
-        # Update status display
-        done = ctr["ok"] + ctr["skipped"] + ctr["err"]
-        print_status(cost_tracker, step_name="AI OCR Correction",
-                     progress_current=done, progress_total=len(issues))
+        # Issue-level summary
+        done_issues = ctr["ok"] + ctr["skipped"] + ctr["err"]
+        if len(issues) > 1:
+            print(f"\n  Issue {done_issues}/{len(issues)} complete",
+                  flush=True)
 
         # Revised estimate after 5 pages, budget abort if exceeded
         if not args.skip_estimate:
