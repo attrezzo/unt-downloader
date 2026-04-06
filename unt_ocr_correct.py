@@ -161,17 +161,24 @@ _dashboard = None
 
 
 class WorkerDashboard:
-    """Thread-safe per-worker status display for PowerShell-compatible output.
+    """Thread-safe worker status display. Event-driven, PowerShell-safe.
 
-    Progress tracks steps, not pages. Each page = 2 steps (pass 1-2, pass 3).
-    Workers are identified by slot (w1, w2, w3) — not by page number.
+    Renders a compact block each time a step completes (pass 1-2 done,
+    pass 3 done) or a page finishes. Each render scrolls — no ANSI,
+    no \\r, no overwriting.
+
+    Layout:
+        [########---------] 3/8 pages (38%)  $0.64  ETA 2m 10s
+        w1  p05 pass 1-2  (p01 ✓ p03 ✓)
+        w2  p04 pass 3    (p02 ✓)
+        w3  p06 pass 1-2
     """
 
-    STEPS_PER_PAGE = 2  # pass 1-2 + pass 3
+    STEPS_PER_PAGE = 2
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._workers = {}       # worker_id -> {current, t_start}
+        self._workers = {}       # wid -> {current, t_start, history}
         self._steps_done = 0
         self._total_steps = 0
         self._pages_done = 0
@@ -179,8 +186,6 @@ class WorkerDashboard:
         self._errors = 0
         self._start_time = time.monotonic()
         self._cost_tracker = None
-        self._rate_limiter = None
-        self._last_render = 0
 
     def set_context(self, total_pages=0, cost_tracker=None,
                     rate_limiter=None, issue_label=""):
@@ -190,42 +195,39 @@ class WorkerDashboard:
                 self._total_steps = total_pages * self.STEPS_PER_PAGE
             if cost_tracker:
                 self._cost_tracker = cost_tracker
-            if rate_limiter:
-                self._rate_limiter = rate_limiter
 
-    def step(self):
-        """Record one step completed (e.g. pass 1-2 done, or pass 3 done)."""
+    def step(self, worker_id: str = ""):
+        """Record one step completed and render."""
         with self._lock:
             self._steps_done += 1
+        self._do_render()
 
     def update(self, worker_id: str, msg: str, status: str = "info"):
-        """Update a worker's current state."""
+        """Update a worker's current state. Only renders on ok/error."""
         with self._lock:
             if worker_id not in self._workers:
                 self._workers[worker_id] = {
-                    "current": "", "t_start": time.monotonic()}
+                    "current": "", "t_start": time.monotonic(),
+                    "history": []}
             w = self._workers[worker_id]
             w["current"] = msg
             w["t_start"] = time.monotonic()
             if status == "ok":
                 self._pages_done += 1
+                w["history"].append(msg)
             elif status == "error":
                 self._errors += 1
+                w["history"].append(f"ERR {msg}")
 
     def render(self, force=False):
-        """Render dashboard output.
+        """Render the dashboard block. Called on milestones."""
+        if force:
+            self._do_render()
 
-        force=True  → full block (progress + cost + workers). Page milestones.
-        force=False → no-op. Intermediate updates only update worker state
-                      (visible on next force render). PowerShell can't
-                      overwrite lines, so printing between milestones just
-                      creates noise.
-        """
-        if not force:
-            return
+    def _do_render(self):
         with self._lock:
             lines = self._build_lines(time.monotonic())
-        print("\n" + "\n".join(lines), flush=True)
+        print("\n".join(lines), flush=True)
 
     def _fmt_time(self, secs):
         if secs < 60:
@@ -233,72 +235,48 @@ class WorkerDashboard:
         m, s = divmod(int(secs), 60)
         return f"{m}m {s:02d}s"
 
-    def _build_progress_line(self, now):
+    def _build_lines(self, now):
+        lines = [""]  # blank line separator
+
+        # ── Status bar ────────────────────────────────────────────
         elapsed = now - self._start_time
         total = max(self._total_steps, 1)
         done = min(self._steps_done, total)
         pct = min(100, done / total * 100)
-        bar_len = 35
+        bar_len = 30
         filled = int(bar_len * done / total)
         bar = "#" * filled + "-" * (bar_len - filled)
         if self._steps_done > 0 and elapsed > 5:
-            avg_per_step = elapsed / self._steps_done
-            remaining = (total - done) * avg_per_step
+            remaining = (total - done) * (elapsed / self._steps_done)
             eta_str = f"ETA {self._fmt_time(remaining)}"
         else:
             eta_str = self._fmt_time(elapsed)
-        return (f"  [{bar}] {self._pages_done}/{self._total_pages} pages "
-                f"({pct:.0f}%)  {eta_str}")
 
-    def _build_lines(self, now):
-        lines = []
-
-        # ── Progress bar ──────────────────────────────────────────
-        lines.append(self._build_progress_line(now))
-        lines.append("")
-
-        # ── Cost + tokens ─────────────────────────────────────────
-        elapsed = now - self._start_time
         ct = self._cost_tracker
-        if ct:
-            cost_str = f"${ct.total_cost:.2f}"
-            if ct.budget:
-                cost_str += f" / ${ct.budget:.2f}"
-            avg_str = (f"${ct.total_cost / ct.pages_processed:.3f}/page"
-                       if ct.pages_processed > 0 else "")
-            lines.append(
-                f"  Cost: {cost_str}  "
-                f"Tokens: {ct.total_input_tokens:,}in "
-                f"+ {ct.total_output_tokens:,}out  {avg_str}")
-        else:
-            lines.append(f"  Time: {self._fmt_time(elapsed)}  "
-                         f"Done: {self._completed}")
+        cost_str = f"  ${ct.total_cost:.2f}" if ct else ""
 
-        # ── Rate limiter ──────────────────────────────────────────
-        rl = self._rate_limiter
-        if rl:
-            try:
-                s = rl.stats()
-                rpm_pct = s["rpm_bucket_level"] / rl._rpm_capacity * 100
-                tpm_pct = s["tpm_bucket_level"] / rl._tpm_capacity * 100
-                lines.append(
-                    f"  Rate:  RPM {s['rpm_bucket_level']:.0f}"
-                    f"/{rl._rpm_capacity:.0f} ({rpm_pct:.0f}%)  "
-                    f"TPM {s['tpm_bucket_level']:,.0f}"
-                    f"/{rl._tpm_capacity:,.0f} ({tpm_pct:.0f}%)")
-            except Exception:
-                pass
-
-        lines.append("")
+        lines.append(
+            f"  [{bar}] {self._pages_done}/{self._total_pages} pages "
+            f"({pct:.0f}%){cost_str}  {eta_str}")
 
         # ── Workers ───────────────────────────────────────────────
         for wid in sorted(self._workers.keys()):
             w = self._workers[wid]
             age = now - w["t_start"]
-            age_str = f"{age:.0f}s" if age >= 1 else ""
-            lines.append(f"  {wid:<4} {w['current']:<55} {age_str}")
+            age_str = f"{age:.0f}s" if age >= 2 else ""
 
-        lines.append("")
+            # Short history: completed pages for this worker
+            done_pages = []
+            for h in w["history"]:
+                # Extract page number from history entries like "p03 done 1234 chars"
+                m = re.match(r'p(\d+)', h)
+                if m:
+                    done_pages.append(f"p{int(m.group(1)):02d}")
+            hist_str = f"  ({' '.join(done_pages)})" if done_pages else ""
+
+            lines.append(
+                f"  {wid:<4} {w['current']:<45} {age_str:>4}{hist_str}")
+
         return lines
 
     def final_summary(self):
@@ -350,7 +328,6 @@ def log_event(msg: str, status: str = "info", worker: str = ""):
     """Record an event: updates dashboard, writes to file log."""
     if _dashboard and worker:
         _dashboard.update(worker, msg, status)
-        _dashboard.render()
     elif _dashboard:
         # No worker specified — just print directly
         icon = {"ok": "+", "error": "X", "skip": "-"}.get(status, " ")
@@ -365,7 +342,6 @@ def tprint(*args, worker: str = "", level: int = 1, **kwargs):
     if level <= 1:
         if _dashboard and worker:
             _dashboard.update(worker, msg, "info")
-            _dashboard.render()
         else:
             print(f"  {msg}", flush=True)
     if _file_logger and level <= LOG_LEVEL:
@@ -777,7 +753,6 @@ def _claude_call_streaming(req_data, api_key, label, timeout=300):
                                f"{elapsed:.0f}s")
                         if _dashboard and wid:
                             _dashboard.update(wid, msg, "info")
-                            _dashboard.render()
                         else:
                             print(f"    {label} {msg}", flush=True)
                         last_report = now
