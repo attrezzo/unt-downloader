@@ -2732,30 +2732,39 @@ def _pick_model(prompt_text: str, current: str, menu: list) -> str:
     return raw
 
 
-def prompt_model_selection(skip=False, api_key=""):
-    """Let user change model assignments before a batch starts.
-    Shows available models from the API. Returns True if changed."""
+def prompt_model_and_tier(skip=False, api_key="", current_tier="1"):
+    """Let user change model assignments and rate limit tier.
+    Returns (changed: bool, new_tier: str)."""
     global MODEL_INITIAL, MODEL_RESOLVE, MODEL_REFINE
     if skip:
-        return False
+        return False, current_tier
 
-    print(f"  Current model assignments:")
+    tier_names = {"1": "Free", "2": "Build", "3": "Scale",
+                  "4": "Enterprise", "default": "Free", "build": "Build"}
+    tier_label = tier_names.get(current_tier, current_tier)
+
+    print(f"  Current settings:")
     print(f"    1. Pass 1-2 (image):     {MODEL_INITIAL}")
     print(f"    2. Pass 3 (text):        {MODEL_RESOLVE}")
     print(f"    3. Refinement:           {MODEL_REFINE}")
+    print(f"    4. Rate limit tier:      {current_tier} ({tier_label})")
+    print(f"       Check yours at: https://console.anthropic.com/settings/limits")
     print()
-    raw = input("  Change models? Enter number to edit, "
+    raw = input("  Change settings? Enter number to edit, "
                 "or press Enter to continue: ").strip()
     if not raw:
-        return False
+        return False, current_tier
 
-    # Fetch model list once
-    menu = _show_model_menu(api_key) if api_key else []
-    if menu:
-        print("  Enter a number from the list above, or type a model ID.")
-        print()
+    # Fetch model list once (only if editing models)
+    menu = []
+    if raw in ("1", "2", "3"):
+        menu = _show_model_menu(api_key) if api_key else []
+        if menu:
+            print("  Enter a number from the list above, or type a model ID.")
+            print()
 
     changed = False
+    new_tier = current_tier
     while raw:
         if raw == "1":
             new = _pick_model("Pass 1-2 model", MODEL_INITIAL, menu)
@@ -2772,15 +2781,24 @@ def prompt_model_selection(skip=False, api_key=""):
             if new != MODEL_REFINE:
                 MODEL_REFINE = new
                 changed = True
-        raw = input("  Edit another (1/2/3) or Enter to continue: ").strip()
+        elif raw == "4":
+            print("    Tiers: 1=Free  2=Build  3=Scale  4=Enterprise")
+            print("    Check: https://console.anthropic.com/settings/limits")
+            t = input(f"    Tier [{current_tier}]: ").strip()
+            if t and t in ("1", "2", "3", "4"):
+                new_tier = t
+                changed = True
+        raw = input("  Edit another (1/2/3/4) or Enter to continue: ").strip()
 
     if changed:
-        print(f"\n  Updated models:")
+        t_label = tier_names.get(new_tier, new_tier)
+        print(f"\n  Updated settings:")
         print(f"    Pass 1-2: {MODEL_INITIAL}")
         print(f"    Pass 3:   {MODEL_RESOLVE}")
         print(f"    Refine:   {MODEL_REFINE}")
+        print(f"    Tier:     {new_tier} ({t_label})")
         print()
-    return changed
+    return changed, new_tier
 
 
 def confirm_or_abort(prompt_msg, skip=False):
@@ -2868,8 +2886,11 @@ def main():
     p.add_argument("--delay",          type=float, default=1.0)
     p.add_argument("--api-workers",    type=int, default=3)
     p.add_argument("--serial",         action="store_true")
-    p.add_argument("--tier",           default="default",
-                   choices=["default", "build", "custom"])
+    p.add_argument("--tier",           default="1",
+                   choices=["1", "2", "3", "4", "default", "build", "custom"],
+                   help="Rate limit tier (check yours at "
+                        "console.anthropic.com/settings/limits). "
+                        "1=free 2=build 3=scale 4=enterprise")
     p.add_argument("--compile",        action="store_true",
                    help="Compile readable markdown from AI OCR output "
                         "(no API calls, run after --correct)")
@@ -3017,7 +3038,9 @@ def main():
 
         # Let user change models before refinement
         if not args.skip_estimate:
-            prompt_model_selection(skip=args.yes, api_key=api_key)
+            _, args.tier = prompt_model_and_tier(
+                skip=args.yes, api_key=api_key,
+                current_tier=args.tier)
 
         if args.refine_text:
             cnf_min = args.cnf_min if args.cnf_min is not None else 0.0
@@ -3132,8 +3155,10 @@ def main():
         est_cost, per_page = show_correction_estimate(
             pages_to_process, args.budget)
 
-        # Let user change models before committing
-        if prompt_model_selection(skip=args.yes, api_key=api_key):
+        # Let user change models and tier before committing
+        changed, args.tier = prompt_model_and_tier(
+            skip=args.yes, api_key=api_key, current_tier=args.tier)
+        if changed:
             # Re-estimate with new models
             est_cost, per_page = show_correction_estimate(
                 pages_to_process, args.budget)

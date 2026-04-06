@@ -187,27 +187,47 @@ class ClaudeRateLimiter:
 # Tier presets — pass one of these to ClaudeRateLimiter()
 # ---------------------------------------------------------------------------
 
-# Default free/low-usage tier
-TIER_DEFAULT = {"rpm": 50,    "tpm": 40_000}
+# ---------------------------------------------------------------------------
+# Tier presets — check yours at: https://console.anthropic.com/settings/limits
+# ---------------------------------------------------------------------------
 
-# Build tier (after $5 spend — common for anyone running a full collection)
-TIER_BUILD   = {"rpm": 1_000, "tpm": 80_000}
+# Tier 1: Free / low usage
+TIER_1 = {"rpm": 50,    "tpm": 40_000}
 
-# Custom — set your own from console.anthropic.com/settings/limits
-TIER_CUSTOM  = {"rpm": 50,    "tpm": 40_000}   # edit these
+# Tier 2: Build (after $5 spend)
+TIER_2 = {"rpm": 1_000, "tpm": 80_000}
+
+# Tier 3: Scale (after $50+ spend) — per-model limits vary:
+#   Haiku:  2,000 RPM, 1,000,000 input TPM, 200,000 output TPM
+#   Sonnet: 2,000 RPM, 800,000 input TPM, 160,000 output TPM
+#   Opus:   2,000 RPM, 800,000 input TPM, 160,000 output TPM
+# We use the Sonnet limits as the conservative default.
+TIER_3 = {"rpm": 2_000, "tpm": 800_000}
+
+# Tier 4: Enterprise
+TIER_4 = {"rpm": 4_000, "tpm": 2_000_000}
+
+# Legacy aliases
+TIER_DEFAULT = TIER_1
+TIER_BUILD   = TIER_2
+TIER_CUSTOM  = TIER_1  # edit these or use --tier with a number
 
 
 def limiter_from_tier(tier_name: str) -> "ClaudeRateLimiter":
     """
-    Create a rate limiter from a named tier preset.
+    Create a rate limiter from a tier preset.
 
     Args:
-        tier_name: "default", "build", or "custom"
+        tier_name: "1", "2", "3", "4", or legacy "default", "build", "custom"
     """
     tiers = {
-        "default": TIER_DEFAULT,
-        "build":   TIER_BUILD,
+        "1":       TIER_1,
+        "2":       TIER_2,
+        "3":       TIER_3,
+        "4":       TIER_4,
+        "default": TIER_1,
+        "build":   TIER_2,
         "custom":  TIER_CUSTOM,
     }
-    tier = tiers.get(tier_name.lower(), TIER_DEFAULT)
+    tier = tiers.get(tier_name.lower(), TIER_1)
     return ClaudeRateLimiter(**tier)

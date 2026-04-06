@@ -1759,9 +1759,10 @@ def main():
                    help="Parallel issues for Claude API calls (default: 3)")
     p.add_argument("--serial",         action="store_true",
                    help="Disable API parallelism — process one issue at a time")
-    p.add_argument("--tier",           default="default",
-                   choices=["default", "build", "custom"],
-                   help="Anthropic rate limit tier: default=50rpm, build=1000rpm")
+    p.add_argument("--tier",           default="1",
+                   choices=["1", "2", "3", "4", "default", "build", "custom"],
+                   help="Anthropic rate limit tier: 1=free 2=build 3=scale "
+                        "4=enterprise (check at console.anthropic.com/settings/limits)")
     p.add_argument("--logging",        type=int, default=1, choices=[1,2,3,4,5],
                    help="Log verbosity: 1=progress 2=pages 3=engines 4=alignment 5=verbose")
     p.add_argument("--verbose",        action="store_true",
