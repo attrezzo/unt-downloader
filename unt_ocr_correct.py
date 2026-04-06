@@ -99,7 +99,7 @@ def init_paths(collection_dir: Path):
 # ============================================================================
 
 REFERENCES_DIR = Path(__file__).parent / "references"
-SKILL_DIR      = Path(__file__).parent / "fraktur-ocr skill"
+SKILL_DIR      = Path(__file__).parent / "initial-ocr skill"
 
 # Additional skill path from global config (set during init)
 _configured_skill_dir = None
@@ -1343,6 +1343,470 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
 
 
 # ============================================================================
+
+
+# ============================================================================
+# REFINEMENT — TEXT AND IMAGE MODES
+# ============================================================================
+
+# Regex to parse gap tags
+GAP_RE = re.compile(
+    r'\{\{\s*gap\s*\|'
+    r'\s*est=(\d+)'
+    r'\s*\|\s*imgbbox="([^"]*)"'
+    r'(?:\s*\|\s*cnf="([^"]*)")?'
+    r'(?:\s*\|\s*status=(\S+))?'
+    r'(?:\s*\|\s*fragments="([^"]*)")?'
+    r'(?:\s*\|\s*region_ocr="([^"]*)")?'
+    r'\s*\[([^\]]*)\]'
+    r'\s*\}\}')
+
+
+def parse_gaps(text: str) -> list:
+    """Extract all gap tags from text with their positions and fields."""
+    gaps = []
+    for m in GAP_RE.finditer(text):
+        gaps.append({
+            "match": m,
+            "start": m.start(),
+            "end": m.end(),
+            "est": int(m.group(1)),
+            "imgbbox": m.group(2),
+            "cnf": float(m.group(3)) if m.group(3) else 0.0,
+            "status": m.group(4) or "",
+            "fragments": m.group(5) or "",
+            "region_ocr": m.group(6) or "",
+            "guess": m.group(7),
+            "full_tag": m.group(0),
+        })
+    return gaps
+
+
+def get_context(text: str, start: int, end: int, chars: int = 200) -> str:
+    """Get ~chars characters of context before and after a position."""
+    before = text[max(0, start - chars):start].strip()
+    after = text[end:end + chars].strip()
+    return f"...{before} [GAP] {after}..."
+
+
+def parse_bbox(bbox_str: str) -> tuple:
+    """Parse 'x,y,w,h' string into (x, y, w, h) ints."""
+    parts = bbox_str.split(",")
+    if len(parts) == 4:
+        return tuple(int(p.strip()) for p in parts)
+    return (0, 0, 0, 0)
+
+
+def merge_bboxes(bboxes: list, padding: int = 50) -> tuple:
+    """Merge a list of (x,y,w,h) bboxes into a single bounding box."""
+    if not bboxes:
+        return (0, 0, 0, 0)
+    x_min = min(b[0] for b in bboxes) - padding
+    y_min = min(b[1] for b in bboxes) - padding
+    x_max = max(b[0] + b[2] for b in bboxes) + padding
+    y_max = max(b[1] + b[3] for b in bboxes) + padding
+    return (max(0, x_min), max(0, y_min), x_max - max(0, x_min), y_max - max(0, y_min))
+
+
+def group_gaps_by_bbox(gaps: list, proximity_px: int = 100) -> list:
+    """Group gaps whose bboxes overlap or are within proximity_px vertically.
+    Returns list of lists of gaps."""
+    if not gaps:
+        return []
+
+    # Sort by y position
+    sorted_gaps = sorted(gaps, key=lambda g: parse_bbox(g["imgbbox"])[1])
+    groups = []
+    current_group = [sorted_gaps[0]]
+    current_bbox = parse_bbox(sorted_gaps[0]["imgbbox"])
+    current_bottom = current_bbox[1] + current_bbox[3]
+
+    for gap in sorted_gaps[1:]:
+        bbox = parse_bbox(gap["imgbbox"])
+        gap_top = bbox[1]
+        if gap_top <= current_bottom + proximity_px:
+            current_group.append(gap)
+            current_bottom = max(current_bottom, bbox[1] + bbox[3])
+        else:
+            groups.append(current_group)
+            current_group = [gap]
+            current_bbox = bbox
+            current_bottom = bbox[1] + bbox[3]
+
+    groups.append(current_group)
+    return groups
+
+
+def crop_image(image_bytes: bytes, bbox: tuple) -> bytes:
+    """Crop a JPEG image to the given (x,y,w,h) bounding box. Returns JPEG bytes."""
+    from PIL import Image
+    import io
+    img = Image.open(io.BytesIO(image_bytes))
+    x, y, w, h = bbox
+    # Clamp to image bounds
+    x2 = min(x + w, img.width)
+    y2 = min(y + h, img.height)
+    x = max(0, x)
+    y = max(0, y)
+    cropped = img.crop((x, y, x2, y2))
+    buf = io.BytesIO()
+    cropped.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+def build_text_refine_prompt() -> str:
+    """System prompt for text-only refinement."""
+    fraktur_errors = load_reference("fraktur-errors.md")
+    texas_german = load_reference("texas-german.md")
+    return f"""You are an expert in 19th-century German Fraktur OCR correction.
+
+REFERENCE: FRAKTUR ERROR PATTERNS
+{fraktur_errors}
+
+REFERENCE: TEXAS GERMAN VOCABULARY
+{texas_german}
+
+TASK: Re-evaluate OCR gap tags using fragments, raw OCR, and context.
+No image is provided — work from text evidence only.
+
+For each gap in the batch, return one line:
+  UNCHANGED: <N>
+  UPDATED: <N> | cnf="0.XX" [new guess]
+  PROMOTED: <N> [text to replace gap tag]
+
+PROMOTED means cnf >= 0.95 — the gap tag is removed and replaced with
+plain text. UPDATED means improved guess/confidence. UNCHANGED means
+you cannot improve on the current guess.
+
+Preserve Texas German dialect, pre-1901 spellings, English loanwords."""
+
+
+def build_image_refine_prompt() -> str:
+    """System prompt for image-assisted refinement."""
+    fraktur_errors = load_reference("fraktur-errors.md")
+    texas_german = load_reference("texas-german.md")
+    return f"""You are an expert in reading 19th-century German Fraktur from
+damaged microfilm scans.
+
+REFERENCE: FRAKTUR ERROR PATTERNS
+{fraktur_errors}
+
+REFERENCE: TEXAS GERMAN VOCABULARY
+{texas_german}
+
+TASK: You receive a cropped region of a newspaper page and one or more
+gap tags from that region with surrounding context. Examine the image
+carefully and produce updated guesses.
+
+For each gap, return one line:
+  UNCHANGED: <N>
+  UPDATED: <N> | cnf="0.XX" [new guess]
+  PROMOTED: <N> [text to replace gap tag]
+
+PROMOTED means cnf >= 0.95. Look for Fraktur letterforms, ascenders,
+descenders, dots, stroke patterns. Cross-reference with fragments and
+raw OCR text provided.
+
+Preserve Texas German dialect, pre-1901 spellings, English loanwords."""
+
+
+def apply_refinement_results(page_text: str, gaps: list,
+                             results: str) -> str:
+    """Apply refinement results to page text, modifying gap tags in-place."""
+    replacements = {}
+    for line in results.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("UNCHANGED:"):
+            continue
+        elif line.startswith("UPDATED:"):
+            m = re.match(
+                r'UPDATED:\s*(\d+)\s*\|\s*cnf="([^"]*)"\s*\[([^\]]*)\]',
+                line)
+            if m:
+                idx = int(m.group(1)) - 1
+                new_cnf = m.group(2)
+                new_guess = m.group(3)
+                if 0 <= idx < len(gaps):
+                    replacements[idx] = ("update", new_cnf, new_guess)
+        elif line.startswith("PROMOTED:"):
+            m = re.match(r'PROMOTED:\s*(\d+)\s*\[([^\]]*)\]', line)
+            if m:
+                idx = int(m.group(1)) - 1
+                promoted_text = m.group(2)
+                if 0 <= idx < len(gaps):
+                    replacements[idx] = ("promote", None, promoted_text)
+
+    # Apply replacements in reverse order to preserve positions
+    sorted_indices = sorted(replacements.keys(), reverse=True)
+    for idx in sorted_indices:
+        action, new_cnf, new_text = replacements[idx]
+        gap = gaps[idx]
+        if action == "promote":
+            page_text = (page_text[:gap["start"]] + new_text +
+                         page_text[gap["end"]:])
+        elif action == "update":
+            cnf_val = float(new_cnf)
+            status = ' | status=auto-resolved' if cnf_val >= 0.80 else ''
+            frags = f' | fragments="{gap["fragments"]}"' if gap["fragments"] else ''
+            rocr = f' | region_ocr="{gap["region_ocr"]}"' if gap["region_ocr"] else ''
+            new_tag = (f'{{{{ gap | est={gap["est"]} | '
+                       f'imgbbox="{gap["imgbbox"]}" | '
+                       f'cnf="{new_cnf}"{status}{frags}{rocr} '
+                       f'[{new_text}] }}}}')
+            page_text = (page_text[:gap["start"]] + new_tag +
+                         page_text[gap["end"]:])
+
+    return page_text
+
+
+def refine_text(issues, config, collection_dir, api_key,
+                cnf_min=0.0, cnf_max=0.79, include_resolved=False,
+                rate_limiter=None, cost_tracker=None, model=None):
+    """Text-only refinement pass across all matching gaps."""
+    model = model or MODEL_RESOLVE
+    prompt = build_text_refine_prompt()
+    total_updated = 0
+    total_promoted = 0
+    total_unchanged = 0
+
+    for issue in issues:
+        ark_id = issue["ark_id"]
+        ai_dir = collection_dir / "ai_ocr" / ark_id
+        if not ai_dir.exists():
+            continue
+
+        for page_file in sorted(ai_dir.glob("page_*.md")):
+            text = page_file.read_text(encoding="utf-8")
+            gaps = parse_gaps(text)
+
+            # Filter by cnf range and status
+            eligible = []
+            for g in gaps:
+                if g["cnf"] < cnf_min or g["cnf"] > cnf_max:
+                    continue
+                if g["status"] == "auto-resolved" and not include_resolved:
+                    continue
+                # For text refinement, skip gaps with nothing to work with
+                if not g["fragments"] and not g["region_ocr"]:
+                    continue
+                eligible.append(g)
+
+            if not eligible:
+                continue
+
+            tprint(f"  {ark_id}/{page_file.name}: {len(eligible)} gaps",
+                   level=1)
+
+            # Build batch prompt
+            batch_lines = []
+            for i, g in enumerate(eligible, 1):
+                ctx = get_context(text, g["start"], g["end"])
+                batch_lines.append(
+                    f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
+                    f"fragments=\"{g['fragments']}\" "
+                    f"region_ocr=\"{g['region_ocr']}\" "
+                    f"current_guess=\"{g['guess']}\"\n"
+                    f"  Context: {ctx}")
+
+            user_msg = "\n\n".join(batch_lines)
+
+            try:
+                result, _ = claude_api_call(
+                    {"model": model, "max_tokens": 4000,
+                     "system": prompt,
+                     "messages": [{"role": "user", "content": user_msg}]},
+                    api_key, rate_limiter, est_tokens=len(user_msg) // 4 + 2000,
+                    cost_tracker=cost_tracker)
+            except Exception as e:
+                tprint(f"    Error: {e}", level=1)
+                continue
+
+            # Apply results
+            new_text = apply_refinement_results(text, eligible, result)
+            if new_text != text:
+                page_file.write_text(new_text, encoding="utf-8")
+                # Count changes
+                for line in result.strip().split("\n"):
+                    if line.startswith("UPDATED:"):
+                        total_updated += 1
+                    elif line.startswith("PROMOTED:"):
+                        total_promoted += 1
+                    elif line.startswith("UNCHANGED:"):
+                        total_unchanged += 1
+
+    print(f"\nText refinement: {total_promoted} promoted, "
+          f"{total_updated} updated, {total_unchanged} unchanged")
+    return total_promoted + total_updated
+
+
+def refine_image(issues, config, collection_dir, api_key,
+                 cnf_min=0.01, cnf_max=0.60, include_resolved=False,
+                 rate_limiter=None, cost_tracker=None, model=None):
+    """Image-assisted refinement with bbox cropping and batching."""
+    model = model or MODEL_REFINE
+    prompt = build_image_refine_prompt()
+    total_updated = 0
+    total_promoted = 0
+
+    for issue in issues:
+        ark_id = issue["ark_id"]
+        ai_dir = collection_dir / "ai_ocr" / ark_id
+        if not ai_dir.exists():
+            continue
+
+        for page_file in sorted(ai_dir.glob("page_*.md")):
+            text = page_file.read_text(encoding="utf-8")
+            gaps = parse_gaps(text)
+
+            # Filter
+            eligible = []
+            for g in gaps:
+                if g["cnf"] < cnf_min or g["cnf"] > cnf_max:
+                    continue
+                if g["status"] == "auto-resolved" and not include_resolved:
+                    continue
+                # Skip pure context guesses with nothing visible
+                if not g["fragments"] and not g["region_ocr"] and g["cnf"] == 0.0:
+                    continue
+                eligible.append(g)
+
+            if not eligible:
+                continue
+
+            # Get the page image
+            pg_match = re.search(r'page_(\d+)', page_file.stem)
+            if not pg_match:
+                continue
+            pg_num = int(pg_match.group(1))
+            img_bytes, img_type = fetch_page_image(ark_id, pg_num)
+            if not img_bytes:
+                tprint(f"  {ark_id}/p{pg_num}: no image, skipping", level=1)
+                continue
+
+            # Group gaps by bbox proximity for batching
+            groups = group_gaps_by_bbox(eligible)
+            tprint(f"  {ark_id}/p{pg_num}: {len(eligible)} gaps in "
+                   f"{len(groups)} batch(es)", level=1)
+
+            any_changed = False
+            for group in groups:
+                # Merge bboxes for this group
+                bboxes = [parse_bbox(g["imgbbox"]) for g in group]
+                merged = merge_bboxes(bboxes, padding=50)
+
+                # Crop
+                try:
+                    crop_bytes = crop_image(img_bytes, merged)
+                except Exception as e:
+                    tprint(f"    Crop failed: {e}", level=2)
+                    continue
+
+                # Build batch prompt with image
+                content = [
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": base64.standard_b64encode(
+                            crop_bytes).decode("ascii"),
+                    }},
+                ]
+
+                batch_lines = []
+                for i, g in enumerate(group, 1):
+                    ctx = get_context(text, g["start"], g["end"])
+                    batch_lines.append(
+                        f"GAP {i}: est={g['est']} cnf={g['cnf']:.2f} "
+                        f"fragments=\"{g['fragments']}\" "
+                        f"region_ocr=\"{g['region_ocr']}\" "
+                        f"current_guess=\"{g['guess']}\"\n"
+                        f"  Context: {ctx}")
+
+                content.append(
+                    {"type": "text",
+                     "text": "\n\n".join(batch_lines)})
+
+                try:
+                    result, _ = claude_api_call(
+                        {"model": model, "max_tokens": 2000,
+                         "system": prompt,
+                         "messages": [{"role": "user",
+                                       "content": content}]},
+                        api_key, rate_limiter, est_tokens=5000,
+                        cost_tracker=cost_tracker)
+                except Exception as e:
+                    tprint(f"    Error: {e}", level=1)
+                    continue
+
+                new_text = apply_refinement_results(text, group, result)
+                if new_text != text:
+                    text = new_text
+                    any_changed = True
+                    for line in result.strip().split("\n"):
+                        if line.startswith("UPDATED:"):
+                            total_updated += 1
+                        elif line.startswith("PROMOTED:"):
+                            total_promoted += 1
+
+            if any_changed:
+                page_file.write_text(text, encoding="utf-8")
+
+    print(f"\nImage refinement: {total_promoted} promoted, "
+          f"{total_updated} updated")
+    return total_promoted + total_updated
+
+
+def regenerate_corrected(issues, config, collection_dir):
+    """Regenerate corrected/ and readable/ from updated ai_ocr/ files."""
+    corrected_dir = collection_dir / "corrected"
+    corrected_dir.mkdir(exist_ok=True)
+
+    for issue in issues:
+        ark_id = issue["ark_id"]
+        vol = str(issue.get("volume", "?")).zfill(2)
+        num = str(issue.get("number", "?")).zfill(2)
+        date = re.sub(r"[^\w\-]", "-", issue.get("date", "unknown"))
+        fname = f"{ark_id}_vol{vol}_no{num}_{date}.txt"
+        ai_dir = collection_dir / "ai_ocr" / ark_id
+
+        if not ai_dir.exists():
+            continue
+
+        page_files = sorted(ai_dir.glob("page_*.md"))
+        if not page_files:
+            continue
+
+        # Build header
+        title_line = issue.get("full_title", config.get("title_name", ""))
+        header = (
+            f"=== {title_line} ===\n"
+            f"ARK:    {ark_id}\n"
+            f"URL:    https://texashistory.unt.edu/ark:/67531/{ark_id}/\n"
+            f"Date:   {issue.get('date', 'unknown')}\n"
+            f"Volume: {issue.get('volume', '?')}   "
+            f"Number: {issue.get('number', '?')}\n"
+            f"Title:  {title_line}\n"
+            f"{'=' * 60}")
+
+        total_pages = len(page_files)
+        out_lines = [header, ""]
+        for pf in page_files:
+            pg_match = re.search(r'page_(\d+)', pf.stem)
+            pg_num = int(pg_match.group(1)) if pg_match else 0
+            raw = pf.read_text(encoding="utf-8")
+            clean = extract_clean_text(raw)
+            out_lines.append(f"--- Page {pg_num} of {total_pages} ---")
+            out_lines.append(clean)
+            out_lines.append("")
+
+        corr_path = corrected_dir / fname
+        corr_path.write_text("\n".join(out_lines), encoding="utf-8")
+
+    # Also regenerate readable/ if it exists
+    readable_dir = collection_dir / "readable"
+    if readable_dir.exists():
+        compile_all(issues, config, collection_dir, resume=False)
 # COMPILE — READABLE MARKDOWN OUTPUT
 # ============================================================================
 
@@ -1615,6 +2079,20 @@ def main():
     p.add_argument("--compile",        action="store_true",
                    help="Compile readable markdown from AI OCR output "
                         "(no API calls, run after --correct)")
+    p.add_argument("--refine-text",    action="store_true",
+                   help="Text-only refinement of low-confidence gaps "
+                        "(no image, uses Sonnet by default)")
+    p.add_argument("--refine-image",   action="store_true",
+                   help="Image-assisted refinement of gaps using bbox "
+                        "cropping (uses Opus by default)")
+    p.add_argument("--cnf-min",        type=float, default=None,
+                   help="Minimum cnf for refinement (default: 0.0 text, "
+                        "0.01 image)")
+    p.add_argument("--cnf-max",        type=float, default=None,
+                   help="Maximum cnf for refinement (default: 0.79 text, "
+                        "0.60 image)")
+    p.add_argument("--include-resolved", action="store_true",
+                   help="Include auto-resolved gaps in refinement")
     p.add_argument("--budget",         type=float, default=None,
                    help="Max dollar amount to spend (stops before exceeding)")
     p.add_argument("--model-initial",  default=None,
@@ -1686,7 +2164,8 @@ def main():
                or os.environ.get("ANTHROPIC_API_KEY", "")
                or global_config.get("anthropic_api_key", "")
                or config.get("anthropic_api_key", ""))
-    if not args.preload_images and not args.compile and not api_key:
+    if (not args.preload_images and not args.compile
+            and not api_key):
         sys.exit("Error: API key required. Set in config.json, "
                  "ANTHROPIC_API_KEY env var, or --api-key flag.")
 
@@ -1733,6 +2212,41 @@ def main():
               flush=True)
         compile_all(issues, config, collection_dir,
                     resume=not args.force)
+        return
+
+    if args.refine_text or args.refine_image:
+        rate_limiter = (limiter_from_tier(args.tier)
+                        if ClaudeRateLimiter else None)
+        cost_tracker = CostTracker(MODEL_RESOLVE, budget=args.budget)
+
+        if args.refine_text:
+            cnf_min = args.cnf_min if args.cnf_min is not None else 0.0
+            cnf_max = args.cnf_max if args.cnf_max is not None else 0.79
+            print(f"\nText refinement: cnf {cnf_min:.2f}-{cnf_max:.2f} "
+                  f"using {args.model_resolve or MODEL_RESOLVE}", flush=True)
+            refine_text(issues, config, collection_dir, api_key,
+                        cnf_min=cnf_min, cnf_max=cnf_max,
+                        include_resolved=args.include_resolved,
+                        rate_limiter=rate_limiter,
+                        cost_tracker=cost_tracker,
+                        model=args.model_resolve)
+
+        if args.refine_image:
+            cnf_min = args.cnf_min if args.cnf_min is not None else 0.01
+            cnf_max = args.cnf_max if args.cnf_max is not None else 0.60
+            print(f"\nImage refinement: cnf {cnf_min:.2f}-{cnf_max:.2f} "
+                  f"using {args.model_refine or MODEL_REFINE}", flush=True)
+            refine_image(issues, config, collection_dir, api_key,
+                         cnf_min=cnf_min, cnf_max=cnf_max,
+                         include_resolved=args.include_resolved,
+                         rate_limiter=rate_limiter,
+                         cost_tracker=cost_tracker,
+                         model=args.model_refine)
+
+        # Regenerate corrected/ and readable/ from updated ai_ocr/
+        print("\nRegenerating corrected/ and readable/ ...", flush=True)
+        regenerate_corrected(issues, config, collection_dir)
+        print(f"Cost: {cost_tracker.summary()}")
         return
 
     # Count pages to process (respecting --resume/--force)

@@ -203,14 +203,14 @@ def configure_global(existing: dict = None) -> dict:
     print("─" * 72)
     print("FRAKTUR OCR SKILL")
     print("─" * 72)
-    print("The fraktur-ocr skill provides reference data for OCR correction")
+    print("The initial-ocr skill provides reference data for OCR correction")
     print("(error patterns, Texas German vocabulary, markup specification).\n")
 
     default_skill = e.get("skill_path", "")
     if not default_skill:
         # Auto-detect skill directory
         candidates = [
-            Path(__file__).parent / "fraktur-ocr skill",
+            Path(__file__).parent / "initial-ocr skill",
             Path(__file__).parent / "fraktur-ocr-skill",
         ]
         for c in candidates:
@@ -1520,7 +1520,7 @@ def run_update_skill(global_config: dict, args):
     skill_path = global_config.get("skill_path", "")
     if not skill_path:
         candidates = [
-            Path(__file__).parent / "fraktur-ocr skill",
+            Path(__file__).parent / "initial-ocr skill",
             Path(__file__).parent / "fraktur-ocr-skill",
         ]
         for c in candidates:
@@ -1698,6 +1698,16 @@ def main():
                    help="Correct OCR errors using Claude vision API")
     p.add_argument("--compile",        action="store_true",
                    help="Compile readable markdown from corrected OCR (no API calls)")
+    p.add_argument("--refine-text",    action="store_true",
+                   help="Text-only refinement of low-confidence gaps (Sonnet)")
+    p.add_argument("--refine-image",   action="store_true",
+                   help="Image-assisted refinement with bbox cropping (Opus)")
+    p.add_argument("--cnf-min",        type=float, default=None,
+                   help="Min cnf for refinement filtering")
+    p.add_argument("--cnf-max",        type=float, default=None,
+                   help="Max cnf for refinement filtering")
+    p.add_argument("--include-resolved", action="store_true",
+                   help="Include auto-resolved gaps in refinement")
     p.add_argument("--translate",      action="store_true",
                    help="Translate to English using Claude vision API")
     p.add_argument("--render-pdf",     action="store_true",
@@ -1762,6 +1772,7 @@ def main():
 
     if not any([args.configure, args.update_skill, args.discover, args.download_ocr,
                 args.download_pdf, args.preload_images, args.correct, args.compile,
+                args.refine_text, args.refine_image,
                 args.translate, args.status, args.render_pdf]):
         p.print_help()
         return
@@ -1880,6 +1891,26 @@ def main():
         if args.date_from: compile_args += ["--date-from", args.date_from]
         if args.date_to:   compile_args += ["--date-to", args.date_to]
         run_worker("unt_ocr_correct.py", compile_args)
+
+    if args.refine_text or args.refine_image:
+        refine_args = ["--config-path", str(config_path)]
+        if args.refine_text:   refine_args.append("--refine-text")
+        if args.refine_image:  refine_args.append("--refine-image")
+        if resolved_api_key:   refine_args += ["--api-key", resolved_api_key]
+        if args.ark:           refine_args += ["--ark", args.ark]
+        if args.date_from:     refine_args += ["--date-from", args.date_from]
+        if args.date_to:       refine_args += ["--date-to", args.date_to]
+        if args.cnf_min is not None:
+            refine_args += ["--cnf-min", str(args.cnf_min)]
+        if args.cnf_max is not None:
+            refine_args += ["--cnf-max", str(args.cnf_max)]
+        if args.include_resolved:
+            refine_args.append("--include-resolved")
+        if args.budget is not None:
+            refine_args += ["--budget", str(args.budget)]
+        if args.tier:
+            refine_args += ["--tier", args.tier]
+        run_worker("unt_ocr_correct.py", refine_args)
 
     if args.translate:
         run_worker("unt_translate.py", worker_args)

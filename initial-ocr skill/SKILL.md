@@ -1,5 +1,5 @@
 ---
-name: fraktur-ocr
+name: initial-ocr
 description: Multi-pass OCR correction pipeline for 19th-century German-language Fraktur newspapers scanned from microfilm. Use this skill whenever the user uploads a newspaper page image (JPG/PNG/TIFF) from a German-language Texas newspaper, mentions Fraktur OCR, references the Bellville Wochenblatt or similar German-Texan periodicals, asks to OCR old German text, or wants to correct/improve existing OCR of Fraktur script. Also trigger when the user mentions ABBYY OCR output from the Portal to Texas History (UNT), German-Texan historical newspapers, or any combination of "OCR" with "Fraktur," "German newspaper," "Wochenblatt," "Texas German," or "19th century German." This skill handles the full pipeline from raw image to corrected, metadata-tagged output.
 ---
 
