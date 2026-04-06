@@ -216,22 +216,15 @@ class WorkerDashboard:
         """Render dashboard output.
 
         force=True  → full block (progress + cost + workers). Page milestones.
-        force=False → progress bar line, throttled to 2s.
-
-        An empty line is always printed first so that PowerShell's
-        tendency to repeat the first line of output is harmless.
+        force=False → no-op. Intermediate updates only update worker state
+                      (visible on next force render). PowerShell can't
+                      overwrite lines, so printing between milestones just
+                      creates noise.
         """
-        now = time.monotonic()
-        if not force and (now - self._last_render) < 2.0:
+        if not force:
             return
         with self._lock:
-            self._last_render = now
-            if force:
-                lines = self._build_lines(now)
-            else:
-                lines = [self._build_progress_line(now)]
-
-        # Empty line first — PowerShell may repeat it, which is fine
+            lines = self._build_lines(time.monotonic())
         print("\n" + "\n".join(lines), flush=True)
 
     def _fmt_time(self, secs):
