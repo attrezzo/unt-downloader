@@ -602,15 +602,22 @@ class CostTracker:
 
 def claude_api_call(payload: dict, api_key: str,
                     rate_limiter=None, est_tokens: int = 8000,
-                    cost_tracker=None):
-    """Make a Claude API call with retry/rate-limit. Returns (text, usage)."""
-    tprint(f"    -> Claude API: model={payload.get('model')} "
-           f"max_tokens={payload.get('max_tokens')} est={est_tokens}", level=3)
+                    cost_tracker=None, label: str = ""):
+    """Make a Claude API call with retry/rate-limit. Returns (text, usage).
+    label: short identifier for stdout progress (e.g. 'p01 pass1-2')."""
+    model = payload.get("model", "?")
+    log_debug(f"API call: model={model} max_tokens={payload.get('max_tokens')} "
+              f"est={est_tokens} label={label}", level=3)
     req_data = json.dumps(payload).encode("utf-8")
+    req_mb = len(req_data) / 1_048_576
+
     if rate_limiter:
         rate_limiter.acquire(estimated_tokens=est_tokens)
 
     for attempt in range(1, 4):
+        t0 = time.monotonic()
+        if label:
+            log_event(f"{label} sending {req_mb:.1f}MB to {model}...")
         try:
             req = urllib.request.Request(
                 ANTHROPIC_API, data=req_data,
@@ -620,6 +627,7 @@ def claude_api_call(payload: dict, api_key: str,
                 method="POST")
             with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read())
+            elapsed = time.monotonic() - t0
             usage = result.get("usage", {})
             in_tok = usage.get("input_tokens", 0)
             out_tok = usage.get("output_tokens", 0)
@@ -627,8 +635,11 @@ def claude_api_call(payload: dict, api_key: str,
                 rate_limiter.record_usage(input_tokens=in_tok, output_tokens=out_tok)
             if cost_tracker:
                 cost_tracker.record(in_tok, out_tok)
-            tprint(f"    <- Claude API: {in_tok} in + {out_tok} out tokens",
-                   level=3)
+            if label:
+                log_event(f"{label} done  {in_tok:,}in+{out_tok:,}out  "
+                          f"{elapsed:.1f}s", "ok")
+            log_debug(f"API response: {in_tok}in+{out_tok}out "
+                      f"{elapsed:.1f}s model={model}", level=3)
             text = ""
             for block in result.get("content", []):
                 if block.get("type") == "text":
@@ -636,11 +647,15 @@ def claude_api_call(payload: dict, api_key: str,
                     break
             return text, usage
         except urllib.error.HTTPError as e:
+            elapsed = time.monotonic() - t0
             if e.code in (429, 503, 529):
                 wait = 30 * attempt
-                log_event(f"rate limit {e.code}, waiting {wait}s...")
+                log_event(f"{label} rate limit {e.code} after "
+                          f"{elapsed:.0f}s, retry in {wait}s...")
                 time.sleep(wait)
             else:
+                log_event(f"{label} HTTP {e.code} after {elapsed:.0f}s",
+                          "error")
                 raise
         except Exception as e:
             if attempt < 3:
@@ -920,13 +935,14 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
 
     est = EST_INPUT_TOKENS_PASS12 if has_image else 5_000
 
-    log_event(f"p{page_num:02d} pass 1-2 started  ({MODEL_INITIAL})")
+    p_label = f"p{page_num:02d} pass1-2"
     try:
-        pass12_raw, usage1 = claude_api_call(
+        pass12_raw, _ = claude_api_call(
             {"model": MODEL_INITIAL, "max_tokens": MAX_OUTPUT_TOKENS,
              "system": pass12_prompt,
              "messages": [{"role": "user", "content": content}]},
-            api_key, rate_limiter, est_tokens=est, cost_tracker=cost_tracker)
+            api_key, rate_limiter, est_tokens=est,
+            cost_tracker=cost_tracker, label=p_label)
     except Exception as e:
         log_event(f"p{page_num:02d} pass 1-2 FAILED  {e}", "error")
         return {"text": "", "markdown": "", "stats": {},
@@ -936,11 +952,6 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
         log_event(f"p{page_num:02d} pass 1-2 empty response", "error")
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": "empty pass 1-2 response"}
-
-    in1 = usage1.get("input_tokens", 0)
-    out1 = usage1.get("output_tokens", 0)
-    log_event(f"p{page_num:02d} pass 1-2 done     "
-              f"{in1:,}in+{out1:,}out tok", "ok")
 
     # ── Call 2: Pass 3 (text-only cross-reference) ───────────────────────
     ref_ocr = abbyy_text or portal_ocr or ""
@@ -956,28 +967,21 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
         "Resolve all gaps: add [guess], cnf, region_ocr. "
         "Promote cnf >= 0.95 to plain text.")
 
-    log_event(f"p{page_num:02d} pass 3 started    ({MODEL_RESOLVE})")
+    p3_label = f"p{page_num:02d} pass3"
     try:
-        raw, usage3 = claude_api_call(
+        raw, _ = claude_api_call(
             {"model": MODEL_RESOLVE, "max_tokens": MAX_OUTPUT_TOKENS,
              "system": pass3_prompt,
              "messages": [{"role": "user", "content": pass3_user}]},
             api_key, rate_limiter, est_tokens=EST_INPUT_TOKENS_PASS3,
-            cost_tracker=cost_tracker)
+            cost_tracker=cost_tracker, label=p3_label)
     except Exception as e:
-        log_event(f"p{page_num:02d} pass 3 FAILED    {e} (using pass 1-2)",
+        log_event(f"p{page_num:02d} pass 3 FAILED  {e} (using pass 1-2)",
                   "error")
         raw = pass12_raw
-        usage3 = {}
 
     if not raw.strip():
         raw = pass12_raw
-
-    in3 = usage3.get("input_tokens", 0)
-    out3 = usage3.get("output_tokens", 0)
-    if usage3:
-        log_event(f"p{page_num:02d} pass 3 done      "
-                  f"{in3:,}in+{out3:,}out tok", "ok")
 
     clean_text = extract_clean_text(raw)
     stats = extract_stats(raw)
