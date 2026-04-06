@@ -516,26 +516,21 @@ def _extract_text_from_ai_ocr(md_text: str) -> str:
     Strips the header (above ---), gap tags, and Column/Ad markers,
     returning clean text suitable for translation.
     """
-    # Text body is after the first --- separator
-    parts = md_text.split("\n---\n")
-    body = parts[1] if len(parts) >= 2 else md_text
-
-    # Strip LAYOUT/COLUMNS/DAMAGE header lines
-    lines = body.strip().split('\n')
-    clean = []
-    skip_header = True
-    for line in lines:
-        if skip_header:
-            if line.startswith(('LAYOUT:', 'COLUMNS:', 'DAMAGE:')):
-                continue
-            if line.strip() == '' and not clean:
-                continue
-            skip_header = False
-        if line.startswith('STATS:'):
-            break
-        clean.append(line)
-
-    text = '\n'.join(clean).strip()
+    # Extract body: everything between first --- and STATS:
+    # The body may contain its own --- dividers (article separators)
+    first_delim = md_text.find("\n---\n")
+    if first_delim >= 0:
+        body_start = first_delim + 5
+        stats_idx = md_text.find("\nSTATS:", body_start)
+        if stats_idx > 0:
+            text = md_text[body_start:stats_idx]
+            if text.rstrip().endswith("---"):
+                text = text.rstrip()[:-3]
+        else:
+            text = md_text[body_start:]
+        text = text.strip()
+    else:
+        text = md_text
 
     # Strip gap tags → replace with best guess
     text = re.sub(r'\{\{\s*gap\s*\|[^}]*\[([^\]]*)\]\s*\}\}', r'\1', text)

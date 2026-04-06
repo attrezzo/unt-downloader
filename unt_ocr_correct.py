@@ -1423,39 +1423,41 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     }
 
 
-def extract_clean_text(raw_response: str) -> str:
-    """Extract clean corrected text from Claude's response, stripping markup."""
-    # Handle cases where Claude prefixes analysis before the formatted output
-    # Find the LAYOUT: line as the true start of structured output
+def _extract_body(raw_response: str) -> str:
+    """Extract body text between first --- and STATS: section.
+
+    The body may contain its own --- dividers (e.g., between a farm ad
+    and column text). We take everything from after the FIRST --- to
+    before STATS:, not just between the first two --- markers.
+    """
+    # Find LAYOUT: start
     layout_idx = raw_response.find("LAYOUT:")
     if layout_idx > 0:
         raw_response = raw_response[layout_idx:]
 
-    # Find text between --- delimiters
-    parts = raw_response.split("\n---\n")
-    if len(parts) >= 3:
-        text_body = parts[1]
-    elif len(parts) == 2:
-        text_body = parts[1]
+    # Find the first --- after LAYOUT/COLUMNS/DAMAGE header
+    first_delim = raw_response.find("\n---\n")
+    if first_delim < 0:
+        return raw_response
+
+    body_start = first_delim + 5  # skip past "\n---\n"
+
+    # Find STATS: section (the end marker)
+    stats_idx = raw_response.find("\nSTATS:", body_start)
+    if stats_idx > 0:
+        # Also strip any trailing --- before STATS
+        body = raw_response[body_start:stats_idx]
+        if body.rstrip().endswith("---"):
+            body = body.rstrip()[:-3]
     else:
-        text_body = raw_response
+        body = raw_response[body_start:]
 
-    # Strip header lines (LAYOUT/COLUMNS/DAMAGE)
-    lines = text_body.strip().split('\n')
-    clean_lines = []
-    skip_header = True
-    for line in lines:
-        if skip_header:
-            if line.startswith(('LAYOUT:', 'COLUMNS:', 'DAMAGE:')):
-                continue
-            if line.strip() == '' and not clean_lines:
-                continue
-            skip_header = False
-        if line.startswith('STATS:'):
-            break
-        clean_lines.append(line)
+    return body.strip()
 
-    text = '\n'.join(clean_lines).strip()
+
+def extract_clean_text(raw_response: str) -> str:
+    """Extract clean corrected text from Claude's response, stripping markup."""
+    text = _extract_body(raw_response)
 
     # Strip HTML comment metadata tags
     text = re.sub(
@@ -1525,14 +1527,10 @@ def build_page_markdown(newspaper, date, page_num, source_image,
         header += f"- {key}: {val}\n"
     header += "\n---\n\n"
 
-    # Extract text body from raw response (between --- markers)
-    parts = raw_response.split("\n---\n")
-    if len(parts) >= 2:
-        text_body = parts[1]
-    else:
-        text_body = raw_response
+    # Extract text body from raw response (between first --- and STATS)
+    text_body = _extract_body(raw_response)
 
-    return header + text_body.strip() + "\n"
+    return header + text_body + "\n"
 
 
 # ============================================================================
