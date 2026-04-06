@@ -6,7 +6,7 @@ Replaces the multi-engine OCR pipeline with Claude Vision.
 
 Each page image is sent to Claude along with optional ABBYY/portal OCR text
 and comprehensive Fraktur reference data. Claude performs direct transcription,
-cross-referencing, gap identification, confidence-rated infills, and article
+cross-referencing, gap identification, confidence scoring, and article
 boundary marking in a single pass.
 
 Output:
@@ -489,48 +489,48 @@ PASS 1 - DIRECT FRAKTUR OCR:
    - Tier 2 with context checking (capital letter confusions)
    - Tiers 3-5 case by case (ligature breaks, number/letter, hyphenation)
 5. Where text is confidently readable, write it directly with no tags
-6. Where text is illegible or uncertain, insert a gap with your best guess
-   and an approximate bounding box showing where in the image this text is:
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" [best guess of missing text] }}}}
-   imgbbox = approximate pixel region (x,y=top-left, w,h=size). Be generous.
-   ALWAYS include a guess and a bounding box.
-7. Mark images/illustrations/engravings on the page:
+6. Where text is illegible or uncertain, insert a gap tag with:
+   - est = estimated character count
+   - imgbbox = approximate pixel bounding box (x,y=top-left, w,h=size), be generous
+   - cnf = confidence 0-1 (0.95=high, 0.5=moderate, 0.0=pure guess)
+   - [best guess] = your prediction in square brackets
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" [best guess] }}}}
+   ALWAYS guess. Set cnf="0.00" if it's pure context inference.
+7. After cross-referencing with ABBYY/portal OCR, add region_ocr (raw text):
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial" | region_ocr="raw" [guess] }}}}
+8. Mark images/illustrations/engravings:
    {{{{ Img | bbox="x,y,w,h" | desc="brief description" }}}}
-8. Wrap each article/news item/notice in a numbered Column tag:
+9. Wrap each article/news item/notice in a numbered Column tag:
    {{{{ Column001 }}}} article text {{{{ /Column }}}}
-9. Wrap each advertisement in a numbered Ad tag:
+10. Wrap each advertisement in a numbered Ad tag:
    {{{{ Ad001 }}}} ad text {{{{ /Ad }}}}
-10. Number Column and Ad tags sequentially per page (001, 002, 003...)
-11. Do NOT correct Texas German dialect words or pre-1901 spellings
-12. Do NOT translate English loanwords to German
-13. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
+11. Number Column and Ad tags sequentially per page (001, 002, 003...)
+12. Do NOT correct Texas German dialect words or pre-1901 spellings
+13. Do NOT translate English loanwords to German
+14. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
 
 PASS 2 - GAP INVENTORY:
 For each {{{{ gap }}}} from Pass 1:
 1. Re-examine the image at that location
 2. Note partial letterforms, ascenders, descenders, dots, fragments
 3. Refine the character count estimate, bounding box, and your best guess
-4. Replace with enriched marker:
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="visible_fragments" [refined guess] }}}}
+4. Add fragments field and adjust cnf:
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="visible" [refined guess] }}}}
 
-PASS 3 - CROSS-REFERENCE AND INFILL:
-For each enriched gap:
+PASS 3 - CROSS-REFERENCE AND CONFIDENCE:
+For each gap:
 1. If ABBYY/portal OCR is provided, find the corresponding region
 2. Apply the Fraktur error correction table to decode the raw OCR fragment
 3. Cross-reference: your reading + OCR fragment + 1890s German +
    article topic (international news = more Hochdeutsch, local = more dialect)
-4. If you can assign a confidence level, promote to infill (preserve imgbbox):
-   [reconstructed text]^CONFIDENCE^
-   <!-- {{{{ infill | est=NN | imgbbox="x,y,w,h" | confidence=LEVEL | region_ocr="raw_ocr_text" | guess="clean_text" | notes="reasoning" }}}} -->
-   Confidence: HIGH, MED, LOW, VLOW
-   The region_ocr field MUST contain the exact raw OCR text, uncorrected.
-5. If still uncertain, keep as gap with status=unresolved and your best guess:
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="..." | status=unresolved [best guess] }}}}
-6. For non-gap corrections where the fix is ambiguous or changes meaning:
+4. Update the gap tag: refine your guess, adjust cnf, add region_ocr:
+   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="..." | region_ocr="raw_ocr" [best guess] }}}}
+   region_ocr MUST contain the exact raw OCR text, uncorrected.
+5. For non-gap corrections where the fix is ambiguous:
    corrected_word <!-- {{{{ corrected | original="ocr_reading" | rule="rule_name" }}}} -->
 
-IMPORTANT: Never use [unleserlich] or leave text blank. Every unreadable region
-gets a best-guess prediction in square brackets inside the gap tag.
+cnf scale: 0.90-0.99=high, 0.70-0.89=moderate, 0.40-0.69=low,
+0.01-0.39=speculative, 0.00=pure context guess. Never 1.00.
 
 OUTPUT FORMAT - return this exact structure:
 
@@ -540,25 +540,21 @@ DAMAGE: <brief damage notes or "none">
 
 ---
 
-<final corrected text with all inline markup tags>
+<final corrected text with all markup tags>
 
 ---
 
 STATS:
 - estimated_chars: <N>
-- high_confidence_chars: <N>
-- infill_high: <N>
-- infill_med: <N>
-- infill_low: <N>
-- infill_vlow: <N>
-- unresolved_gaps: <N>
+- chars_no_gap: <N>
+- chars_cnf_high: <N>
+- chars_cnf_mid: <N>
+- chars_cnf_low: <N>
 - total_gaps: <N>
-- gaps_filled: <N>
-- gaps_remaining: <N>
 
 CRITICAL RULES:
-- NEVER use [unleserlich] — always provide a best guess in a gap tag
-- Every gap tag MUST have est= and a [best guess] in square brackets
+- NEVER use [unleserlich] or leave text blank
+- Every gap MUST have est, imgbbox, cnf, and [best guess]
 - Preserve pre-1901 German spellings (thun, Noth, Theil, Eigenthum, -iren)
 - Preserve English loanwords as-is (Saloon, County, Farmer, Sheriff, Receiver)
 - Preserve Texas German dialect and hybrid forms (Dry Goods Haus, Stadtmarshall)
@@ -720,12 +716,9 @@ def extract_clean_text(raw_response: str) -> str:
 
     text = '\n'.join(clean_lines).strip()
 
-    # Strip infill confidence markers: [text]^CONF^ -> text
-    text = re.sub(r'\[([^\]]+)\]\^(?:HIGH|MED|LOW|VLOW)\^', r'\1', text)
-
     # Strip HTML comment metadata tags
     text = re.sub(
-        r'<!--\s*\{\{\s*(?:infill|article|column_break|interleaved|corrected)'
+        r'<!--\s*\{\{\s*(?:corrected|column_break|interleaved)'
         r'[^}]*\}\}\s*-->',
         '', text)
 
@@ -1285,37 +1278,38 @@ def compute_confidence(raw_text: str) -> dict:
         return stats
 
     # Fall back: count characters from the markup directly
-    total = len(raw_text)
-    if total == 0:
-        return {"high_confidence_pct": 0}
+    # Parse gap tags and bucket by cnf value
+    cnf_high = 0   # >= 0.80
+    cnf_mid = 0    # 0.40 - 0.79
+    cnf_low = 0    # < 0.40
+    gap_pattern = re.compile(
+        r'\{\{\s*gap\s*\|[^[]*?cnf="([^"]*)"[^[]*\[([^\]]*)\]\s*\}\}')
+    for m in gap_pattern.finditer(raw_text):
+        try:
+            cnf = float(m.group(1))
+        except (ValueError, TypeError):
+            cnf = 0.0
+        chars = len(m.group(2))
+        if cnf >= 0.80:
+            cnf_high += chars
+        elif cnf >= 0.40:
+            cnf_mid += chars
+        else:
+            cnf_low += chars
 
-    # Count characters inside infill tags by confidence
-    infill_chars = {lvl: 0 for lvl in ["HIGH", "MED", "LOW", "VLOW"]}
-    for m in re.finditer(r'\[([^\]]+)\]\^(HIGH|MED|LOW|VLOW)\^', raw_text):
-        infill_chars[m.group(2)] += len(m.group(1))
-
-    # Count characters inside gap tags (the guess part)
-    gap_chars = 0
-    for m in re.finditer(r'\{\{\s*gap\s*\|[^[]*\[([^\]]*)\]\s*\}\}', raw_text):
-        gap_chars += len(m.group(1))
-
-    # Extract just the text body for total char count
     clean = extract_clean_text(raw_text)
     total_chars = len(clean) if clean else 1
-
-    tagged_chars = sum(infill_chars.values()) + gap_chars
-    high_conf = max(0, total_chars - tagged_chars)
+    gap_total = cnf_high + cnf_mid + cnf_low
+    no_gap = max(0, total_chars - gap_total)
 
     return {
         "estimated_chars": total_chars,
-        "high_confidence_chars": high_conf,
-        "high_confidence_pct": round(high_conf / total_chars * 100, 1)
+        "chars_no_gap": no_gap,
+        "high_confidence_pct": round(no_gap / total_chars * 100, 1)
                                if total_chars > 0 else 0,
-        "infill_high": infill_chars["HIGH"],
-        "infill_med": infill_chars["MED"],
-        "infill_low": infill_chars["LOW"],
-        "infill_vlow": infill_chars["VLOW"],
-        "unresolved_gaps": gap_chars,
+        "chars_cnf_high": cnf_high,
+        "chars_cnf_mid": cnf_mid,
+        "chars_cnf_low": cnf_low,
     }
 
 
@@ -1348,10 +1342,10 @@ def compile_issue(issue: dict, config: dict, collection_dir: Path):
     all_clean_pages = []
     total_stats = {
         "estimated_chars": 0,
-        "high_confidence_chars": 0,
-        "infill_high": 0, "infill_med": 0,
-        "infill_low": 0, "infill_vlow": 0,
-        "unresolved_gaps": 0,
+        "chars_no_gap": 0,
+        "chars_cnf_high": 0,
+        "chars_cnf_mid": 0,
+        "chars_cnf_low": 0,
     }
 
     for pf in page_files:
@@ -1371,8 +1365,8 @@ def compile_issue(issue: dict, config: dict, collection_dir: Path):
 
     # Compute overall confidence percentage
     est = total_stats["estimated_chars"]
-    high = total_stats["high_confidence_chars"]
-    pct = round(high / est * 100, 1) if est > 0 else 0
+    no_gap = total_stats["chars_no_gap"]
+    pct = round(no_gap / est * 100, 1) if est > 0 else 0
 
     # Build the readable markdown
     today = datetime.now().strftime("%Y-%m-%d")

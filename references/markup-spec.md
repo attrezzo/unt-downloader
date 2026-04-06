@@ -6,100 +6,66 @@ Machine-readable tags for tracking OCR provenance, confidence, and reconstructio
 
 ## Design Goals
 
-1. **Human-readable**: A person reading the output sees clean text with bracketed guesses and confidence markers
+1. **Human-readable**: Guesses in brackets read naturally in context
 2. **Machine-parseable**: Tags contain structured metadata that scripts/AI can extract
-3. **Refinement-friendly**: Each uncertain region carries enough data for a future AI to make a better guess without seeing the original image
-4. **Always guessing**: Every unreadable region gets a best-guess prediction, even if speculative. No text is left blank.
-5. **Strippable**: Confident text stands alone if all tags are removed; guesses in brackets read naturally
+3. **Refinement-friendly**: Each uncertain region carries enough data (bounding box, fragments, OCR source text) for a future AI to improve the guess without re-reading the full page image
+4. **Always guessing**: Every unreadable region gets a best-guess prediction. No text is left blank.
+5. **Strippable**: Confident text stands alone if all tags are removed
 
 ---
 
 ## Tag Types
 
-### 1. Gap Marker (unresolved — best guess but low confidence)
+### 1. Gap Marker
 
-Used when text could not be read with confidence. **Every gap MUST include:**
-- An estimated character count (`est`)
-- A best-guess prediction in square brackets, even if speculative
+The universal tag for any text that is not 100% confident. Covers everything from near-certain reconstructions to wild guesses. The `cnf` field tells you how much to trust it.
 
-The guess appears in square brackets inside the tag so the text reads naturally even before refinement.
+**Every gap MUST include:**
+- `est` — estimated character count
+- `imgbbox` — approximate pixel bounding box in the source image
+- `cnf` — confidence score from 0 to 1
+- `[best guess]` — the predicted text in square brackets
 
-**Basic gap (Pass 1):**
+**Format:**
 ```
-{{ gap | est=NN | imgbbox="x,y,w,h" [best guess] }}
-```
-
-**Enriched gap (after Pass 2, with visible fragments):**
-```
-{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" [best guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" [best guess] }}
 ```
 
-**Unresolved gap (after Pass 3, cross-referenced but still uncertain):**
+**With optional fields:**
 ```
-{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" | status=unresolved [best guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial_text" | region_ocr="raw_ocr" [best guess] }}
 ```
 
 **Fields:**
-- `est` (required): Estimated character count of missing text
-- `imgbbox` (required): Approximate bounding box in the source image as `"x,y,w,h"` in pixels. x,y = top-left corner, w,h = width and height. Be generous — overestimate the region to ensure the text is fully contained. This allows future refinement passes to crop just this region instead of resending the full page image.
+- `est` (required): Estimated character count of the text region
+- `imgbbox` (required): Approximate bounding box as `"x,y,w,h"` in pixels (x,y = top-left, w,h = size). Be generous — overestimate to ensure the text is fully contained. Enables future refinement passes to crop just this region instead of resending the full page.
+- `cnf` (required): Confidence score from 0 to 1:
+  - `0.90–0.99` — High confidence. Multiple sources agree, strong context. Rarely needs review.
+  - `0.70–0.89` — Moderate confidence. Fragments match, context fits. Worth reviewing.
+  - `0.40–0.69` — Low confidence. Context-based guess, fragments ambiguous. Should be reviewed.
+  - `0.01–0.39` — Speculative. Mostly guessing from context. Treat as placeholder.
+  - `0.00` — Pure educated guess. No fragments, no OCR source. Derived entirely from context.
+  - `1.00` — Never used. Perfect OCR wouldn't be in a gap tag.
 - `fragments` (optional): Any partial letterforms visible, as best-guess Latin characters
-- `status` (optional): `unresolved` marks gaps that survived all three passes
-- `[best guess]` (required): Always present. The current best prediction of what the text says, in square brackets. Use context, fragments, article topic, and 1890s German knowledge to produce this. Even a wild guess is better than nothing — future passes can improve it.
+- `region_ocr` (optional): The raw ABBYY/portal OCR text for this region, exactly as it appears — garbled and all. Critical for future refinement.
+- `[best guess]` (required): Always present. The current best prediction in square brackets.
 
 **Examples:**
 ```
-Die {{ gap | est=12 | imgbbox="450,1200,280,45" | fragments="Verfa...ung" [Verfassung] }} wurde gestern abgehalten.
+Die {{ gap | est=12 | imgbbox="450,1200,280,45" | cnf="0.85" | fragments="Verfa...ung" | region_ocr="Bcrfaffung" [Verfassung] }} wurde gestern abgehalten.
 
-Der Bürgermeister {{ gap | est=22 | imgbbox="820,2100,400,50" | fragments="Ber...lung" | status=unresolved [Versammlung] }} erklärte seine Absicht.
+Der {{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" [aus] }} einem großen Umzuge.
 
-Im {{ gap | est=8 | imgbbox="100,950,180,40" [Gasthof] }} an der Hauptstraße fand die Sitzung statt.
+Im {{ gap | est=8 | imgbbox="100,950,180,40" | cnf="0.15" [Gasthof] }} an der Hauptstraße fand die Sitzung statt.
+
+Die {{ gap | est=22 | imgbbox="820,2100,400,50" | cnf="0.00" [Bürgerversammlung] }} wurde auf nächste Woche vertagt.
 ```
 
-**IMPORTANT:** `[unleserlich]` is deprecated. Never use it. Every gap gets a best guess, no matter how speculative. If you truly have zero fragments and zero context, guess based on the article topic, surrounding sentence structure, and common 1890s German newspaper phrases. Mark such guesses with `status=unresolved` so future passes know to revisit.
+**IMPORTANT:** Never leave text blank or use `[unleserlich]`. Every gap gets a best guess, no matter how speculative — set `cnf="0.00"` for pure context guesses.
 
 ---
 
-### 2. Infill Tag (filled with confidence)
-
-Replaces a gap marker after cross-referencing with ABBYY OCR and context. Used when you have enough evidence to assign a confidence level.
-
-**Inline display format:**
-```
-[reconstructed text]^CONFIDENCE^
-```
-
-**Full metadata (HTML comment, immediately follows the inline display):**
-```
-<!-- {{ infill | est=NN | imgbbox="x,y,w,h" | confidence=LEVEL | region_ocr="raw_text" | guess="clean_text" | notes="free_text" }} -->
-```
-
-**Fields:**
-- `est` (required): Character count estimate
-- `imgbbox` (required): Approximate bounding box in the source image as `"x,y,w,h"` in pixels. Be generous with the region.
-- `confidence` (required): `HIGH`, `MED`, `LOW`, or `VLOW`
-- `region_ocr` (required): The raw ABBYY OCR text for this region, exactly as it appears in the source — garbled and all. This is the most critical field for future refinement.
-- `guess` (required): The clean reconstructed text (same as what appears in brackets)
-- `notes` (optional): Free-text notes on reasoning, alternative readings considered
-
-**Confidence Definitions:**
-
-| Level | Meaning | Criteria | Future action |
-|-------|---------|----------|---------------|
-| `HIGH` | Near-certain | Multiple sources agree; strong contextual constraints; common word/phrase | Probably no review needed |
-| `MED` | Probable | Partial letterforms match; context fits; reasonable inference | Worth reviewing if dialect corpus improves |
-| `LOW` | Plausible guess | Primarily context-based; OCR fragments ambiguous; multiple readings possible | Should be reviewed in future passes |
-| `VLOW` | Speculative | Little evidence; filled mainly to maintain readability | Treat as placeholder; definitely review |
-
-**Example:**
-```
-Die [Versammlung]^MED^ <!-- {{ infill | est=18 | imgbbox="450,1200,280,45" | confidence=MED | region_ocr="Bcrfamm" | guess="Versammlung" | notes="ABBYY has Bcr=Ver, famm=samml" }} --> wurde gestern abgehalten.
-```
-
-**Distinction between gap and infill:** A `gap` is a region where you're not confident enough to assign a formal confidence level — the guess is there for readability and as a starting point for future passes. An `infill` is a region where you've done the cross-referencing work and can defend the guess with evidence and a confidence rating.
-
----
-
-### 3. Correction Tag (for non-gap corrections)
+### 2. Correction Tag (for non-gap corrections)
 
 When you correct a word that was readable but clearly wrong (e.g., obvious Fraktur swap where you're confident of the fix), optionally tag it:
 
@@ -114,7 +80,7 @@ This is optional for common Tier 1 swaps (d/b, f/s) — those are so pervasive t
 
 ---
 
-### 4. Article (Column) Marker
+### 3. Article (Column) Marker
 
 Wrap each discrete article, news item, editorial, or notice in a numbered Column tag. Numbers are sequential per page (001, 002, 003...).
 
@@ -130,7 +96,7 @@ Use Column for: news articles, editorials, notices, programs, poetry, masthead, 
 
 ---
 
-### 5. Advertisement Marker
+### 4. Advertisement Marker
 
 Wrap each advertisement in a numbered Ad tag. Numbers are sequential per page (001, 002, 003...).
 
@@ -144,7 +110,7 @@ Use Ad for: commercial content, classified ads, legal notices paid for by indivi
 
 ---
 
-### 6. Image Marker
+### 5. Image Marker
 
 Mark areas of the page that contain images, illustrations, engravings, or other non-text visual content:
 
@@ -154,7 +120,7 @@ Mark areas of the page that contain images, illustrations, engravings, or other 
 
 **Fields:**
 - `bbox` (required): Bounding box in the source image as `"x,y,w,h"` in pixels. Be generous.
-- `desc` (required): Brief description of the image content (e.g. "engraving of courthouse", "portrait of speaker", "decorative border")
+- `desc` (required): Brief description of the image content
 
 **Examples:**
 ```
@@ -163,11 +129,9 @@ Mark areas of the page that contain images, illustrations, engravings, or other 
 {{ Img | bbox="50,2800,1100,200" | desc="decorative rule separating masthead from articles" }}
 ```
 
-This allows future processing to identify and skip non-text regions, or to extract images for separate handling.
-
 ---
 
-### 8. Column Break Marker
+### 6. Column Break Marker
 
 When you detect that OCR has interleaved columns (two unrelated texts merged mid-sentence), mark where the break occurs:
 
@@ -179,7 +143,7 @@ Where N and M are column numbers (1 = leftmost).
 
 ---
 
-### 9. Page Break Marker
+### 7. Page Break Marker
 
 In multi-page documents, mark page boundaries:
 
@@ -198,19 +162,14 @@ In multi-page documents, mark page boundaries:
 - Source image: page_01.jpg
 - Reference OCR: UNT Portal to Texas History / ABBYY
 - Processing date: 2026-04-05
-- Pass 1 confidence: 72%
 - Total gaps: 48
-- Gaps filled: 41
-- Remaining unfilled: 7
 
 ### Statistics
 - Estimated total characters on page: 18500
-- Characters read with high confidence: 13320 (72%)
-- Characters infilled at HIGH: 1850 (10%)
-- Characters infilled at MED: 1480 (8%)
-- Characters infilled at LOW: 925 (5%)
-- Characters infilled at VLOW: 370 (2%)
-- Characters in unresolved gaps: 555 (3%)
+- Characters with no gap tag: 13320 (72%)
+- Characters in gaps cnf >= 0.80: 3330 (18%)
+- Characters in gaps cnf 0.40-0.79: 1295 (7%)
+- Characters in gaps cnf < 0.40: 555 (3%)
 
 ---
 
@@ -219,7 +178,7 @@ In multi-page documents, mark page boundaries:
 
 ### Große Feier
 
-des Ehrentages der Deutschen am [sechsten Oktober]^MED^ <!-- {{ infill | est=16 | imgbbox="380,620,300,40" | confidence=MED | region_ocr="" | guess="sechsten Oktober" | notes="date matches program header 'am 6. Oktober' below" }} --> in Austin County.
+des Ehrentages der Deutschen am {{ gap | est=16 | imgbbox="380,620,300,40" | cnf="0.75" | region_ocr="" [sechsten Oktober] }} in Austin County.
 
 {{ Img | bbox="200,680,500,120" | desc="decorative flourish below program header" }}
 
@@ -231,17 +190,17 @@ veranstaltet von den deutschen Vereinen in Austin County.
 
 ### PROGRAMM:
 
-Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend [aus]^HIGH^ <!-- {{ infill | est=3 | imgbbox="720,910,60,35" | confidence=HIGH | region_ocr="" | guess="aus" | notes="grammatically required after 'bestehend'" }} -->
+Das Fest beginnt um 10 Uhr Morgens mit einem großen Umzuge, bestehend {{ gap | est=3 | imgbbox="720,910,60,35" | cnf="0.95" [aus] }}
 
 ### geschmückten Wagen,
 
-darstellend Begebenheiten aus der deutschen Geschichte, oder der {{ gap | est=30 | imgbbox="300,1050,500,45" | fragments="cidrd" | status=unresolved [verschiedenen Nationalitäten] }}
+darstellend Begebenheiten aus der deutschen Geschichte, oder der {{ gap | est=30 | imgbbox="300,1050,500,45" | cnf="0.25" | fragments="cidrd" | region_ocr="cidrd Rationalitätcn" [verschiedenen Nationalitäten] }}
 {{ /Column }}
 
 {{ Column002 }}
-**Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry [Goods]^HIGH^ <!-- {{ infill | est=5 | imgbbox="950,1400,100,35" | confidence=HIGH | region_ocr="Try" | guess="Goods" | notes="ABBYY 'Try' is T/D swap + r/o noise" }} --> Haus, Ecke 14 u. Main Str. an der Arbeit wären.
+**Fort Worth,** 13. Sept. Heute morgen zwischen 2 u. 3 Uhr wurden die Polizeibeamten benachrichtigt, dasz Einbrecher in dem Fort Worth Dry {{ gap | est=5 | imgbbox="950,1400,100,35" | cnf="0.92" | region_ocr="Try" [Goods] }} Haus, Ecke 14 u. Main Str. an der Arbeit wären.
 
-Die {{ gap | est=15 | imgbbox="820,1460,280,40" [Polizeibeamten] }} kamen sofort zur Stelle.
+Die {{ gap | est=15 | imgbbox="820,1460,280,40" | cnf="0.10" [Polizeibeamten] }} kamen sofort zur Stelle.
 {{ /Column }}
 
 {{ Ad001 }}
@@ -265,19 +224,13 @@ Office über Haufschild's Store, Bellville.
 For programmatic extraction, tags follow these regex patterns:
 
 ```
-# Gap markers (with imgbbox and best guess)
-\{\{\s*gap\s*\|\s*est=(\d+)\s*\|\s*imgbbox="([^"]*)"\s*(?:\|\s*fragments="([^"]*)")?\s*(?:\|\s*status=(\w+))?\s*\[([^\]]*)\]\s*\}\}
-
-# Infill markers (in HTML comments, with imgbbox)
-\{\{\s*infill\s*\|\s*est=(\d+)\s*\|\s*imgbbox="([^"]*)"\s*\|\s*confidence=(HIGH|MED|LOW|VLOW)\s*\|\s*region_ocr="([^"]*)"\s*\|\s*guess="([^"]*)"(?:\s*\|\s*notes="([^"]*)")?\s*\}\}
-
-# Inline display
-\[([^\]]+)\]\^(HIGH|MED|LOW|VLOW)\^
+# Gap markers (unified — all uncertain text)
+\{\{\s*gap\s*\|\s*est=(\d+)\s*\|\s*imgbbox="([^"]*)"\s*\|\s*cnf="([^"]*)"(?:\s*\|\s*fragments="([^"]*)")?(?:\s*\|\s*region_ocr="([^"]*)")?\s*\[([^\]]*)\]\s*\}\}
 
 # Image markers
 \{\{\s*Img\s*\|\s*bbox="([^"]*)"\s*\|\s*desc="([^"]*)"\s*\}\}
 
-# Correction markers
+# Correction markers (in HTML comments)
 \{\{\s*corrected\s*\|\s*original="([^"]*)"\s*\|\s*rule="([^"]*)"\s*\}\}
 
 # Article/column structural markers
@@ -292,13 +245,13 @@ For programmatic extraction, tags follow these regex patterns:
 
 To refine tagged output in a future pass:
 
-1. Extract all `{{ gap }}` tags and `{{ infill }}` tags with `confidence=LOW` or `confidence=VLOW`
-2. For each, provide the future AI with:
-   - The `region_ocr` field (raw ABBYY text) if available
+1. Extract all `{{ gap }}` tags, prioritizing low `cnf` values
+2. For each, crop the source image using `imgbbox` (saves ~95% token cost vs full page)
+3. Provide the future AI with:
+   - The cropped image region
+   - The `region_ocr` field (raw OCR text) if available
    - The `fragments` field if available
    - The surrounding sentence (±50 characters each side)
-   - The current guess (from `[brackets]` or `guess=` field)
-3. The future AI proposes a new guess with updated confidence
-4. Replace the tag in place, preserving the original `region_ocr` for audit trail
-
-This allows iterative refinement without re-reading the source image.
+   - The current guess from `[brackets]`
+4. The future AI proposes a new guess with updated `cnf`
+5. Replace the tag in place, preserving the original `region_ocr` for audit trail

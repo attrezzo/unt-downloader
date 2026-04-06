@@ -95,26 +95,26 @@ Review your Pass 1 output. For each `{{ gap }}` marker:
 3. Note what partial letterforms or fragments you can see
 4. Refine your best guess based on fragments
 
-**Output this pass as an update** — replace each basic gap with an enriched marker (refine the imgbbox if needed):
+**Output this pass as an update** — add fragments and refine imgbbox:
 
 ```
-{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="partial_text" [refined guess] }}
+{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial_text" [refined guess] }}
 ```
 
 For example:
 ```
-{{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" [Versammlung] }}
+{{ gap | est=25 | imgbbox="820,2100,400,50" | cnf="0.40" | fragments="Ber...lung" [Versammlung] }}
 ```
 
 ---
 
-### PASS 3 — Cross-Reference and Infill
+### PASS 3 — Cross-Reference and Confidence
 
 This pass requires the existing ABBYY OCR (or other traditional OCR) if available. If no reference OCR exists, work from the image alone using contextual inference.
 
 **Instructions:**
 
-1. For each `{{gap}}` marker, examine:
+1. For each `{{ gap }}` marker, examine:
    - The original image at that location (re-examine carefully)
    - The corresponding region in the ABBYY OCR (if provided)
    - Surrounding context in both your Pass 1 text and the ABBYY text
@@ -122,27 +122,22 @@ This pass requires the existing ABBYY OCR (or other traditional OCR) if availabl
 
 2. Apply the Fraktur error correction table from `references/fraktur-errors.md` to decode the ABBYY fragments
 
-3. If you can assign a confidence level, promote the gap to an **infill tag** (preserve the imgbbox from the gap):
+3. Update the gap tag with your best guess, a confidence score, and the raw OCR source:
 
 ```
-[reconstructed text]^CONFIDENCE^ <!-- {{ infill | est=NN | imgbbox="x,y,w,h" | confidence=LEVEL | region_ocr="raw_abbyy_text" | guess="your reconstruction" }} -->
+{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="partial" | region_ocr="raw_abbyy" [refined guess] }}
 ```
 
-**Confidence levels:**
-- `HIGH` — Multiple sources agree, context strongly constrains, result is near-certain
-- `MED` — Reasonable inference from partial letterforms + context, probably right
-- `LOW` — Educated guess based primarily on context, could easily be wrong
-- `VLOW` — Speculative fill to maintain readability, treat as placeholder
+**Confidence scale (`cnf`):**
+- `0.90–0.99` — High. Multiple sources agree, strong context. Rarely needs review.
+- `0.70–0.89` — Moderate. Fragments match, context fits. Worth reviewing.
+- `0.40–0.69` — Low. Context-based, fragments ambiguous. Should be reviewed.
+- `0.01–0.39` — Speculative. Mostly guessing from context.
+- `0.00` — Pure educated guess. No evidence beyond sentence structure and topic.
 
-4. If you cannot confidently assign a level, leave as a gap with `status=unresolved` and your best guess:
+4. `region_ocr` MUST contain the exact raw OCR text for this region, uncorrected. This is the most valuable field for future refinement.
 
-```
-{{ gap | est=25 | imgbbox="820,2100,400,50" | fragments="Ber...lung" | status=unresolved [Versammlung] }}
-```
-
-The output is **human-readable** (guesses in brackets read naturally in context) AND **machine-parseable** (tags carry metadata for future passes).
-
-**IMPORTANT:** Never leave text blank or use `[unleserlich]`. Every unreadable region gets a best-guess prediction. Even a wild guess from context alone is more useful than a blank — future refinement passes can improve it.
+**IMPORTANT:** Never leave text blank or use `[unleserlich]`. Every gap gets a best guess and a `cnf` score. Even `cnf="0.00"` with a wild guess is more useful than nothing.
 
 ---
 
@@ -158,19 +153,14 @@ After all three passes, produce the final document:
 - Source image: [filename]
 - Reference OCR: [source, e.g. "UNT Portal to Texas History / ABBYY"]
 - Processing date: [today]
-- Pass 1 confidence: [estimated % of text read confidently]
 - Total gaps: [count]
-- Gaps filled: [count filled in Pass 3]
-- Remaining unfilled: [count]
 
 ### Statistics
 - Estimated total characters on page: [N]
-- Characters read with high confidence: [N] ([%])
-- Characters infilled at HIGH confidence: [N] ([%])
-- Characters infilled at MED confidence: [N] ([%])
-- Characters infilled at LOW confidence: [N] ([%])
-- Characters infilled at VLOW confidence: [N] ([%])
-- Characters in unresolved gaps: [N] ([%])
+- Characters with no gap tag: [N] ([%])
+- Characters in gaps cnf >= 0.80: [N] ([%])
+- Characters in gaps cnf 0.40-0.79: [N] ([%])
+- Characters in gaps cnf < 0.40: [N] ([%])
 
 ---
 
