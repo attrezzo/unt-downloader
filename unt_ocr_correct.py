@@ -213,12 +213,8 @@ class WorkerDashboard:
                 self._skipped += 1
 
     def render(self, force=False):
-        """Redraw the dashboard. Only renders on force=True (page complete).
-        Streaming updates go to worker state but don't trigger display."""
-        if not force:
-            return
+        """Redraw the dashboard. Throttled to every 2s unless force=True."""
         now = time.monotonic()
-        # Minimum 2s between renders to avoid spam
         if not force and (now - self._last_render) < 2.0:
             return
         with self._lock:
