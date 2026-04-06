@@ -1798,6 +1798,7 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
     if not pages_todo:
         tprint(f"  All pages already corrected", worker=worker_id, level=1)
     else:
+        global _interrupted
         # Worker slot pool: w1, w2, w3 etc. Reused as pages complete.
         _slot_lock = threading.Lock()
         _free_slots = list(range(api_workers, 0, -1))  # [3,2,1] → pop gives 1,2,3
@@ -1822,41 +1823,65 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
             return pg, result
 
         pages_done = 0
-        page_results = run_parallel(
-            _correct_one, pages_todo,
-            max_workers=api_workers, label="pages")
+        # Process results AS each page completes (not batched at the end).
+        ex = ThreadPoolExecutor(max_workers=api_workers)
+        futures = {ex.submit(_correct_one, pg): pg for pg in pages_todo}
+        try:
+            while futures and not _interrupted:
+                # Poll for completed futures
+                done_batch = [f for f in futures if f.done()]
+                if not done_batch:
+                    try:
+                        time.sleep(0.3)
+                    except KeyboardInterrupt:
+                        _interrupted = True
+                        break
+                    continue
 
-        for pg, result in page_results:
-            if isinstance(result, Exception):
-                log_event(f"p{pg:02d} FAILED: {result}", "error")
-                corrected_pages[pg] = (
-                    f"[CORRECTION FAILED: {result}]")
-                continue
-            # result is (pg, dict) from _correct_one
-            _, res = result
-            pages_done += 1
-            page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
-            if res["status"] == "ok":
-                corrected_pages[pg] = res["text"]
-                page_md_path.write_text(
-                    res["markdown"], encoding="utf-8")
-                log_event(f"p{pg:02d} done  {len(res['text'])} chars",
-                          "ok")
-            elif res["status"] == "no_image":
-                log_event(f"p{pg:02d} no image", "skip")
-            elif res["status"] in ("budget", "interrupted"):
-                log_event(f"p{pg:02d} {res['status']}", "skip")
-            else:
-                log_event(f"p{pg:02d} {res.get('error', 'unknown')}",
-                          "error")
-                corrected_pages[pg] = (
-                    f"[CORRECTION FAILED: "
-                    f"{res.get('error', 'unknown')}]")
+                for fut in done_batch:
+                    pg = futures.pop(fut)
+                    try:
+                        _, res = fut.result(timeout=0)
+                    except Exception as e:
+                        log_event(f"p{pg:02d} FAILED: {e}", "error")
+                        corrected_pages[pg] = (
+                            f"[CORRECTION FAILED: {e}]")
+                        continue
 
-            print_status(cost_tracker,
-                         step_name="AI OCR Correction",
-                         progress_current=pages_done,
-                         progress_total=actual_pages)
+                    pages_done += 1
+                    page_md_path = ai_ocr_dir / f"page_{pg:02d}.md"
+                    if res["status"] == "ok":
+                        corrected_pages[pg] = res["text"]
+                        page_md_path.write_text(
+                            res["markdown"], encoding="utf-8")
+                        log_event(f"p{pg:02d} done  "
+                                  f"{len(res['text'])} chars", "ok")
+                    elif res["status"] == "no_image":
+                        log_event(f"p{pg:02d} no image", "skip")
+                    elif res["status"] in ("budget", "interrupted"):
+                        log_event(f"p{pg:02d} {res['status']}", "skip")
+                    else:
+                        log_event(
+                            f"p{pg:02d} {res.get('error', 'unknown')}",
+                            "error")
+                        corrected_pages[pg] = (
+                            f"[CORRECTION FAILED: "
+                            f"{res.get('error', 'unknown')}]")
+
+                    print_status(cost_tracker,
+                                 step_name="AI OCR Correction",
+                                 progress_current=pages_done,
+                                 progress_total=actual_pages)
+
+        except KeyboardInterrupt:
+            _interrupted = True
+
+        if _interrupted:
+            for f in futures:
+                f.cancel()
+            print(f"  Stopped. {pages_done}/{len(pages_todo)} "
+                  f"pages completed.", flush=True)
+        ex.shutdown(wait=False)
 
     # Write corrected/ file
     out_lines = [header, ""]
