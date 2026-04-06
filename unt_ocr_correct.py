@@ -164,33 +164,40 @@ _dashboard = None
 class WorkerDashboard:
     """Thread-safe per-worker status display for PowerShell-compatible output.
 
+    Progress tracks steps, not pages. Each page = 2 steps (pass 1-2, pass 3).
     Workers are identified by slot (w1, w2, w3) — not by page number.
-    Progress bar prints only when the completed count changes.
-    Full dashboard block prints on force=True (page completion milestones).
     """
+
+    STEPS_PER_PAGE = 2  # pass 1-2 + pass 3
 
     def __init__(self):
         self._lock = threading.Lock()
         self._workers = {}       # worker_id -> {current, t_start}
-        self._completed = 0
-        self._errors = 0
-        self._skipped = 0
-        self._start_time = time.monotonic()
+        self._steps_done = 0
+        self._total_steps = 0
+        self._pages_done = 0
         self._total_pages = 0
+        self._errors = 0
+        self._start_time = time.monotonic()
         self._cost_tracker = None
         self._rate_limiter = None
         self._last_render = 0
-        self._last_progress_count = -1  # track when count changes
 
     def set_context(self, total_pages=0, cost_tracker=None,
                     rate_limiter=None, issue_label=""):
         with self._lock:
             if total_pages:
                 self._total_pages = total_pages
+                self._total_steps = total_pages * self.STEPS_PER_PAGE
             if cost_tracker:
                 self._cost_tracker = cost_tracker
             if rate_limiter:
                 self._rate_limiter = rate_limiter
+
+    def step(self):
+        """Record one step completed (e.g. pass 1-2 done, or pass 3 done)."""
+        with self._lock:
+            self._steps_done += 1
 
     def update(self, worker_id: str, msg: str, status: str = "info"):
         """Update a worker's current state."""
@@ -202,11 +209,9 @@ class WorkerDashboard:
             w["current"] = msg
             w["t_start"] = time.monotonic()
             if status == "ok":
-                self._completed += 1
+                self._pages_done += 1
             elif status == "error":
                 self._errors += 1
-            elif status == "skip":
-                self._skipped += 1
 
     def render(self, force=False):
         """Render dashboard output.
@@ -238,19 +243,20 @@ class WorkerDashboard:
 
     def _build_progress_line(self, now):
         elapsed = now - self._start_time
-        done = self._completed + self._errors + self._skipped
-        total = max(self._total_pages, 1)
+        total = max(self._total_steps, 1)
+        done = min(self._steps_done, total)
         pct = min(100, done / total * 100)
         bar_len = 35
         filled = int(bar_len * done / total)
         bar = "#" * filled + "-" * (bar_len - filled)
-        if self._completed > 0 and elapsed > 5:
-            avg_per_page = elapsed / self._completed
-            remaining = (total - done) * avg_per_page
+        if self._steps_done > 0 and elapsed > 5:
+            avg_per_step = elapsed / self._steps_done
+            remaining = (total - done) * avg_per_step
             eta_str = f"ETA {self._fmt_time(remaining)}"
         else:
             eta_str = self._fmt_time(elapsed)
-        return f"  [{bar}] {done}/{total} ({pct:.0f}%)  {eta_str}"
+        return (f"  [{bar}] {self._pages_done}/{self._total_pages} pages "
+                f"({pct:.0f}%)  {eta_str}")
 
     def _build_lines(self, now):
         lines = []
@@ -313,8 +319,7 @@ class WorkerDashboard:
             tok_str = (f"  Tokens: {ct.total_input_tokens:,}in"
                        f" + {ct.total_output_tokens:,}out"
                        f"  (${ct.total_cost / ct.pages_processed:.3f}/page)")
-        print(f"\n  Done: {self._completed}  Errors: {self._errors}  "
-              f"Skipped: {self._skipped}  "
+        print(f"\n  Done: {self._pages_done}  Errors: {self._errors}  "
               f"Time: {self._fmt_time(elapsed)}{cost_str}")
         if tok_str:
             print(f"  {tok_str}")
@@ -1215,6 +1220,8 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
         log_event(f"p{page_num:02d} pass 1-2 FAILED: {e}", "error", worker=wid)
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": str(e)}
+    if _dashboard:
+        _dashboard.step()
 
     if not pass12_raw.strip():
         log_event(f"p{page_num:02d} pass 1-2 empty response", "error", worker=wid)
@@ -1247,6 +1254,8 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     except Exception as e:
         log_event(f"p{page_num:02d} pass 3 FAILED (using pass 1-2)", "error", worker=wid)
         raw = pass12_raw
+    if _dashboard:
+        _dashboard.step()
 
     if not raw.strip():
         raw = pass12_raw
