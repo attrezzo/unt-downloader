@@ -70,14 +70,151 @@ IMAGES_DIR    = None
 ABBYY_DIR     = None
 ARTICLES_DIR  = None
 AI_OCR_DIR    = None
-LOG_LEVEL     = 1
+
+
+# ============================================================================
+# LOGGING & STATUS DISPLAY
+# ============================================================================
+
+import logging as _logging_mod
+from collections import deque
+
+LOG_LEVEL = 1
+_file_logger = None
+_activity_log = None
+
+
+class ActivityLog:
+    """Thread-safe rolling log of recent worker activity for CLI display."""
+
+    def __init__(self, max_items: int = 50):
+        self._lock = threading.Lock()
+        self._items = deque(maxlen=max_items)
+        self._total = 0
+        self._ok = 0
+        self._err = 0
+        self._skip = 0
+        self._start_time = time.monotonic()
+
+    def add(self, msg: str, status: str = "info"):
+        with self._lock:
+            self._items.appendleft((time.monotonic(), msg, status))
+            self._total += 1
+            if status == "ok":
+                self._ok += 1
+            elif status == "error":
+                self._err += 1
+            elif status == "skip":
+                self._skip += 1
+
+    def recent(self, n: int = 5) -> list:
+        with self._lock:
+            return list(self._items)[:n]
+
+    def stats(self) -> dict:
+        with self._lock:
+            elapsed = time.monotonic() - self._start_time
+            rate = self._ok / (elapsed / 60) if elapsed > 0 else 0
+            return {
+                "total": self._total, "ok": self._ok,
+                "err": self._err, "skip": self._skip,
+                "elapsed": elapsed, "rate": rate,
+            }
+
+
+def init_logging(collection_dir: Path, log_level: int):
+    """Initialize file logger and activity log."""
+    global _file_logger, _activity_log, LOG_LEVEL
+    LOG_LEVEL = log_level
+    _activity_log = ActivityLog()
+
+    if log_level >= 2:
+        log_dir = collection_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"ocr_{ts}.log"
+        _file_logger = _logging_mod.getLogger("unt_ocr")
+        _file_logger.setLevel(_logging_mod.DEBUG)
+        handler = _logging_mod.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(_logging_mod.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S"))
+        _file_logger.addHandler(handler)
+        _file_logger.info(f"Log started: level={log_level}")
+        print(f"  Log file: {log_path}")
+
+
+def log_debug(msg: str, level: int = 2):
+    """Write to debug log file only (if logging enabled)."""
+    if _file_logger and level <= LOG_LEVEL:
+        _file_logger.debug(msg)
+
+
+def log_event(msg: str, status: str = "info"):
+    """Record an event in the activity log (for display) and file log."""
+    if _activity_log:
+        _activity_log.add(msg, status)
+    if _file_logger:
+        _file_logger.info(msg)
 
 
 def tprint(*args, worker: str = "", level: int = 1, **kwargs):
-    if level > LOG_LEVEL:
+    """Legacy debug print — routes to file logger. Kept for compatibility."""
+    if _file_logger and level <= LOG_LEVEL:
+        prefix = f"[{worker}] " if worker else ""
+        _file_logger.debug(f"{prefix}{' '.join(str(a) for a in args)}")
+    # level 1 messages also go to activity log for display
+    if level <= 1 and _activity_log:
+        msg = ' '.join(str(a) for a in args)
+        _activity_log.add(msg, "info")
+
+
+def print_status(cost_tracker=None, step_name="OCR Correction",
+                 progress_current=0, progress_total=0):
+    """Print a clean status block to stdout."""
+    if not _activity_log:
         return
-    prefix = f"[{worker}] " if worker else ""
-    print(f"{prefix}", *args, flush=True, **kwargs)
+
+    s = _activity_log.stats()
+
+    lines = []
+    lines.append("")
+    lines.append(f"  {step_name}")
+
+    if progress_total > 0:
+        pct = progress_current / progress_total * 100
+        bar_len = 30
+        filled = int(bar_len * progress_current / progress_total)
+        bar = "#" * filled + "-" * (bar_len - filled)
+        lines.append(f"  [{bar}] {progress_current}/{progress_total} "
+                     f"({pct:.0f}%)")
+
+    cost_str = ""
+    if cost_tracker:
+        cost_str = f" | Cost: ${cost_tracker.total_cost:.2f}"
+        if cost_tracker.budget:
+            cost_str += f"/${cost_tracker.budget:.2f}"
+
+    rate_str = f"{s['rate']:.1f}/min" if s['rate'] > 0 else "--"
+    lines.append(f"  Done: {s['ok']}  Skip: {s['skip']}  "
+                 f"Err: {s['err']}  Rate: {rate_str}{cost_str}")
+    lines.append("")
+
+    recent = _activity_log.recent(5)
+    now = time.monotonic()
+    if recent:
+        lines.append("  Recent:")
+        for ts, msg, status in recent:
+            ago = now - ts
+            if ago < 60:
+                ago_str = f"{ago:.0f}s ago"
+            else:
+                ago_str = f"{ago/60:.0f}m ago"
+            icon = {"ok": "+", "error": "X", "skip": "-"}.get(status, " ")
+            lines.append(f"    {icon} {msg:<55} ({ago_str})")
+    lines.append("")
+
+    print("\n".join(lines), flush=True)
 
 
 def init_paths(collection_dir: Path):
@@ -1319,19 +1456,18 @@ def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                     corrected_pages[pg] = result["text"]
                     page_md_path.write_text(
                         result["markdown"], encoding="utf-8")
-                    tprint(f"  p{pg:02d} ok  ({len(result['text'])} chars)",
-                           worker=worker_id, level=1)
+                    log_event(
+                        f"p{pg:02d} {ark_id}  "
+                        f"{len(result['text'])} chars", "ok")
                 elif result["status"] == "no_image":
-                    tprint(f"  p{pg:02d} SKIP (no image or OCR)",
-                           worker=worker_id, level=1)
+                    log_event(f"p{pg:02d} {ark_id}  no image", "skip")
                     corrected_pages[pg] = ""
                 elif result["status"] == "budget":
-                    tprint(f"  p{pg:02d} BUDGET LIMIT",
-                           worker=worker_id, level=1)
+                    log_event(f"p{pg:02d} {ark_id}  budget limit", "skip")
                 else:
-                    tprint(f"  p{pg:02d} FAILED: "
-                           f"{result.get('error', 'unknown')}",
-                           worker=worker_id, level=1)
+                    log_event(
+                        f"p{pg:02d} {ark_id}  "
+                        f"{result.get('error', 'unknown')}", "error")
                     corrected_pages[pg] = (
                         f"[CORRECTION FAILED: "
                         f"{result.get('error', 'unknown')}]")
@@ -2296,9 +2432,6 @@ def main():
     p.add_argument("--max-output-tokens", type=int, default=None)
     args = p.parse_args()
 
-    global LOG_LEVEL
-    LOG_LEVEL = 5 if args.verbose else args.logging
-
     config_path = Path(args.config_path)
     if not config_path.exists():
         sys.exit(f"Config not found: {config_path}")
@@ -2307,6 +2440,8 @@ def main():
 
     collection_dir = config_path.parent
     init_paths(collection_dir)
+    init_logging(collection_dir,
+                 5 if args.verbose else args.logging)
 
     # Load global config
     global_config_path = Path(__file__).parent / "config.json"
@@ -2569,6 +2704,11 @@ def main():
             ctr["skipped"] += 1
         else:
             ctr["err"] += 1
+
+        # Update status display
+        done = ctr["ok"] + ctr["skipped"] + ctr["err"]
+        print_status(cost_tracker, step_name="AI OCR Correction",
+                     progress_current=done, progress_total=len(issues))
 
         # Revised estimate after 5 pages, budget abort if exceeded
         if not args.skip_estimate:
