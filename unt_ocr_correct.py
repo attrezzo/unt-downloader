@@ -2395,9 +2395,55 @@ def show_revised_estimate(cost_tracker, units_remaining, unit_label="pages"):
     print()
 
 
-def prompt_model_selection(skip=False):
+def _show_model_menu(api_key: str) -> list:
+    """Fetch and display available models. Returns menu list."""
+    try:
+        from unt_cost_estimate import build_model_menu
+        menu = build_model_menu(api_key)
+    except Exception:
+        menu = []
+
+    if not menu:
+        # Fallback: show known models from pricing.json
+        pricing = load_pricing() if load_pricing else {}
+        menu = [{"id": mid, "input": p.get("input"),
+                 "output": p.get("output"), "tier": p.get("tier", ""),
+                 "note": p.get("note", ""), "priced": True}
+                for mid, p in pricing.items()]
+
+    if menu:
+        print(f"\n  {'#':<3}  {'Model ID':<36}  {'In$/MTok':>8}  "
+              f"{'Out$/MTok':>9}  Note")
+        print(f"  {'─'*3}  {'─'*36}  {'─'*8}  {'─'*9}  {'─'*20}")
+        for i, m in enumerate(menu, 1):
+            in_str = f"${m['input']:.2f}" if m.get("input") else "?"
+            out_str = f"${m['output']:.2f}" if m.get("output") else "?"
+            note = (m.get("note") or "")[:20]
+            print(f"  {i:<3}  {m['id']:<36}  {in_str:>8}  "
+                  f"{out_str:>9}  {note}")
+        print()
+    return menu
+
+
+def _pick_model(prompt_text: str, current: str, menu: list) -> str:
+    """Let user pick a model from the menu or type one. Returns model ID."""
+    raw = input(f"    {prompt_text} [{current}]: ").strip()
+    if not raw:
+        return current
+    # If they typed a number, look up in menu
+    try:
+        idx = int(raw)
+        if 1 <= idx <= len(menu):
+            return menu[idx - 1]["id"]
+    except ValueError:
+        pass
+    # Otherwise treat as a model ID string
+    return raw
+
+
+def prompt_model_selection(skip=False, api_key=""):
     """Let user change model assignments before a batch starts.
-    Returns True if models were changed."""
+    Shows available models from the API. Returns True if changed."""
     global MODEL_INITIAL, MODEL_RESOLVE, MODEL_REFINE
     if skip:
         return False
@@ -2412,21 +2458,27 @@ def prompt_model_selection(skip=False):
     if not raw:
         return False
 
+    # Fetch model list once
+    menu = _show_model_menu(api_key) if api_key else []
+    if menu:
+        print("  Enter a number from the list above, or type a model ID.")
+        print()
+
     changed = False
     while raw:
         if raw == "1":
-            new = input(f"    Pass 1-2 model [{MODEL_INITIAL}]: ").strip()
-            if new:
+            new = _pick_model("Pass 1-2 model", MODEL_INITIAL, menu)
+            if new != MODEL_INITIAL:
                 MODEL_INITIAL = new
                 changed = True
         elif raw == "2":
-            new = input(f"    Pass 3 model [{MODEL_RESOLVE}]: ").strip()
-            if new:
+            new = _pick_model("Pass 3 model", MODEL_RESOLVE, menu)
+            if new != MODEL_RESOLVE:
                 MODEL_RESOLVE = new
                 changed = True
         elif raw == "3":
-            new = input(f"    Refinement model [{MODEL_REFINE}]: ").strip()
-            if new:
+            new = _pick_model("Refinement model", MODEL_REFINE, menu)
+            if new != MODEL_REFINE:
                 MODEL_REFINE = new
                 changed = True
         raw = input("  Edit another (1/2/3) or Enter to continue: ").strip()
@@ -2674,7 +2726,7 @@ def main():
 
         # Let user change models before refinement
         if not args.skip_estimate:
-            prompt_model_selection(skip=args.yes)
+            prompt_model_selection(skip=args.yes, api_key=api_key)
 
         if args.refine_text:
             cnf_min = args.cnf_min if args.cnf_min is not None else 0.0
@@ -2790,7 +2842,7 @@ def main():
             pages_to_process, args.budget)
 
         # Let user change models before committing
-        if prompt_model_selection(skip=args.yes):
+        if prompt_model_selection(skip=args.yes, api_key=api_key):
             # Re-estimate with new models
             est_cost, per_page = show_correction_estimate(
                 pages_to_process, args.budget)
