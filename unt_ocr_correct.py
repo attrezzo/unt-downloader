@@ -188,10 +188,11 @@ class WorkerDashboard:
         self._cost_tracker = None
         self._last_render = 0
         self._render_lines = 0
+        self._est_output_tokens = 0  # for token-based progress bar
 
     def set_context(self, total_pages=0, cost_tracker=None,
                     rate_limiter=None, issue_label="",
-                    steps_per_page=None):
+                    steps_per_page=None, est_output_tokens=0):
         with self._lock:
             if total_pages:
                 self._total_pages = total_pages
@@ -199,6 +200,8 @@ class WorkerDashboard:
                 self._total_steps = total_pages * spp
             if cost_tracker:
                 self._cost_tracker = cost_tracker
+            if est_output_tokens:
+                self._est_output_tokens = est_output_tokens
         self._do_render()
 
     def step(self, worker_id: str = ""):
@@ -274,21 +277,43 @@ class WorkerDashboard:
 
         # ── Progress bar ──────────────────────────────────────────
         elapsed = now - self._start_time
-        total = max(self._total_steps, 1)
-        done = min(self._steps_done, total)
-        pct = min(100, done / total * 100)
-        bar_len = 30
-        filled = int(bar_len * done / total)
-        bar = "#" * filled + "-" * (bar_len - filled)
-        if self._steps_done > 0 and elapsed > 5:
-            remaining = (total - done) * (elapsed / self._steps_done)
-            eta_str = f"ETA {self._fmt_time(remaining)}"
-        else:
-            eta_str = self._fmt_time(elapsed)
+        ct = self._cost_tracker
 
-        lines.append(
-            f"  [{bar}] {self._pages_done}/{self._total_pages} pages "
-            f"({pct:.0f}%)  {eta_str}")
+        # Token-based progress: use output tokens vs estimate
+        if self._est_output_tokens and ct:
+            out_tok = ct.total_output_tokens
+            est_tok = max(self._est_output_tokens, 1)
+            pct = min(99, out_tok / est_tok * 100)  # cap at 99 until page_done
+            if self._pages_done >= self._total_pages:
+                pct = 100
+            bar_len = 30
+            filled = int(bar_len * pct / 100)
+            bar = "#" * filled + "-" * (bar_len - filled)
+            if out_tok > 100 and elapsed > 5:
+                tok_rate = out_tok / elapsed
+                remaining_tok = max(0, est_tok - out_tok)
+                eta_str = f"ETA {self._fmt_time(remaining_tok / max(tok_rate, 1))}"
+            else:
+                eta_str = self._fmt_time(elapsed)
+            lines.append(
+                f"  [{bar}] {self._pages_done}/{self._total_pages} pages "
+                f"({pct:.0f}%)  ~{out_tok:,}/{est_tok:,} tok  {eta_str}")
+        else:
+            # Step-based progress (multi-page correction)
+            total = max(self._total_steps, 1)
+            done = min(self._steps_done, total)
+            pct = min(100, done / total * 100)
+            bar_len = 30
+            filled = int(bar_len * done / total)
+            bar = "#" * filled + "-" * (bar_len - filled)
+            if self._steps_done > 0 and elapsed > 5:
+                remaining = (total - done) * (elapsed / self._steps_done)
+                eta_str = f"ETA {self._fmt_time(remaining)}"
+            else:
+                eta_str = self._fmt_time(elapsed)
+            lines.append(
+                f"  [{bar}] {self._pages_done}/{self._total_pages} pages "
+                f"({pct:.0f}%)  {eta_str}")
 
         # ── Cost + tokens ─────────────────────────────────────────
         ct = self._cost_tracker
@@ -2691,9 +2716,11 @@ def refine_full(issues, config, collection_dir, api_key,
         return 0
 
     if _dashboard:
+        # Estimate ~8000 output tokens per page for token-based progress
         _dashboard.set_context(total_pages=len(page_items),
                                cost_tracker=cost_tracker,
-                               steps_per_page=1)
+                               steps_per_page=1,
+                               est_output_tokens=8000 * len(page_items))
 
     changed_count = 0
     global _interrupted
