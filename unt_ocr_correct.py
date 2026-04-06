@@ -43,13 +43,19 @@ except ImportError:
 
 UNT_BASE      = "https://texashistory.unt.edu"
 ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL  = "claude-sonnet-4-6"
 ILLEGIBLE     = "[unleserlich]"  # deprecated — kept only for parsing legacy files
 
-# Token estimates (calibrated: ~56k image + ~7k prompt + ~5k reference OCR)
-EST_INPUT_TOKENS_PER_PAGE  = 68_000
-EST_OUTPUT_TOKENS_PER_PAGE = 5_000
-MAX_OUTPUT_TOKENS          = 16_000
+# Default model tiers (user-selectable via --model-* flags)
+MODEL_INITIAL = "claude-haiku-4-5"     # Pass 1-2: image + transcription (cheap)
+MODEL_RESOLVE = "claude-sonnet-4-6"    # Pass 3: cross-reference + guess (text-only)
+MODEL_REFINE  = "claude-opus-4-6"      # Future refinement of low-cnf gaps
+
+# Token estimates
+EST_INPUT_TOKENS_PASS12  = 66_000  # image + system prompt + OCR text
+EST_OUTPUT_TOKENS_PASS12 = 4_500   # full page text with gap markers
+EST_INPUT_TOKENS_PASS3   = 10_000  # text-only: Pass 1-2 output + OCR + prompt
+EST_OUTPUT_TOKENS_PASS3  = 4_500   # same text with gaps filled
+MAX_OUTPUT_TOKENS        = 16_000
 
 PRELOAD_LOG_NAME = "preload_failures.json"
 
@@ -326,8 +332,10 @@ class CostTracker:
         with self._lock:
             if self.pages_processed == 0:
                 return pages_left * (
-                    EST_INPUT_TOKENS_PER_PAGE * self.input_price +
-                    EST_OUTPUT_TOKENS_PER_PAGE * self.output_price
+                    (EST_INPUT_TOKENS_PASS12 + EST_INPUT_TOKENS_PASS3) *
+                    self.input_price +
+                    (EST_OUTPUT_TOKENS_PASS12 + EST_OUTPUT_TOKENS_PASS3) *
+                    self.output_price
                 ) / 1_000_000
             avg_in = self.total_input_tokens / self.pages_processed
             avg_out = self.total_output_tokens / self.pages_processed
@@ -340,8 +348,11 @@ class CostTracker:
             return False
         with self._lock:
             if self.pages_processed == 0:
-                avg_cost = (EST_INPUT_TOKENS_PER_PAGE * self.input_price +
-                            EST_OUTPUT_TOKENS_PER_PAGE * self.output_price) / 1_000_000
+                avg_cost = (
+                    (EST_INPUT_TOKENS_PASS12 + EST_INPUT_TOKENS_PASS3) *
+                    self.input_price +
+                    (EST_OUTPUT_TOKENS_PASS12 + EST_OUTPUT_TOKENS_PASS3) *
+                    self.output_price) / 1_000_000
             else:
                 avg_cost = self.total_cost / self.pages_processed
             return (self.total_cost + avg_cost) > self.budget
@@ -349,8 +360,11 @@ class CostTracker:
     def avg_cost_per_page(self) -> float:
         with self._lock:
             if self.pages_processed == 0:
-                return (EST_INPUT_TOKENS_PER_PAGE * self.input_price +
-                        EST_OUTPUT_TOKENS_PER_PAGE * self.output_price) / 1_000_000
+                return (
+                    (EST_INPUT_TOKENS_PASS12 + EST_INPUT_TOKENS_PASS3) *
+                    self.input_price +
+                    (EST_OUTPUT_TOKENS_PASS12 + EST_OUTPUT_TOKENS_PASS3) *
+                    self.output_price) / 1_000_000
             return self.total_cost / self.pages_processed
 
     def summary(self) -> str:
@@ -423,9 +437,8 @@ def claude_api_call(payload: dict, api_key: str,
 # SYSTEM PROMPT BUILDING
 # ============================================================================
 
-def build_system_prompt(config: dict) -> str:
-    """Build comprehensive system prompt with reference data from the
-    fraktur-ocr skill and collection metadata."""
+def _build_collection_header(config: dict) -> str:
+    """Shared collection context for all prompts."""
     title      = config.get("title_name", "")
     publisher  = config.get("publisher", "")
     location   = config.get("pub_location", "Texas")
@@ -433,32 +446,35 @@ def build_system_prompt(config: dict) -> str:
     language   = config.get("language", "German")
     typeface   = config.get("typeface", "Fraktur")
     source     = config.get("source_medium", "microfilm")
-    community  = config.get("community_desc", "")
-    places     = config.get("place_names", "")
-    orgs       = config.get("organizations", "")
-    history    = config.get("historical_context", "")
-    subjects   = config.get("subject_notes", "")
     lccn       = config.get("lccn", "")
+    ctx = ""
+    for key, label in [("community_desc", "COMMUNITY"),
+                       ("historical_context", "HISTORY"),
+                       ("subject_notes", "SUBJECTS"),
+                       ("place_names", "PLACE NAMES (preserve exactly)"),
+                       ("organizations", "ORGANIZATIONS (preserve exactly)")]:
+        val = config.get(key, "")
+        if val:
+            ctx += f"\n{label}: {val}"
+    return (f"COLLECTION: {title}\n"
+            f"Publisher: {publisher} | Location: {location} | "
+            f"Period: {date_range}\n"
+            f"Language: {language} | Typeface: {typeface} | Source: {source}\n"
+            f"{'LCCN: ' + lccn if lccn else ''}"
+            f"{ctx}")
 
+
+def build_pass12_prompt(config: dict) -> str:
+    """System prompt for Pass 1-2: image transcription + gap inventory.
+    Sent with the page image to the initial model (default: Haiku)."""
+    header = _build_collection_header(config)
     fraktur_errors = load_reference("fraktur-errors.md")
     texas_german   = load_reference("texas-german.md")
-    markup_spec    = load_reference("markup-spec.md")
 
-    ctx = ""
-    if community: ctx += f"\nCOMMUNITY: {community}"
-    if history:   ctx += f"\nHISTORY: {history}"
-    if subjects:  ctx += f"\nSUBJECTS: {subjects}"
-    if places:    ctx += f"\nPLACE NAMES (preserve exactly): {places}"
-    if orgs:      ctx += f"\nORGANIZATIONS (preserve exactly): {orgs}"
+    return f"""You are an expert OCR specialist for 19th-century German Fraktur
+newspaper text scanned from microfilm.
 
-    return f"""You are an expert OCR specialist running the fraktur-ocr pipeline
-for 19th-century German Fraktur newspaper text scanned from microfilm.
-
-COLLECTION: {title}
-Publisher: {publisher} | Location: {location} | Period: {date_range}
-Language: {language} | Typeface: {typeface} | Source: {source}
-{"LCCN: " + lccn if lccn else ""}
-{ctx}
+{header}
 
 REFERENCE: FRAKTUR ERROR PATTERNS
 ===================================
@@ -468,103 +484,122 @@ REFERENCE: TEXAS GERMAN VOCABULARY & ORTHOGRAPHY
 ==================================================
 {texas_german}
 
-REFERENCE: METADATA MARKUP SPECIFICATION
-==========================================
-{markup_spec}
+YOUR TASK: PASS 1 + PASS 2 (transcription and gap inventory)
+==============================================================
 
-THE THREE-PASS PIPELINE
-========================
+Read the newspaper page image. Produce a transcription where most text is
+plain, high-confidence output. Mark uncertain regions as gaps.
 
-You receive a newspaper page image and optionally ABBYY/portal OCR text.
-Execute all three passes and return a single combined result.
-
-PASS 1 - DIRECT FRAKTUR OCR:
-1. Identify the page layout: masthead, column count, center-page features
-   (advertisements, program announcements, large headlines), damage
-2. Read each section in order: masthead, center features, columns
-   left-to-right top-to-bottom
-3. Transcribe the Fraktur text to Latin characters
-4. Apply Fraktur error corrections (Tiers 1-5) automatically as you read:
-   - Tier 1 aggressively (b/d, f/s swaps are almost always correct)
-   - Tier 2 with context checking (capital letter confusions)
-   - Tiers 3-5 case by case (ligature breaks, number/letter, hyphenation)
-5. Where text is confidently readable, write it directly with no tags
-6. Where text is illegible or uncertain, mark with a gap tag. Do NOT guess
-   yet - just record location and estimated size:
+PASS 1 - DIRECT FRAKTUR OCR (high-confidence extraction):
+1. Identify layout: masthead, column count, center features, damage
+2. Read each section: masthead, center features, columns left-to-right
+3. Transcribe Fraktur to Latin characters
+4. Apply Fraktur error corrections as you read (Tier 1 aggressively,
+   Tiers 2-5 with context)
+5. Confident text: write directly, no tags. This should be most of the page.
+6. Illegible/uncertain text: mark with a gap. Do NOT guess:
    {{{{ gap | est=NN | imgbbox="x,y,w,h" }}}}
-   est = estimated character count. imgbbox = pixel bounding box (be generous).
-7. Mark images/illustrations/engravings:
-   {{{{ Img | bbox="x,y,w,h" | desc="brief description" }}}}
-8. Wrap each article/news item/notice in a numbered Column tag:
-   {{{{ Column001 }}}} article text {{{{ /Column }}}}
-9. Wrap each advertisement in a numbered Ad tag:
-   {{{{ Ad001 }}}} ad text {{{{ /Ad }}}}
-10. Number Column and Ad tags sequentially per page (001, 002, 003...)
-11. Do NOT correct Texas German dialect words or pre-1901 spellings
-12. Do NOT translate English loanwords to German
-13. Headlines: ## text | Subheads: ### text | Datelines: **City, Date**
+   est = char count estimate. imgbbox = pixel bounding box (be generous).
+7. Images/illustrations: {{{{ Img | bbox="x,y,w,h" | desc="..." }}}}
+8. Articles: {{{{ Column001 }}}} ... {{{{ /Column }}}}
+9. Advertisements: {{{{ Ad001 }}}} ... {{{{ /Ad }}}}
+10. Number Column/Ad tags sequentially (001, 002, 003...)
+11. Headlines: ## | Subheads: ### | Datelines: **bold**
+12. Do NOT correct Texas German dialect or pre-1901 spellings
+13. Do NOT translate English loanwords
 
-PASS 2 - GAP INVENTORY:
-For each {{{{ gap }}}} from Pass 1:
-1. Re-examine the image at each gap location
-2. Note partial letterforms, ascenders, descenders, dots, fragments
-3. Refine the character count estimate and bounding box
-4. Add fragments field. Do NOT guess yet:
+PASS 2 - GAP INVENTORY (observation only):
+For each gap, re-examine the image. Record what you see. Do NOT guess.
+Update each gap with fragments:
    {{{{ gap | est=NN | imgbbox="x,y,w,h" | fragments="visible_text" }}}}
 
-PASS 3 - CROSS-REFERENCE, GUESS, AND CONFIDENCE:
-This is where guessing happens. Every remaining gap gets a guess and cnf.
-For each gap:
-1. If ABBYY/portal OCR is provided, find the corresponding region
-2. Apply the Fraktur error correction table to decode the raw OCR fragment
-3. Cross-reference: your reading + OCR fragment + context + 1890s German +
-   article topic (international news = more Hochdeutsch, local = more dialect)
-4. Assign a confidence score:
-   cnf >= 0.95: PROMOTE TO PLAIN TEXT. Remove the gap tag entirely.
-     The text becomes untagged high-confidence output like Pass 1 text.
-   cnf 0.80-0.94: keep gap, add status=auto-resolved. Rarely needs review.
-   cnf < 0.80: keep gap, open for future refinement.
-5. Gaps that remain MUST have [guess], cnf, and region_ocr:
-   {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="..." | region_ocr="raw_ocr" [guess] }}}}
-   region_ocr = exact raw OCR text, uncorrected.
-6. For non-gap corrections where the fix is ambiguous:
-   corrected_word <!-- {{{{ corrected | original="ocr_reading" | rule="rule_name" }}}} -->
-
-cnf: 0.95-0.99=promote to plain text, 0.80-0.94=auto-resolved,
-0.70-0.79=moderate, 0.40-0.69=low, 0.01-0.39=speculative,
-0.00=pure context guess.
-
-OUTPUT FORMAT - return this exact structure:
-
-LAYOUT: <one-line layout description>
+OUTPUT FORMAT:
+LAYOUT: <one-line description>
 COLUMNS: <number>
-DAMAGE: <brief damage notes or "none">
+DAMAGE: <notes or "none">
 
 ---
 
-<final corrected text with all markup tags>
+<transcribed text with gap markers — mostly plain text, gaps for uncertain regions>
 
 ---
 
 STATS:
 - estimated_chars: <N>
 - chars_no_gap: <N>
-- chars_cnf_high: <N>
-- chars_cnf_mid: <N>
-- chars_cnf_low: <N>
 - total_gaps: <N>
 
-CRITICAL RULES:
-- NEVER use [unleserlich] or leave text blank
-- Every gap MUST have est, imgbbox, cnf, and [best guess]
-- Preserve pre-1901 German spellings (thun, Noth, Theil, Eigenthum, -iren)
-- Preserve English loanwords as-is (Saloon, County, Farmer, Sheriff, Receiver)
-- Preserve Texas German dialect and hybrid forms (Dry Goods Haus, Stadtmarshall)
-- If a word is only 1-2 characters off from plausible Texas German, prefer dialect
-- Do NOT translate - text stays in original language
-- Do NOT modernize period orthography
-- Watch for column interleaving (sudden topic change mid-sentence) and mark with
+RULES:
+- NEVER guess in gaps — that happens in a separate pass
+- Preserve Texas German, period spellings, English loanwords as-is
+- Watch for column interleaving and mark with
   <!-- {{{{ column_break | from=N | to=M }}}} -->"""
+
+
+def build_pass3_prompt(config: dict) -> str:
+    """System prompt for Pass 3: cross-reference, guess, confidence.
+    Text-only call (no image needed) to the resolve model (default: Sonnet)."""
+    header = _build_collection_header(config)
+    fraktur_errors = load_reference("fraktur-errors.md")
+    texas_german   = load_reference("texas-german.md")
+    markup_spec    = load_reference("markup-spec.md")
+
+    return f"""You are an expert in 19th-century German Fraktur OCR correction.
+
+{header}
+
+REFERENCE: FRAKTUR ERROR PATTERNS
+===================================
+{fraktur_errors}
+
+REFERENCE: TEXAS GERMAN VOCABULARY & ORTHOGRAPHY
+==================================================
+{texas_german}
+
+REFERENCE: MARKUP SPECIFICATION
+================================
+{markup_spec}
+
+YOUR TASK: PASS 3 (cross-reference, guess, and confidence)
+============================================================
+
+You receive transcribed text from Pass 1-2 (with {{{{ gap }}}} markers for
+uncertain regions) and the raw ABBYY/portal OCR text for the same page.
+
+For every gap, produce a best guess and assign a confidence score.
+
+INSTRUCTIONS:
+1. For each {{{{ gap }}}} marker, cross-reference:
+   - The fragments field (partial letterforms from the image)
+   - The corresponding region in the ABBYY/portal OCR text
+   - Surrounding context in the transcription
+   - Your knowledge of 1890s German, Texas German dialect, article topic
+2. Apply the Fraktur error correction table to decode garbled OCR fragments
+3. Assign a confidence score and update the gap:
+
+   cnf >= 0.95: PROMOTE TO PLAIN TEXT. Remove the gap tag entirely.
+     Write the text as untagged output.
+   cnf 0.80-0.94: keep gap, add status=auto-resolved:
+     {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | status=auto-resolved | fragments="..." | region_ocr="raw" [guess] }}}}
+   cnf < 0.80: keep gap, open for refinement:
+     {{{{ gap | est=NN | imgbbox="x,y,w,h" | cnf="0.XX" | fragments="..." | region_ocr="raw" [guess] }}}}
+
+4. region_ocr MUST contain the exact raw OCR text, uncorrected
+5. Every remaining gap MUST have [guess] and cnf. Even cnf="0.00" with a
+   wild guess is better than nothing.
+
+cnf scale: 0.95-0.99=promote to plain, 0.80-0.94=auto-resolved,
+0.70-0.79=moderate, 0.40-0.69=low, 0.01-0.39=speculative,
+0.00=pure context guess.
+
+OUTPUT: Return the complete text with gaps resolved. Use the same format
+as the input (LAYOUT/COLUMNS/DAMAGE header, --- delimiters, STATS block).
+Update the STATS to reflect resolved gaps.
+
+RULES:
+- Preserve Texas German, period spellings, English loanwords
+- Do NOT translate
+- Do NOT modernize orthography"""
 
 
 def build_page_prompt(ark_id: str, page_num: int, total_pages: int,
@@ -638,14 +673,22 @@ def build_page_prompt(ark_id: str, page_num: int, total_pages: int,
 # ============================================================================
 
 def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
-                 system_prompt, api_key, rate_limiter=None, cost_tracker=None):
+                 pass12_prompt, pass3_prompt, api_key,
+                 rate_limiter=None, cost_tracker=None):
     """
-    Correct a single page using Claude Vision.
-    Returns dict: text, markdown, stats, status, usage.
+    Correct a single page using tiered Claude models.
+
+    Call 1 (MODEL_INITIAL, e.g. Haiku): Image + Pass 1-2 prompt
+      → transcription with {{ gap }} markers (no guesses)
+    Call 2 (MODEL_RESOLVE, e.g. Sonnet): Pass 1-2 text + OCR → Pass 3
+      → gaps resolved with guesses, cnf, region_ocr (text-only, no image)
+
+    Returns dict: text, markdown, stats, status.
     """
     abbyy_text = get_abbyy_page_text(issue_fname, page_num)
     portal_ocr = get_portal_ocr_text(issue_fname, page_num)
 
+    # ── Call 1: Pass 1-2 (image + transcription) ─────────────────────────
     content = build_page_prompt(
         ark_id, page_num, total_pages, newspaper, date,
         abbyy_text=abbyy_text, portal_ocr=portal_ocr)
@@ -654,22 +697,55 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
     if not has_image and not abbyy_text and not portal_ocr:
         return {"text": "", "markdown": "", "stats": {}, "status": "no_image"}
 
-    est = EST_INPUT_TOKENS_PER_PAGE if has_image else 5_000
+    est = EST_INPUT_TOKENS_PASS12 if has_image else 5_000
 
     try:
-        raw, usage = claude_api_call(
-            {"model": CLAUDE_MODEL, "max_tokens": MAX_OUTPUT_TOKENS,
-             "system": system_prompt,
+        tprint(f"      pass 1-2 ({MODEL_INITIAL}) ...", level=2)
+        pass12_raw, _ = claude_api_call(
+            {"model": MODEL_INITIAL, "max_tokens": MAX_OUTPUT_TOKENS,
+             "system": pass12_prompt,
              "messages": [{"role": "user", "content": content}]},
             api_key, rate_limiter, est_tokens=est, cost_tracker=cost_tracker)
     except Exception as e:
-        tprint(f"    x p{page_num:02d} API error: {e}", level=1)
+        tprint(f"    x p{page_num:02d} Pass 1-2 error: {e}", level=1)
         return {"text": "", "markdown": "", "stats": {},
                 "status": "failed", "error": str(e)}
 
-    if not raw.strip():
+    if not pass12_raw.strip():
         return {"text": "", "markdown": "", "stats": {},
-                "status": "failed", "error": "empty response"}
+                "status": "failed", "error": "empty pass 1-2 response"}
+
+    # ── Call 2: Pass 3 (text-only cross-reference) ───────────────────────
+    # Build text-only prompt with Pass 1-2 output + reference OCR
+    ref_ocr = abbyy_text or portal_ocr or ""
+    pass3_user = (
+        f"PASS 1-2 TRANSCRIPTION (with gap markers):\n"
+        f"```\n{pass12_raw}\n```\n\n")
+    if ref_ocr:
+        ocr_label = "ABBYY" if abbyy_text else "Portal"
+        pass3_user += (
+            f"{ocr_label} OCR TEXT (raw, for cross-referencing gaps):\n"
+            f"```\n{ref_ocr[:30000]}\n```\n\n")
+    pass3_user += (
+        "Resolve all gaps: add [guess], cnf, region_ocr. "
+        "Promote cnf >= 0.95 to plain text.")
+
+    try:
+        tprint(f"      pass 3 ({MODEL_RESOLVE}) ...", level=2)
+        raw, _ = claude_api_call(
+            {"model": MODEL_RESOLVE, "max_tokens": MAX_OUTPUT_TOKENS,
+             "system": pass3_prompt,
+             "messages": [{"role": "user", "content": pass3_user}]},
+            api_key, rate_limiter, est_tokens=EST_INPUT_TOKENS_PASS3,
+            cost_tracker=cost_tracker)
+    except Exception as e:
+        tprint(f"    x p{page_num:02d} Pass 3 error: {e} — using Pass 1-2",
+               level=1)
+        # Fall back to Pass 1-2 output (gaps unresolved but text is there)
+        raw = pass12_raw
+
+    if not raw.strip():
+        raw = pass12_raw  # fallback
 
     clean_text = extract_clean_text(raw)
     stats = extract_stats(raw)
@@ -686,7 +762,6 @@ def correct_page(ark_id, page_num, total_pages, newspaper, date, issue_fname,
         "raw_response": raw,
         "stats": stats,
         "status": "ok",
-        "usage": usage,
     }
 
 
@@ -779,7 +854,7 @@ def build_page_markdown(newspaper, date, page_num, source_image,
     header += f"- Source image: {source_image}\n"
     header += f"- Reference OCR: {ref_desc}\n"
     header += f"- Processing date: {today}\n"
-    header += f"- Model: {CLAUDE_MODEL}\n"
+    header += f"- Model: {MODEL_INITIAL} (pass 1-2) + {MODEL_RESOLVE} (pass 3)\n"
     header += "- Pipeline version: 2.0 (AI-only)\n\n"
     header += "### Statistics\n"
     for key, val in stats.items():
@@ -852,7 +927,7 @@ def segment_page(page_num, corrected_text, api_key,
 
     # Complex page: use Claude
     raw, _ = claude_api_call(
-        {"model": CLAUDE_MODEL, "max_tokens": 4000,
+        {"model": MODEL_RESOLVE, "max_tokens": 4000,
          "system": SEGMENTATION_PROMPT,
          "messages": [{"role": "user", "content":
              f"PAGE {page_num}\n\n{corrected_text}"}]},
@@ -913,7 +988,7 @@ def stitch_boundary(last_item, first_item, api_key,
         f"(type={first_item.get('type')}, headline={first_hl!r}):\n"
         f"{first_body[:600]}...")
     raw, _ = claude_api_call(
-        {"model": CLAUDE_MODEL, "max_tokens": 100,
+        {"model": MODEL_RESOLVE, "max_tokens": 100,
          "system": STITCH_PROMPT,
          "messages": [{"role": "user", "content": prompt}]},
         api_key, rate_limiter, est_tokens=500, cost_tracker=cost_tracker)
@@ -1134,7 +1209,7 @@ def preload_images(issues, resume=True, retry_failed=False, workers=4):
 # ISSUE PROCESSING
 # ============================================================================
 
-def process_issue(issue, api_key, system_prompt, delay,
+def process_issue(issue, api_key, pass12_prompt, pass3_prompt, delay,
                   resume, force, rate_limiter=None,
                   cost_tracker=None, worker_id=""):
     """Process one newspaper issue through the AI OCR pipeline."""
@@ -1209,7 +1284,8 @@ def process_issue(issue, api_key, system_prompt, delay,
 
         result = correct_page(
             ark_id, pg, actual_pages, newspaper, date, fname,
-            system_prompt, api_key, rate_limiter, cost_tracker)
+            pass12_prompt, pass3_prompt, api_key,
+            rate_limiter, cost_tracker)
 
         if result["status"] == "ok":
             corrected_pages[pg] = result["text"]
@@ -1443,35 +1519,41 @@ def compile_all(issues: list, config: dict, collection_dir: Path,
 # COST ESTIMATION DISPLAY
 # ============================================================================
 
-def show_cost_estimate(model, pages_to_process, budget):
-    """Display pre-batch cost estimate. Returns estimated cost."""
-    input_price, output_price = 3.0, 15.0  # Sonnet defaults
-    if load_pricing:
-        pricing = load_pricing()
-        mp = pricing.get(model, {})
-        input_price = mp.get("input", input_price)
-        output_price = mp.get("output", output_price)
+def show_cost_estimate(pages_to_process, budget):
+    """Display pre-batch cost estimate for tiered models. Returns est cost."""
+    pricing = load_pricing() if load_pricing else {}
 
-    total_in = pages_to_process * EST_INPUT_TOKENS_PER_PAGE
-    total_out = pages_to_process * EST_OUTPUT_TOKENS_PER_PAGE
-    est_cost = (total_in * input_price + total_out * output_price) / 1_000_000
-    est_high = est_cost * 1.3
+    def _price(model):
+        mp = pricing.get(model, {})
+        return mp.get("input", 3.0), mp.get("output", 15.0)
+
+    p12_in, p12_out = _price(MODEL_INITIAL)
+    p3_in, p3_out = _price(MODEL_RESOLVE)
+
+    # Per-page cost: Call 1 (image) + Call 2 (text-only)
+    cost_p12 = (EST_INPUT_TOKENS_PASS12 * p12_in +
+                EST_OUTPUT_TOKENS_PASS12 * p12_out) / 1_000_000
+    cost_p3 = (EST_INPUT_TOKENS_PASS3 * p3_in +
+               EST_OUTPUT_TOKENS_PASS3 * p3_out) / 1_000_000
+    per_page = cost_p12 + cost_p3
+    est_cost = pages_to_process * per_page
+    est_high = est_cost * 1.2
 
     print()
     print("=" * 60)
     print("  AI OCR CORRECTION -- COST ESTIMATE")
     print("=" * 60)
-    print(f"  Model            : {model}")
+    print(f"  Pass 1-2 model   : {MODEL_INITIAL} "
+          f"(${p12_in:.2f}/${p12_out:.2f} per MTok)")
+    print(f"  Pass 3 model     : {MODEL_RESOLVE} "
+          f"(${p3_in:.2f}/${p3_out:.2f} per MTok)")
     print(f"  Pages to process : {pages_to_process:,}")
-    print(f"  Est. input/page  : ~{EST_INPUT_TOKENS_PER_PAGE:,} tokens")
-    print(f"  Est. output/page : ~{EST_OUTPUT_TOKENS_PER_PAGE:,} tokens")
-    print(f"  Input rate       : ${input_price:.2f}/MTok")
-    print(f"  Output rate      : ${output_price:.2f}/MTok")
-    print(f"  Est. total cost  : ${est_cost:.2f} - ${est_high:.2f}")
+    print(f"  Est. cost/page   : ${per_page:.3f} "
+          f"(${cost_p12:.3f} image + ${cost_p3:.3f} text)")
+    print(f"  Est. total cost  : ${est_cost:.0f} - ${est_high:.0f}")
     if budget is not None:
         print(f"  Budget limit     : ${budget:.2f}")
         if est_high > budget:
-            per_page = est_cost / max(pages_to_process, 1)
             affordable = int(budget / per_page) if per_page > 0 else 0
             print(f"  Budget covers    : ~{affordable} of "
                   f"{pages_to_process} pages")
@@ -1535,6 +1617,15 @@ def main():
                         "(no API calls, run after --correct)")
     p.add_argument("--budget",         type=float, default=None,
                    help="Max dollar amount to spend (stops before exceeding)")
+    p.add_argument("--model-initial",  default=None,
+                   help="Model for Pass 1-2 image transcription "
+                        "(default: claude-haiku-4-5)")
+    p.add_argument("--model-resolve",  default=None,
+                   help="Model for Pass 3 cross-reference/guess "
+                        "(default: claude-sonnet-4-6)")
+    p.add_argument("--model-refine",   default=None,
+                   help="Model for future refinement passes "
+                        "(default: claude-opus-4-6)")
     p.add_argument("--logging",        type=int, default=1,
                    choices=[1, 2, 3, 4, 5],
                    help="Log verbosity: 1=progress 2=pages 3=api 4=detail "
@@ -1573,11 +1664,22 @@ def main():
     # Initialize skill directory from global config
     init_skill_dir(global_config)
 
-    global CLAUDE_MODEL
-    if config.get("claude_model"):
-        CLAUDE_MODEL = config["claude_model"]
+    # Model tier resolution: CLI flags → config.json → defaults
+    global MODEL_INITIAL, MODEL_RESOLVE, MODEL_REFINE
+    if args.model_initial:
+        MODEL_INITIAL = args.model_initial
+    elif global_config.get("model_initial"):
+        MODEL_INITIAL = global_config["model_initial"]
+    if args.model_resolve:
+        MODEL_RESOLVE = args.model_resolve
+    elif config.get("claude_model"):
+        MODEL_RESOLVE = config["claude_model"]
     elif global_config.get("claude_model"):
-        CLAUDE_MODEL = global_config["claude_model"]
+        MODEL_RESOLVE = global_config["claude_model"]
+    if args.model_refine:
+        MODEL_REFINE = args.model_refine
+    elif global_config.get("model_refine"):
+        MODEL_REFINE = global_config["model_refine"]
 
     # API key resolution
     api_key = (args.api_key
@@ -1605,7 +1707,8 @@ def main():
 
     print(f"Collection : {config['title_name']}", flush=True)
     print(f"Issues     : {len(issues)}", flush=True)
-    print(f"Model      : {CLAUDE_MODEL}", flush=True)
+    print(f"Models     : {MODEL_INITIAL} (pass 1-2) → "
+          f"{MODEL_RESOLVE} (pass 3)", flush=True)
     print(f"Pipeline   : AI-only (Claude Vision)", flush=True)
 
     # Check image cache
@@ -1655,7 +1758,7 @@ def main():
         return
 
     # Cost estimate and confirmation
-    show_cost_estimate(CLAUDE_MODEL, pages_to_process, args.budget)
+    show_cost_estimate(pages_to_process, args.budget)
 
     if not args.yes:
         confirm = input(
@@ -1666,10 +1769,11 @@ def main():
             return
 
     # Initialize tracking
-    system_prompt = build_system_prompt(config)
+    pass12_prompt = build_pass12_prompt(config)
+    pass3_prompt = build_pass3_prompt(config)
     rate_limiter = (limiter_from_tier(args.tier)
                     if ClaudeRateLimiter else None)
-    cost_tracker = CostTracker(CLAUDE_MODEL, budget=args.budget)
+    cost_tracker = CostTracker(MODEL_RESOLVE, budget=args.budget)
 
     log = []
     log_lock = threading.Lock()
@@ -1692,7 +1796,7 @@ def main():
             break
 
         status = process_issue(
-            issue, api_key, system_prompt,
+            issue, api_key, pass12_prompt, pass3_prompt,
             args.delay, args.resume, args.force,
             rate_limiter=rate_limiter,
             cost_tracker=cost_tracker,
